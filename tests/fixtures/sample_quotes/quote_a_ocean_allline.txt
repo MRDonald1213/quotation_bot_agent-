@@ -1,0 +1,18 @@
+OCEAN ALL-LINE SHIPPING - MARITIME QUOTATION
+Quote Reference: OAL-501
+Date: 2026-10-20
+
+Route: Shanghai, China to Rotterdam, Netherlands
+Delivery scope: port to port
+Cargo: machine parts
+Gross weight: 4800 kg
+Volume: 28 m3
+
+Price: base freight EUR 3600.00, all-in with no additional charges.
+Insurance is not included. Customs clearance is not included.
+Transit time: 28 to 34 days
+This quotation is valid until 2026-12-31
+
+Li Wei
+Ocean All-Line Shipping
+li.wei@ocean-allline.example

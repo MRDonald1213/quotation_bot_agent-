@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "freight-agent"
+version = "0.1.0"
+description = "Local-first CLI AI freight quotation agent (Workflow A: intake to quote)"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.10,<3",
+    "pydantic-ai>=2.60,<3",
+    "pydantic-settings>=2.6,<3",
+    "typer>=0.12,<1",
+    "rich>=13.7,<16",
+    "sqlalchemy>=2.0,<2.1",
+    "pypdf>=5.0,<7",
+    "python-docx>=1.1,<2",
+    "openpyxl>=3.1,<4",
+    "httpx2>=2,<3",
+    "pycountry>=24.6,<25",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2,<9"]
+
+[project.scripts]
+freight = "freight_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/freight_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
