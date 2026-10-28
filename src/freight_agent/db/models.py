@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utcnow_iso() -> str:
@@ -110,6 +110,10 @@ class QuotationRow(Base):
     customs_included: Mapped[int | None] = mapped_column(Integer)
     total_known_cost: Mapped[str | None] = mapped_column(Text)
     comparison_status: Mapped[str] = mapped_column(String(24), index=True)
+    review_status: Mapped[str] = mapped_column(String(16), index=True, default="extracted")
+    reviewed_at: Mapped[str | None] = mapped_column(String(32))
+    imported_at: Mapped[str | None] = mapped_column(String(32))
+    review_notes: Mapped[str | None] = mapped_column(Text)
     model_name: Mapped[str | None] = mapped_column(String(120))
     prompt_version: Mapped[str | None] = mapped_column(String(60))
     processed_at: Mapped[str | None] = mapped_column(String(32))

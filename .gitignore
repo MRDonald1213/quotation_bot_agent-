@@ -1,6 +1,5 @@
 .env
-data/*.db
-data/workspace/
+data/
 __pycache__/
 *.pyc
 .pytest_cache/

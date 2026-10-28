@@ -32,14 +32,14 @@ COMPARISON_SCHEMA: list[tuple[str, GapSeverity, str]] = [
 ]
 
 _QUESTION_TEMPLATES = {
-    "currency": "Could you confirm the currency in which this quotation is priced?",
-    "base_price": "Could you confirm the base freight price for this shipment, and what it covers?",
-    "delivery_scope": "Could you confirm the delivery scope (port-to-port, door-to-door, or other)?",
-    "valid_until": "Until what date is this quotation valid?",
-    "transit_days": "What is the expected transit time in days (minimum and maximum)?",
-    "insurance_included": "Is cargo insurance included in this quote? If not, what would it cost?",
-    "customs_included": "Are customs clearance duties/handling included in this quote?",
-    "quote_reference": "Could you provide a quote reference number for this offer?",
+    "currency": "Which currency is this price in?",
+    "base_price": "What is the base freight price, and what does it include?",
+    "delivery_scope": "Does this price cover delivery to the final address, or only to the port?",
+    "valid_until": "Until what date (YYYY-MM-DD) is this quotation valid?",
+    "transit_days": "What is the expected transit time in days, minimum and maximum?",
+    "insurance_included": "Is cargo insurance included? If not, what does it cost?",
+    "customs_included": "Are customs clearance and handling included in this price?",
+    "quote_reference": "What reference number should we quote when we accept this offer?",
 }
 
 
@@ -116,7 +116,7 @@ def template_questions(shipment: Shipment, quote: Quotation, gaps: list[GapItem]
             why_it_matters=gap.description,
             question_text=_QUESTION_TEMPLATES.get(
                 gap.field_name,
-                f"Could you clarify the following for shipment {shipment.reference}: {gap.field_name}?"),
+                f"Could you confirm the {gap.field_name.replace('_', ' ')} for this quotation?"),
             priority=gap.severity,
             source_context=evidence_snippets.get(gap.field_name, "not found"),
             target_carrier_id=carrier.id if carrier else None,

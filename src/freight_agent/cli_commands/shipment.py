@@ -154,4 +154,16 @@ def approve(
     approved = shipment_service.approve_proposed_shipment(settings, str(s.id), s.updated_at)
     console.print(f"[green]shipment approved[/green] {approved.reference} is now open "
                   f"(category {approved.route_category or '-'})")
-    console.print(f"[dim]next: freight questions generate {approved.reference}[/dim]")
+    from ..services.clarification import generate_clarification_drafts
+    from ..domain.exceptions import FreightAgentError
+    try:
+        drafts = generate_clarification_drafts(settings, str(approved.id))
+    except FreightAgentError as exc:
+        err_console.print(f"[yellow]drafts not generated yet: {exc}[/yellow]")
+        err_console.print(f"[yellow]retry with: freight questions generate {approved.reference}[/yellow]")
+        return
+    if drafts:
+        console.print(f"[green]clarification drafts prepared[/green] {len(drafts)} awaiting review — "
+                      f"`freight review` or `freight email list {approved.reference}`")
+    else:
+        console.print("[dim]no open gaps: no drafts needed[/dim]")

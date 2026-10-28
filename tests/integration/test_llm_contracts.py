@@ -64,19 +64,29 @@ EXTRACT_A = {
         {"field_name": "transit_days_max", "snippet": "Estimated transit: 12-16 days", "page_or_sheet": "page 1", "confidence": 0.9},
         {"field_name": "valid_until", "snippet": "valid until 2026-11-15", "page_or_sheet": "page 1", "confidence": 0.95},
         {"field_name": "delivery_scope", "snippet": "port to port", "page_or_sheet": "page 1", "confidence": 0.85},
+        {"field_name": "currency", "snippet": "Base ocean freight: 3,200 EUR", "page_or_sheet": "page 1", "confidence": 0.9},
+        {"field_name": "transit_days_min", "snippet": "Estimated transit: 12-16 days", "page_or_sheet": "page 1", "confidence": 0.9},
+        {"field_name": "transit_days_max", "snippet": "Estimated transit: 12-16 days", "page_or_sheet": "page 1", "confidence": 0.9},
+        {"field_name": "included_services", "snippet": "Includes: ocean freight", "page_or_sheet": "page 1", "confidence": 0.85},
+        {"field_name": "excluded_services", "snippet": "On-carriage: excluded", "page_or_sheet": "page 1", "confidence": 0.85},
     ],
 }
 EXTRACT_WITHOUT_EVIDENCE = {**EXTRACT_A, "field_evidence": []}
 GARBAGE = {"base_price": "not-a-number", "charges": "this should be a list"}
+WORDING_FALLBACK = {  # invalid wording → the service keeps its rule-template questions
+    "gaps": [], "clarification_questions": [], "comparison_readiness": "not_ready", "summary": "",
+}
+
 
 
 def _setup(settings, fake_llm, file, classify_payload=CLASSIFY_OK, extract_payload=EXTRACT_A):
     fake_llm.responses = {
         "Extract the QuoteExtraction": extract_payload,   # checked first
+        'filename="gap_context.json"': WORDING_FALLBACK,  # question wording call
         f'filename="{file.name}"': classify_payload,
     }
-    shipment = create_shipment(settings, reference="SHP-T-1", name="t", origin="Baku",
-                               destination="Hamburg", cargo_description="parts",
+    shipment = create_shipment(settings, reference="SHP-T-1", name="t", origin="Baku, AZ",
+                               destination="Hamburg, DE", cargo_description="parts",
                                required_delivery_scope=DeliveryScope.door_to_door)
     item, _ = intake_service.register_intake(settings, str(shipment.id), file)
     return shipment, item

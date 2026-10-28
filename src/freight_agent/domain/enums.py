@@ -86,6 +86,15 @@ class GapStatus(StrEnum):
     waived = "waived"
 
 
+class ReviewStatus(StrEnum):
+    """Where an extracted quotation stands between extraction and the canonical record."""
+
+    extracted = "extracted"
+    approved = "approved"
+    imported = "imported"
+    rejected = "rejected"
+
+
 class DraftStatus(StrEnum):
     draft = "draft"
     approved = "approved"

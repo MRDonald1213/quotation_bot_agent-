@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Freight AI Agent</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">Freight <span>AI Agent</span><small>Local workspace</small></div>
+    <nav id="nav" aria-label="Main navigation">
+      <a href="#/">Dashboard</a>
+      <a href="#/documents">Documents</a>
+      <a href="#/queue">Review queue</a>
+      <a href="#/shipments">Quotations</a>
+      <a href="#/comparison">Comparison</a>
+      <a href="#/drafts">Drafts</a>
+      <a href="#/settings">System</a>
+    </nav>
+    <div class="system" id="system" aria-live="polite"></div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="page-title">Dashboard</h1>
+      <p class="guide" id="page-guide"></p>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div class="actions">
+      <button class="btn neutral" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-confirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" aria-live="polite"></div>
+<script src="/static/api.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

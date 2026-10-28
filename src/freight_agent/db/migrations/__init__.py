@@ -71,6 +71,30 @@ def init_schema(session: Session) -> list[str]:
                 description="schema v3: shipment route countries, provenance and human review",
             ))
             applied.append("v3")
+        if current < 4:
+            quotation_columns = {
+                column["name"] for column in inspect(connection).get_columns("quotations")
+            }
+            for name, definition in (
+                ("review_status", "VARCHAR(16) NOT NULL DEFAULT 'extracted'"),
+                ("reviewed_at", "VARCHAR(32)"),
+                ("imported_at", "VARCHAR(32)"),
+                ("review_notes", "TEXT"),
+            ):
+                if name not in quotation_columns:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE quotations ADD COLUMN {name} {definition}"
+                    )
+            # quotations recorded before this split were already reviewed through the CLI
+            connection.exec_driver_sql(
+                "UPDATE quotations SET review_status = 'imported',"
+                " imported_at = COALESCE(updated_at, created_at) WHERE reviewed_at IS NULL"
+            )
+            session.add(SchemaVersionRow(
+                version=4, applied_at=utcnow_iso(),
+                description="schema v4: quotation review and explicit database import state",
+            ))
+            applied.append("v4")
     return applied
 
 

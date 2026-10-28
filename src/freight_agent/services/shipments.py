@@ -5,7 +5,6 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal
-from uuid import uuid4
 
 import pycountry
 from sqlalchemy.exc import IntegrityError
@@ -84,6 +83,36 @@ def _location_key(location: str, country_code: str | None) -> str:
     return " ".join(value.split())
 
 
+def _next_reference(repos: Repos) -> str:
+    """A short sequential reference: procurement staff read these aloud, UUIDs are unusable."""
+    year = datetime.now(timezone.utc).year
+    taken = {s.reference for s in repos.list_shipments()}
+    number = len(taken) + 1
+    while f"SHP-{year}-{number:03d}" in taken:
+        number += 1
+    return f"SHP-{year}-{number:03d}"
+
+
+_ADDRESS_NOISE = re.compile(
+    r"\b(warehouse|terminal|depot|zone|street|str\.?|avenue|ave\.?|road|rd\.?|building|bldg\.?|"
+    r"block|floor|industrial|logistics|office|no\.?)\b", re.IGNORECASE)
+
+
+def short_place(value: str | None) -> str:
+    """City-level label for one route endpoint — the full delivery address stays in `origin`."""
+    if not value:
+        return "?"
+    parts = [part.strip() for part in re.split(r"[,;]|\s{2,}", value) if part.strip()]
+    for part in parts:
+        if len(part) <= 30 and not _ADDRESS_NOISE.search(part):
+            return part
+    return (parts[0][:30] if parts else value[:30]).strip()
+
+
+def route_label(origin: str | None, destination: str | None) -> str:
+    return f"{short_place(origin)} → {short_place(destination)}"
+
+
 def resolve_document_shipment(repos: Repos, item: IntakeItem, extraction: QuoteExtraction,
                               explicit: Shipment | None = None, reference: str | None = None
                               ) -> tuple[Shipment | None, bool, list[str]]:
@@ -133,7 +162,8 @@ def resolve_document_shipment(repos: Repos, item: IntakeItem, extraction: QuoteE
                 for e in extraction.field_evidence if e.field_name in fields
                 and snippet_grounded(e.snippet, item.raw_text)]
     shipment = Shipment(
-        reference=f"AUTO-{uuid4()}", name=f"{extraction.origin} -> {extraction.destination}"[:200],
+        reference=_next_reference(repos),
+        name=route_label(extraction.origin, extraction.destination)[:200],
         origin=extraction.origin, destination=extraction.destination,
         origin_country=origin_country, destination_country=destination_country,
         route_category=f"{origin_country}->{destination_country}" if origin_country and destination_country else None,
@@ -145,7 +175,7 @@ def resolve_document_shipment(repos: Repos, item: IntakeItem, extraction: QuoteE
     )
     return shipment, True, [
         f"New shipment proposed: {shipment.reference}; category: {shipment.route_category or 'unknown'}.",
-        f"Human review required: freight shipment approve {shipment.id}",
+        "Human review required: freight shipment approve last -y",
     ]
 
 
@@ -197,4 +227,18 @@ def approve_proposed_shipment(settings: Settings, id_or_reference: str,
         repos.update_shipment(shipment)
         repos.add_audit(AuditEvent(entity_type="shipment", entity_id=shipment.id, action="proposal_approved",
                                    details_json=json.dumps({"category": f"{shipment.origin_country}->{shipment.destination_country}"})))
+        return shipment
+
+
+def reject_proposed_shipment(settings: Settings, id_or_reference: str, reason: str | None = None) -> Shipment:
+    """Close a proposed route so it never matches future documents (audited)."""
+    with with_session(settings) as repos, repos.atomic():
+        shipment = repos.get_shipment(id_or_reference)
+        if shipment.status != ShipmentStatus.needs_review:
+            raise ValidationFailureError("Only unapproved proposals can be rejected.")
+        shipment.status = ShipmentStatus.closed
+        shipment.updated_at = datetime.now(timezone.utc).replace(microsecond=0)
+        repos.update_shipment(shipment)
+        repos.add_audit(AuditEvent(entity_type="shipment", entity_id=shipment.id, action="proposal_rejected",
+                                   details_json=json.dumps({"reason": reason})))
         return shipment

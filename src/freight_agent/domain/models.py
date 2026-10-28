@@ -20,6 +20,7 @@ from .enums import (
     GapType,
     ProcessingStatus,
     QuestionSetStatus,
+    ReviewStatus,
     ShipmentStatus,
     SourceType,
     ValidationStatus,
@@ -121,6 +122,10 @@ class Quotation(DomainModel):
     model_name: str | None = None
     prompt_version: str | None = None
     processed_at: datetime | None = None
+    review_status: ReviewStatus = ReviewStatus.extracted
+    reviewed_at: datetime | None = None
+    imported_at: datetime | None = None
+    review_notes: str | None = None
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
     version: int = 1

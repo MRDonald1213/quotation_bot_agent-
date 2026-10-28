@@ -12,8 +12,8 @@ from .common import Table, console, err_console, settings_or_exit, typed_errors
 
 @typed_errors
 def add(
-    shipment_id: str = typer.Argument(..., help="Shipment id (or 'none' to import without a shipment)."),
-    file_path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    shipment_id: str = typer.Argument(..., help="Quotation file, or shipment id when importing into an existing shipment."),
+    file_path: Optional[Path] = typer.Argument(None, exists=True, dir_okay=False),
     source: str = typer.Option("upload", "--source", help="upload | email"),
     sender: Optional[str] = typer.Option(None, "--sender"),
     subject: Optional[str] = typer.Option(None, "--subject"),
@@ -21,8 +21,15 @@ def add(
     auto: bool = typer.Option(True, "--auto/--no-auto",
                               help="Automatically classify, extract and resolve the shipment route after import."),
 ) -> None:
-    """Import a quotation/email file: hash, store in workspace, extract text locally."""
+    """Import a quotation file: hash, store in workspace, extract text, then process the whole workflow."""
     settings = settings_or_exit()
+    if file_path is None:
+        if not Path(shipment_id).expanduser().is_file():
+            # one argument that is not a file can only be a shipment id; the file is still missing
+            err_console.print("Missing argument 'FILE_PATH'.\n"
+                              "usage: freight intake add <file>  |  freight intake add <shipment-id> <file>")
+            raise typer.Exit(2)
+        file_path, shipment_id = Path(shipment_id).expanduser(), "none"
     sid = None if shipment_id.lower() in ("none", "-") else shipment_id
     source_type = "imported_email" if source == "email" else "upload"
     item, skipped = intake_service.register_intake(
@@ -33,20 +40,28 @@ def add(
         console.print(f"[yellow]duplicate content — skipped, existing intake id={item.id}[/yellow]")
         return
     console.print(f"[green]intake registered[/green]")
-    console.print(f"  id: {item.id}")
+    console.print(f"  id: {item.id} [dim](later commands accept `last` instead of this id)[/dim]")
     console.print(f"  file: {item.original_filename}")
     console.print(f"  sha256: {item.content_sha256}")
     console.print(f"  chars: {len(item.raw_text)}")
     if not auto:
         console.print(f"[dim]View in TablePlus: freight db open[/dim]")
         return
+    from ..domain.enums import ClassificationStatus
     from ..services.extraction import extract_and_store_quote
     console.print("[dim]auto-processing: classify → extract → resolve route…[/dim]")
     try:
         summary = extract_and_store_quote(settings, str(item.id))
+        if any(n.startswith("classification is needs_review") for n in summary.notes):
+            # local models are flaky: retry the classification once before asking a human
+            console.print("[dim]low-confidence classification — retrying once…[/dim]")
+            from ..services.classification import classify_intake
+            item, _result = classify_intake(settings, str(item.id))
+            if item.classification_status != ClassificationStatus.needs_review:
+                summary = extract_and_store_quote(settings, str(item.id))
     except Exception as exc:  # noqa: BLE001 — intake stays registered; process manually after fixing the cause
         err_console.print(f"[yellow]auto-processing stopped: {exc}[/yellow]")
-        err_console.print(f"[yellow]retry with: freight intake process {str(item.id)[:8]}[/yellow]")
+        err_console.print("[yellow]retry with: freight intake process last --force[/yellow]")
         return
     _print_summary(summary, dry_run=False)
 

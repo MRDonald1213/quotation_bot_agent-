@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from typing import Iterator, TypeVar
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,7 @@ from ...domain.enums import (
     ComparisonStatus,
     DeliveryScope,
     ProcessingStatus,
+    ReviewStatus,
     ShipmentStatus,
     SourceType,
 )
@@ -142,6 +143,10 @@ def quotation_to_row(q: Quotation) -> m.QuotationRow:
         insurance_included=_b(q.insurance_included), customs_included=_b(q.customs_included),
         total_known_cost=money_to_text(q.total_known_cost),
         comparison_status=str(q.comparison_status),
+        review_status=str(q.review_status),
+        reviewed_at=q.reviewed_at.isoformat() if q.reviewed_at else None,
+        imported_at=q.imported_at.isoformat() if q.imported_at else None,
+        review_notes=q.review_notes,
         model_name=q.model_name, prompt_version=q.prompt_version,
         processed_at=q.processed_at.isoformat() if q.processed_at else None,
         created_at=q.created_at.isoformat(), updated_at=q.updated_at.isoformat(),
@@ -168,6 +173,9 @@ def quotation_from_row(r: m.QuotationRow) -> Quotation:
         insurance_included=_b(r.insurance_included), customs_included=_b(r.customs_included),
         total_known_cost=text_to_money(r.total_known_cost),
         comparison_status=ComparisonStatus(r.comparison_status),
+        review_status=ReviewStatus(r.review_status or "extracted"),
+        reviewed_at=m.iso_to_dt(r.reviewed_at), imported_at=m.iso_to_dt(r.imported_at),
+        review_notes=r.review_notes,
         model_name=r.model_name, prompt_version=r.prompt_version,
         processed_at=m.iso_to_dt(r.processed_at),
         created_at=m.iso_to_dt(r.created_at) or Quotation.model_fields["created_at"].default_factory(),
@@ -250,6 +258,16 @@ class Repos:
         self._save()
 
     def get_shipment(self, id_or_reference: str) -> Shipment:
+        if id_or_reference.strip().lower() == "last":
+            # autonomy: `freight shipment approve last` targets the newest shipment
+            row = self.session.scalar(
+                select(m.ShipmentRow)
+                .order_by(m.ShipmentRow.created_at.desc(), text("rowid DESC"))
+                .limit(1)
+            )
+            if row is None:
+                raise NotFoundError("no shipments recorded yet")
+            return shipment_from_row(row)
         row = self.session.get(m.ShipmentRow, id_or_reference)
         if row is None:
             # Try prefix matching for truncated IDs
@@ -297,6 +315,11 @@ class Repos:
             contact_email=row.contact_email, notes=row.notes,
         )
 
+    def list_carriers(self) -> list[Carrier]:
+        rows = self.session.scalars(select(m.CarrierRow).order_by(m.CarrierRow.name)).all()
+        return [Carrier(id=_uid(r.id), name=r.name, portal_url=r.portal_url,
+                        contact_email=r.contact_email, notes=r.notes) for r in rows]
+
     # -- intake
     def add_intake(self, i: IntakeItem, classification_json: str | None = None) -> None:
         self.session.add(intake_to_row(i, classification_json))
@@ -310,6 +333,16 @@ class Repos:
         return None if row is None else intake_from_row(row)
 
     def get_intake(self, intake_id: str) -> IntakeItem:
+        if intake_id.strip().lower() == "last":
+            # autonomy: `freight intake show last` targets the most recently added intake
+            row = self.session.scalar(
+                select(m.IntakeItemRow)
+                .order_by(m.IntakeItemRow.created_at.desc(), text("rowid DESC"))
+                .limit(1)
+            )
+            if row is None:
+                raise NotFoundError("no intake items recorded yet")
+            return intake_from_row(row)
         row = self.session.get(m.IntakeItemRow, intake_id)
         if row is None:
             # Try prefix matching for truncated IDs
@@ -576,6 +609,25 @@ class Repos:
             created_at=m.iso_to_dt(r.created_at) or FieldEvidence.model_fields["created_at"].default_factory(),
         ) for r in rows]
 
+    def get_evidence(self, evidence_id: str) -> FieldEvidence:
+        row = self.session.get(m.FieldEvidenceRow, _u(evidence_id))
+        if row is None:
+            raise NotFoundError(f"evidence not found: {evidence_id}")
+        return FieldEvidence(
+            id=_uid(row.id), quotation_id=_uid(row.quotation_id), field_name=row.field_name,
+            value_as_extracted=row.value_as_extracted, source_filename=row.source_filename,
+            page_or_sheet=row.page_or_sheet, snippet=row.snippet, confidence=row.confidence,
+            validation_status=str(row.validation_status),  # type: ignore[arg-type]
+            created_at=m.iso_to_dt(row.created_at) or FieldEvidence.model_fields["created_at"].default_factory(),
+        )
+
+    def update_evidence(self, e: FieldEvidence) -> None:
+        row = self.session.get(m.FieldEvidenceRow, _u(e.id))
+        if row is None:
+            raise NotFoundError(f"evidence not found: {e.id}")
+        row.validation_status = str(e.validation_status)
+        self._save()
+
     # -- gaps
     def add_gaps(self, gaps: list[Gap]) -> None:
         for g in gaps:
@@ -655,6 +707,15 @@ class Repos:
             created_at=event.created_at.isoformat(),
         ))
         self._save()
+
+    def list_recent_audit(self, limit: int = 20) -> list[AuditEvent]:
+        rows = self.session.scalars(
+            select(m.AuditEventRow).order_by(m.AuditEventRow.created_at.desc(), text("rowid DESC")).limit(limit)
+        ).all()
+        return [AuditEvent(id=_uid(r.id), entity_type=r.entity_type, entity_id=_uid(r.entity_id),
+                           action=r.action, details_json=r.details_json,
+                           created_at=m.iso_to_dt(r.created_at) or AuditEvent.model_fields["created_at"].default_factory())
+                for r in rows]
 
     def audit_for(self, entity_id: str) -> list[AuditEvent]:
         rows = self.session.scalars(

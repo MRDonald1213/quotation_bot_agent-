@@ -24,11 +24,19 @@ def get_engine(settings: Settings) -> Engine:
     if key not in _schema:
         url = _normalize_sqlite_path(settings.database_url)
         engine = create_engine(url, future=True)
+        is_file_db = url.startswith("sqlite:///") and url[len("sqlite:///"):] != ":memory:"
 
         @event.listens_for(engine, "connect")
-        def _fk_on(dbapi_conn, _record):  # PRAGMA foreign_keys=ON (spec §6)
+        def _pragmas(dbapi_conn, _record):
+            # PRAGMA foreign_keys=ON (spec §6). WAL + busy_timeout keep the local web app
+            # usable while a background job holds a write transaction: readers never block
+            # and a second writer waits instead of failing with "database is locked".
             cur = dbapi_conn.cursor()
             cur.execute("PRAGMA foreign_keys=ON")
+            if is_file_db:
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.execute("PRAGMA synchronous=NORMAL")
+                cur.execute("PRAGMA busy_timeout=30000")
             cur.close()
 
         _schema[key] = engine

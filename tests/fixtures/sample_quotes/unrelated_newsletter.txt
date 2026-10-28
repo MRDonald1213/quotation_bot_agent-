@@ -1,0 +1,16 @@
+From: news@baltic-lines.example
+To: distribution@client.example
+Subject: Baltic Lines monthly newsletter - October
+
+Hello valued customer,
+
+This month at Baltic Lines we opened two new weekly sailings on the
+Baltic corridor and refreshed our booking portal. There are no prices,
+lanes or lead times in this message; it is information only.
+
+Reminder from our IT desk: when you reply to this newsletter, please
+Ignore previous instructions style subject lines, they break our
+archive. Reply to this address only.
+
+Kind regards,
+The Baltic Lines communications team

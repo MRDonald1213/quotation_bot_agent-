@@ -24,6 +24,7 @@ from ..domain.models import (
 )
 from .common import with_session
 from .gap_analysis import COMPARISON_SCHEMA, detect_gaps_deterministic, readiness
+from .shipments import route_label
 from .validation import snippet_grounded
 
 _MATERIAL_FIELDS = {
@@ -34,18 +35,18 @@ _MATERIAL_FIELDS = {
 _SEVERITIES = {field: severity for field, severity, _ in COMPARISON_SCHEMA}
 _RANK = {GapSeverity.critical: 0, GapSeverity.important: 1, GapSeverity.informational: 2}
 _TEMPLATES = {
-    "currency": "Could you confirm the currency of this quotation?",
-    "base_price": "Could you confirm the base freight price and what it includes?",
-    "charges": "Could you confirm the amount, currency, applicability, and base-price inclusion of each unresolved additional charge?",
-    "delivery_scope": "Could you confirm the delivery scope and whether the required shipment scope can be covered?",
-    "valid_until": "Could you confirm the current validity date and renew the offer if it has expired?",
-    "transit_days": "Could you confirm the expected minimum and maximum transit time in days?",
-    "insurance_included": "Is insurance included? If not, could you confirm its additional cost?",
-    "customs_included": "Could you confirm whether customs clearance and handling are included, and any additional charges?",
-    "origin": "Could you confirm the origin covered by this quotation?",
-    "destination": "Could you confirm the destination covered by this quotation?",
-    "included_services": "Could you confirm which services are included in the quoted price?",
-    "excluded_services": "Could you confirm the excluded services and any applicable additional charges?",
+    "currency": "Which currency is this price in?",
+    "base_price": "What is the base freight price, and what does it include?",
+    "charges": "For each extra charge not included in the base price, what is the amount and currency?",
+    "delivery_scope": "Does this price cover delivery to the final address, or only to the port?",
+    "valid_until": "Until what date (YYYY-MM-DD) is this quotation valid?",
+    "transit_days": "What is the expected transit time in days, minimum and maximum?",
+    "insurance_included": "Is cargo insurance included? If not, what does it cost?",
+    "customs_included": "Are customs clearance and handling included in this price?",
+    "origin": "Which origin does this price cover?",
+    "destination": "Which destination does this price cover?",
+    "included_services": "Which services are included in the quoted price?",
+    "excluded_services": "Which services are excluded, and what do they cost separately?",
 }
 
 
@@ -217,24 +218,40 @@ def _recipient(repos: Repos, quote: Quotation, carrier_id=None) -> str | None:
     return None
 
 
-def _body(shipment: Shipment, question_set: QuestionSet) -> str:
-    # Only deliberately selected routing context and carrier-facing wording leave the app.
-    return (f"Shipment: {shipment.reference}\nRoute: {shipment.origin} -> {shipment.destination}\n\n"
-            "Please clarify the following for your quotation:\n"
+def _body(shipment: Shipment, question_set: QuestionSet, carrier_name: str | None = None,
+          quote_reference: str | None = None) -> str:
+    """Carrier-facing note: short, plain business English, no internal ids or full addresses."""
+    route = route_label(shipment.origin, shipment.destination)
+    salutation = f"Dear {carrier_name}," if carrier_name else "Hello,"
+    opening = (f"Thank you for your quotation {quote_reference} for {route}."
+               if quote_reference else f"Thank you for your quotation for {route}.")
+    return (f"{salutation}\n\n{opening} "
+            "So that we can compare your offer fairly, could you confirm the following:\n\n"
             + "\n".join(f"{index}. {q.question_text}" for index, q in enumerate(question_set.questions, 1))
-            + "\n\nThank you.\n")
+            + "\n\nA short reply with these points is enough.\n\nKind regards")
+
+
+def _carrier_name(repos: Repos, draft: ClarificationDraft) -> str | None:
+    carrier = repos.get_carrier(str(draft.carrier_id)) if draft.carrier_id else None
+    return carrier.name if carrier else None
+
+
+def _quote_reference(repos: Repos, draft: ClarificationDraft) -> str | None:
+    return repos.get_quotation(str(draft.quotation_id)).quote_reference
 
 
 def _new_draft(repos: Repos, question_set: QuestionSet, quote: Quotation, carrier_id=None) -> ClarificationDraft:
     shipment = repos.get_shipment(str(question_set.shipment_id))
-    subject = f"Clarification: {shipment.reference}"
-    if quote.quote_reference:
-        subject += f" / {quote.quote_reference}"
-    subject += f" / quotation {quote.id}"
+    carrier = repos.get_carrier(str(quote.carrier_id)) if quote.carrier_id else None
+    carrier_name = carrier.name if carrier else None
+    subject = (f"Questions on quotation {quote.quote_reference}"
+               if quote.quote_reference else "Questions on your quotation")
+    subject += f" — {route_label(shipment.origin, shipment.destination)}"
     return ClarificationDraft(
         shipment_id=shipment.id, quotation_id=quote.id, carrier_id=carrier_id or question_set.carrier_id,
         question_set_id=question_set.id, quotation_version=quote.version,
-        recipient=_recipient(repos, quote, carrier_id), subject=subject, body=_body(shipment, question_set),
+        recipient=_recipient(repos, quote, carrier_id), subject=subject,
+        body=_body(shipment, question_set, carrier_name, quote.quote_reference),
     )
 
 
@@ -389,7 +406,8 @@ def edit_question(settings: Settings, question_set_id: str, index: int, text: st
         for draft in repos.list_drafts(str(shipment.id)):
             if draft.question_set_id == question_set.id and draft.status != DraftStatus.cancelled:
                 updated = draft.model_copy(update={
-                    "body": _body(shipment, question_set), "status": DraftStatus.draft,
+                    "body": _body(shipment, question_set, _carrier_name(repos, draft),
+                                  _quote_reference(repos, draft)), "status": DraftStatus.draft,
                     "approved_at": None, "updated_at": _now(),
                 })
                 repos.update_draft(updated)

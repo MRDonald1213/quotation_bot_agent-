@@ -79,8 +79,8 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
                                          ClassificationStatus.failed) and not force:
             return ProcessingSummary(
                 intake_item_id=item.id, classification=classification,
-                notes=["classification is needs_review — review with `freight intake show`, "
-                       "then re-run with --force to extract anyway"],
+                notes=["classification is needs_review — review with `freight intake show last`, "
+                       "then re-run `freight intake process last --force` to extract anyway"],
             )
 
         if selected_shipment is not None and item.shipment_id is None:
@@ -143,8 +143,8 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
                         details_json=json.dumps({"notes": route_notes})))
             return ProcessingSummary(
                 intake_item_id=item.id, classification=classification,
-                notes=notes + ["No quotation created — resolve the shipment/route, "
-                               "then re-run processing."],
+                notes=notes + ["No quotation created — resolve the shipment/route, then re-run "
+                               "`freight intake process last --force` after fixing the cause."],
             )
         shipment_id = shipment.id
 
@@ -280,8 +280,8 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
                                            "readiness": str(analysis.comparison_readiness)})))
 
         if is_proposal:
-            notes.append(f"Clarification drafts are generated after the proposed shipment is approved: "
-                         f"`freight questions generate {shipment.reference}` (or use the shipment id).")
+            notes.append("Clarification drafts are generated automatically once the proposed shipment is "
+                         "approved: `freight shipment approve last -y` (or the Approve button in `freight review`).")
         else:
             from .clarification import generate_clarification_drafts
             try:
@@ -289,7 +289,7 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
             except ModelUnavailableError as exc:
                 raise ModelUnavailableError(
                     f"Quotation {quote.id} was saved, but clarification wording failed. "
-                    f"Retry `freight questions generate {shipment_id}` after checking Ollama. {exc}"
+                    f"Retry `freight questions generate {shipment.reference}` after checking Ollama. {exc}"
                 ) from exc
             notes.extend(f"clarification draft awaiting approval: {draft.id}" for draft in drafts)
 

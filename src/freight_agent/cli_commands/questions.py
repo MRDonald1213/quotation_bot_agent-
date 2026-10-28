@@ -37,7 +37,8 @@ def generate(
         _print("Dry-run: nothing persisted; proposed IDs are not saved records.")
     elif drafts:
         _print(f"Review questions: freight questions list {shipment_record.id}")
-        _print("Review each draft with freight email show <draft-id>, then approve and export locally.")
+        _print("Approve and export each draft in `freight review` (one button) or with "
+               "freight email show/approve/export <draft-id>.")
 
 
 @typed_errors

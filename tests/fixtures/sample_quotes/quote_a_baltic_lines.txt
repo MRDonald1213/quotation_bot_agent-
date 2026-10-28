@@ -1,0 +1,24 @@
+Baltic Lines OÜ - International Freight Quotation
+Quote Reference: BL-2026-0417
+Date: 2026-10-18
+
+Route: Baku, AZ to Hamburg, DE
+Delivery scope: port to port
+Cargo: machine parts
+Gross weight: 5200 kg
+Volume: 12 m3
+
+Base ocean freight: 3,200 EUR
+Terminal handling charge: 340 EUR
+Delivery to Hamburg warehouse: to be confirmed, price TBD
+
+Includes: ocean freight
+On-carriage: excluded
+Estimated transit: 12-16 days
+This quotation is valid until 2026-11-15
+Insurance: not quoted
+Customs clearance: excluded, client to arrange
+
+Maris Ozolins
+Baltic Lines OÜ, Sales Desk
+sales@balticlines.example

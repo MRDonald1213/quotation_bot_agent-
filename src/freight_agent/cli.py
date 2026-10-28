@@ -47,10 +47,13 @@ from .cli_commands import comparison as comparison_cmd  # noqa: E402
 from .cli_commands import config as config_cmd  # noqa: E402
 from .cli_commands import db as db_cmd  # noqa: E402
 from .cli_commands import (  # noqa: E402
-    email, gaps, health, intake, questions, quote, reply, report, shipment,
+    email, gaps, health, intake, questions, quote, reply, report, review, shipment,
 )
 
 app.command(name="init")(health.cmd_init)
+app.command(name="review", help="Serve the local web app (127.0.0.1): intake, review, approval, database import and comparison.")(
+    review.review
+)
 config_app.command(name="show")(config_cmd.show)
 app.command(name="health")(health.cmd_health)
 shipment_app.command(name="create")(shipment.create)
