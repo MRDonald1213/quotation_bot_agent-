@@ -16,24 +16,66 @@ const modalCancel = document.getElementById("modal-cancel");
 const modalConfirm = document.getElementById("modal-confirm");
 const toasts = document.getElementById("toast");
 
-const state = { review: null, status: null, dirty: false, busy: new Set(), watched: null };
+const state = {
+  review: null,
+  status: null,
+  dirty: false,
+  busy: new Set(),
+  watched: null,
+};
 
 const PAGES = {
-  "": { title: "Dashboard", guide: "What the agent read, what still waits for you, and what is already in the database." },
-  documents: { title: "Documents", guide: "Drop quotation files in, run the reading step, then open a document to check it." },
-  queue: { title: "Review queue", guide: "Every decision still waiting for a person. Nothing is discarded silently." },
-  shipments: { title: "Quotations", guide: "One lane, the carriers that quoted it, and where each quote stands." },
-  comparison: { title: "Comparison", guide: "Prices compared by the Python service — the browser never does arithmetic." },
-  drafts: { title: "Drafts", guide: "Questions for the carrier, written for you to approve and send yourself." },
-  settings: { title: "System", guide: "What runs on this computer, where your data lives, and what to check if something fails." },
+  "": {
+    title: "Dashboard",
+    guide:
+      "What the agent read, what still waits for you, and what is already in the database.",
+  },
+  documents: {
+    title: "Documents",
+    guide:
+      "Drop quotation files in, run the reading step, then open a document to check it.",
+  },
+  queue: {
+    title: "Review queue",
+    guide:
+      "Every decision still waiting for a person. Nothing is discarded silently.",
+  },
+  shipments: {
+    title: "Quotations",
+    guide:
+      "One lane, the carriers that quoted it, and where each quote stands.",
+  },
+  comparison: {
+    title: "Comparison",
+    guide:
+      "Prices compared by the Python service — the browser never does arithmetic.",
+  },
+  drafts: {
+    title: "Drafts",
+    guide:
+      "Questions for the carrier, written for you to approve and send yourself.",
+  },
+  settings: {
+    title: "System",
+    guide:
+      "What runs on this computer, where your data lives, and what to check if something fails.",
+  },
 };
 
 // ------------------------------------------------------------------ helpers
 function esc(value) {
   if (value === null || value === undefined) return "";
-  return String(value).replace(/[&<>"']/g, (ch) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[ch]));
+  return String(value).replace(
+    /[&<>"']/g,
+    (ch) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[ch],
+  );
 }
 
 function show(value, fallback) {
@@ -48,28 +90,51 @@ function chip(label, kind) {
 }
 
 const FIELD_LABELS = {
-  carrier_name: "Carrier", quote_reference: "Quote reference", shipment_reference: "Shipment reference",
-  currency: "Currency", base_price: "Base price", charges: "Extra charges", known_additional_charges: "Extra charges",
-  total_known_cost: "Known total", delivery_scope: "Delivery scope", origin: "Origin", destination: "Destination",
-  transit_days: "Transit time", transit_days_min: "Transit time", transit_days_max: "Transit time",
-  valid_until: "Valid until", insurance_included: "Insurance included", customs_included: "Customs included",
-  included_services: "Services included", excluded_services: "Services excluded",
-  weight_kg: "Weight", volume_m3: "Volume", cargo_description: "Cargo", route_category: "Route type",
-  name: "Name", target_currency: "Target currency",
+  carrier_name: "Carrier",
+  quote_reference: "Quote reference",
+  shipment_reference: "Shipment reference",
+  currency: "Currency",
+  base_price: "Base price",
+  charges: "Extra charges",
+  known_additional_charges: "Extra charges",
+  total_known_cost: "Known total",
+  delivery_scope: "Delivery scope",
+  origin: "Origin",
+  destination: "Destination",
+  transit_days: "Transit time",
+  transit_days_min: "Transit time",
+  transit_days_max: "Transit time",
+  valid_until: "Valid until",
+  insurance_included: "Insurance included",
+  customs_included: "Customs included",
+  included_services: "Services included",
+  excluded_services: "Services excluded",
+  weight_kg: "Weight",
+  volume_m3: "Volume",
+  cargo_description: "Cargo",
+  route_category: "Route type",
+  name: "Name",
+  target_currency: "Target currency",
 };
 
 function field(name) {
   if (!name) return "Field";
   if (FIELD_LABELS[name]) return FIELD_LABELS[name];
-  return String(name).replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  return String(name)
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 // A route endpoint on a document is a full delivery address; people only need the city.
-const ADDRESS_NOISE = /(warehouse|terminal|depot|zone|street|str\.?|avenue|ave\.?|road|rd\.?|building|bldg\.?|block|floor|industrial|logistics|office|no\.?)/i;
+const ADDRESS_NOISE =
+  /(warehouse|terminal|depot|zone|street|str\.?|avenue|ave\.?|road|rd\.?|building|bldg\.?|block|floor|industrial|logistics|office|no\.?)/i;
 
 function place(value) {
   if (!value) return "unknown";
-  const parts = String(value).split(/[,;]|\s{2,}/).map((s) => s.trim()).filter(Boolean);
+  const parts = String(value)
+    .split(/[,;]|\s{2,}/)
+    .map((s) => s.trim())
+    .filter(Boolean);
   for (const part of parts) {
     if (part.length <= 30 && !ADDRESS_NOISE.test(part)) return part;
   }
@@ -77,7 +142,9 @@ function place(value) {
 }
 
 function clip(value, max) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
+  const text = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
   return text.length > max ? text.slice(0, max - 1).trimEnd() + "…" : text;
 }
 
@@ -99,14 +166,22 @@ function reviewChip(status) {
 }
 
 function reviewWord(status) {
-  return {extracted: "awaiting your review", approved: "approved and waiting",
-          imported: "already imported", rejected: "rejected"}[status] || String(status || "unknown");
+  return (
+    {
+      extracted: "awaiting your review",
+      approved: "approved and waiting",
+      imported: "already imported",
+      rejected: "rejected",
+    }[status] || String(status || "unknown")
+  );
 }
 
 function classificationChip(row) {
   const map = {
-    pending: ["Not read yet", "pending"], relevant: ["Freight quote", "ok"],
-    needs_review: ["Not sure — check", "warn"], irrelevant: ["Not a quote", "plain"],
+    pending: ["Not read yet", "pending"],
+    relevant: ["Freight quote", "ok"],
+    needs_review: ["Not sure — check", "warn"],
+    irrelevant: ["Not a quote", "plain"],
     failed: ["Could not classify", "bad"],
   };
   const [label, kind] = map[row.classification] || [row.classification, ""];
@@ -115,8 +190,11 @@ function classificationChip(row) {
 
 function processingChip(row) {
   const map = {
-    pending: ["Not processed", "pending"], processed: ["Read and extracted", "ok"],
-    needs_review: ["Needs review", "warn"], failed: ["Failed", "bad"], skipped: ["Skipped", "plain"],
+    pending: ["Not processed", "pending"],
+    processed: ["Read and extracted", "ok"],
+    needs_review: ["Needs review", "warn"],
+    failed: ["Failed", "bad"],
+    skipped: ["Skipped", "plain"],
   };
   const [label, kind] = map[row.processing] || [row.processing, ""];
   return chip(label, kind);
@@ -134,8 +212,11 @@ function severityChip(value) {
 }
 
 const SCOPE = {
-  port_to_port: "port to port", door_to_door: "door to door", door_to_port: "door to port",
-  port_to_door: "port to door", unknown: "not stated",
+  port_to_port: "port to port",
+  door_to_door: "door to door",
+  door_to_port: "door to port",
+  port_to_door: "port to door",
+  unknown: "not stated",
 };
 
 function scope(value) {
@@ -164,7 +245,7 @@ function ago(value) {
 }
 
 function plural(count, singular, suffix) {
-  return `${count} ${singular}${count === 1 ? "" : (suffix || "s")}`;
+  return `${count} ${singular}${count === 1 ? "" : suffix || "s"}`;
 }
 
 function toast(message, kind) {
@@ -196,11 +277,16 @@ function openModal(options) {
       document.removeEventListener("keydown", onKey);
       resolve(value);
     }
-    function onCancel() { finish(null); }
+    function onCancel() {
+      finish(null);
+    }
     function onConfirm() {
       const value = input ? input.value.trim() : true;
       if (input && !value) {
-        toast("A short reason is needed — it is kept in the audit trail.", "error");
+        toast(
+          "A short reason is needed — it is kept in the audit trail.",
+          "error",
+        );
         input.focus();
         return;
       }
@@ -225,8 +311,13 @@ async function askReason(options) {
   const body = `<p>${options.body || ""}</p>
     <label class="label" for="reason-input">${esc(options.label || "Reason")}</label>
     <textarea id="reason-input" placeholder="${esc(options.placeholder || "")}">${esc(options.value || "")}</textarea>`;
-  const value = await openModal({ title: options.title, body, confirmLabel: options.confirmLabel,
-                                  danger: options.danger, input: true });
+  const value = await openModal({
+    title: options.title,
+    body,
+    confirmLabel: options.confirmLabel,
+    danger: options.danger,
+    input: true,
+  });
   return value;
 }
 
@@ -262,12 +353,19 @@ function fail(exc) {
 }
 
 function limits() {
-  return (state.status && state.status.limits) || { max_file_size_mb: 25, supported_extensions: [], confidence_threshold: 0.8 };
+  return (
+    (state.status && state.status.limits) || {
+      max_file_size_mb: 25,
+      supported_extensions: [],
+      confidence_threshold: 0.8,
+    }
+  );
 }
 
 function jobLine(job) {
   if (!job) return "";
-  if (job.status === "succeeded") return `<span class="jobline"><span class="dot ok"></span> Processing result ready — check the details below</span>`;
+  if (job.status === "succeeded")
+    return `<span class="jobline"><span class="dot ok"></span> Processing result ready — check the details below</span>`;
   if (job.status === "failed") {
     return `<span class="jobline"><span class="dot bad"></span> Stopped: ${esc(job.error || "the run did not finish")}</span>`;
   }
@@ -291,12 +389,13 @@ async function refreshStatus() {
   const s = state.status;
   const modelLine = !s.ollama.reachable
     ? `<div class="line bad"><span class="dot bad"></span> Local model is offline</div>`
-    : (s.ollama.model_installed === false
+    : s.ollama.model_installed === false
       ? `<div class="line warn"><span class="dot warn"></span> ${esc(s.ollama.model)} is not installed</div>`
-      : `<div class="line"><span class="dot ok"></span> ${esc(s.ollama.model || "local model")}</div>`);
-  host.innerHTML = modelLine
-    + `<div class="line"><span class="dot ${s.database.initialized ? "ok" : "warn"}"></span> Database ${s.database.initialized ? "ready" : "needs init"}</div>`
-    + `<div class="line"><a href="#/settings">System details</a></div>`;
+      : `<div class="line"><span class="dot ok"></span> ${esc(s.ollama.model || "local model")}</div>`;
+  host.innerHTML =
+    modelLine +
+    `<div class="line"><span class="dot ${s.database.initialized ? "ok" : "warn"}"></span> Database ${s.database.initialized ? "ready" : "needs init"}</div>` +
+    `<div class="line"><a href="#/settings">System details</a></div>`;
 }
 
 // -------------------------------------------------------------------- routes
@@ -308,7 +407,9 @@ function parseHash() {
 
 function markActive(page) {
   for (const link of nav.querySelectorAll("a")) {
-    const linkPage = (link.getAttribute("href") || "#/").replace(/^#\/?/, "").split("/")[0];
+    const linkPage = (link.getAttribute("href") || "#/")
+      .replace(/^#\/?/, "")
+      .split("/")[0];
     link.classList.toggle("active", linkPage === (page || ""));
   }
 }
@@ -337,7 +438,8 @@ async function route() {
   if (page === "documents") return id ? pageReview(id) : pageDocuments();
   if (page === "queue") return pageQueue();
   if (page === "shipments") return id ? pageShipment(id) : pageShipments();
-  if (page === "comparison") return id ? pageComparison(id) : pageComparisonIndex();
+  if (page === "comparison")
+    return id ? pageComparison(id) : pageComparisonIndex();
   if (page === "drafts") return pageDrafts();
   if (page === "settings") return pageSettings();
   view.innerHTML = empty("This page does not exist.");
@@ -350,7 +452,9 @@ async function loadReview() {
 
 function findShipment(id) {
   const review = state.review || { shipments: [] };
-  return review.shipments.find((s) => s.id === id || s.reference === id) || null;
+  return (
+    review.shipments.find((s) => s.id === id || s.reference === id) || null
+  );
 }
 
 function labelOf(shipment) {
@@ -367,24 +471,63 @@ async function pageDashboard() {
     return fail(exc);
   }
   const c = data.counts;
-  const live = data.jobs.filter((j) => j.status === "queued" || j.status === "running");
-  const failed = data.recent.filter((d) => d.processing === "failed" || d.classification === "failed").length;
+  const live = data.jobs.filter(
+    (j) => j.status === "queued" || j.status === "running",
+  );
+  const failed = data.recent.filter(
+    (d) => d.processing === "failed" || d.classification === "failed",
+  ).length;
   const attention = [];
-  if (c.proposals) attention.push([plural(c.proposals, "new route", "s"), "awaiting your approval or correction", "#/queue"]);
-  if (c.awaiting_review) attention.push([plural(c.awaiting_review, "extracted quote"), "awaiting your review", "#/queue"]);
-  if (c.ready_to_import) attention.push([plural(c.ready_to_import, "approved quote"), "ready to import into the database", "#/queue"]);
-  if (c.gaps) attention.push([plural(c.gaps, "item", "s"), "still missing from the quotes the agent read", "#/shipments"]);
-  if (c.drafts) attention.push([plural(c.drafts, "question draft"), "ready for you to approve and send yourself", "#/drafts"]);
-  if (failed) attention.push([plural(failed, "document"), "could not be read — open it to see why", "#/documents"]);
-  if (live.length) attention.push([plural(live.length, "document"), "being read right now", "#/documents"]);
+  if (c.proposals)
+    attention.push([
+      plural(c.proposals, "new route", "s"),
+      "awaiting your approval or correction",
+      "#/queue",
+    ]);
+  if (c.awaiting_review)
+    attention.push([
+      plural(c.awaiting_review, "extracted quote"),
+      "awaiting your review",
+      "#/queue",
+    ]);
+  if (c.ready_to_import)
+    attention.push([
+      plural(c.ready_to_import, "approved quote"),
+      "ready to import into the database",
+      "#/queue",
+    ]);
+  if (c.gaps)
+    attention.push([
+      plural(c.gaps, "item", "s"),
+      "still missing from the quotes the agent read",
+      "#/shipments",
+    ]);
+  if (c.drafts)
+    attention.push([
+      plural(c.drafts, "question draft"),
+      "ready for you to approve and send yourself",
+      "#/drafts",
+    ]);
+  if (failed)
+    attention.push([
+      plural(failed, "document"),
+      "could not be read — open it to see why",
+      "#/documents",
+    ]);
+  if (live.length)
+    attention.push([
+      plural(live.length, "document"),
+      "being read right now",
+      "#/documents",
+    ]);
 
   const ollamaNote = !state.status
     ? '<div class="note bad">The backend is not answering. Start it with <code>freight review</code> in a terminal.</div>'
-    : (state.status.ollama.reachable
-      ? (state.status.ollama.model_installed === false
+    : state.status.ollama.reachable
+      ? state.status.ollama.model_installed === false
         ? `<div class="note warn">Ollama is running but <strong>${esc(state.status.ollama.model)}</strong> is not installed. Run <code>ollama pull ${esc(state.status.ollama.model)}</code>.</div>`
-        : "")
-      : '<div class="note bad">Ollama is not running, so documents cannot be read. Start it with <code>ollama serve</code>. Nothing is ever sent to a cloud model.</div>');
+        : ""
+      : '<div class="note bad">Ollama is not running, so documents cannot be read. Start it with <code>ollama serve</code>. Nothing is ever sent to a cloud model.</div>';
 
   view.innerHTML = `
     <section class="hero rise">
@@ -401,12 +544,21 @@ async function pageDashboard() {
     </section>
 
     <h2>Needs your attention</h2>
-    ${attention.length ? `<div class="list">${attention.map(([count, rest, href], i) => `
+    ${
+      attention.length
+        ? `<div class="list">${attention
+            .map(
+              ([count, rest, href], i) => `
       <a class="panel rise${i > 1 ? "-2" : ""}" href="${esc(href)}" style="text-decoration:none;color:inherit;display:flex;justify-content:space-between;align-items:center;gap:12px">
         <span><strong>${esc(count)}</strong> <span class="meta">${esc(rest)}</span></span>
         <span class="meta">open →</span>
-      </a>`).join("")}</div>`
-      : empty("Nothing waits for a decision right now. New uploads appear here automatically.")}
+      </a>`,
+            )
+            .join("")}</div>`
+        : empty(
+            "Nothing waits for a decision right now. New uploads appear here automatically.",
+          )
+    }
 
     ${ollamaNote ? `<div style="margin-top:14px">${ollamaNote}</div>` : ""}
 
@@ -415,24 +567,40 @@ async function pageDashboard() {
       ${plural(c.imported, "quote")} in the database · ${plural(c.ready_to_import, "quote")} approved and waiting to import</p>
 
     <h2>Recent documents</h2>
-    ${data.recent.length ? `<div class="panel"><table>
+    ${
+      data.recent.length
+        ? `<div class="panel"><table>
       <thead><tr><th>Document</th><th>What the agent decided</th><th>Next step</th></tr></thead>
-      <tbody>${data.recent.map((d) => `
+      <tbody>${data.recent
+        .map(
+          (d) => `
         <tr>
           <td><a class="name" href="${esc(d.target)}">${esc(fileName(d.file))}</a>
             <div class="sub">${esc(ago(d.created_at))}</div></td>
           <td>${classificationChip(d)} ${processingChip(d)}
             ${d.reason ? `<div class="sub">${esc(clip(d.reason, 110))}</div>` : ""}</td>
           <td><a href="${esc(d.target)}">${esc(d.next_action)}</a></td>
-        </tr>`).join("")}</tbody></table></div>`
-      : empty("No documents yet. Upload a quotation on the Documents page to start.")}
+        </tr>`,
+        )
+        .join("")}</tbody></table></div>`
+        : empty(
+            "No documents yet. Upload a quotation on the Documents page to start.",
+          )
+    }
 
     <h2>Recent changes</h2>
-    ${data.activity.length ? `<div class="list">${data.activity.map((a) => `
+    ${
+      data.activity.length
+        ? `<div class="list">${data.activity
+            .map(
+              (a) => `
       <div class="panel" style="display:flex;justify-content:space-between;gap:12px">
         <span>${esc(a.text)}</span><span class="meta">${esc(ago(a.at))}</span>
-      </div>`).join("")}</div>`
-      : `<p class="meta">Nothing recorded yet.</p>`}
+      </div>`,
+            )
+            .join("")}</div>`
+        : `<p class="meta">Nothing recorded yet.</p>`
+    }
 
     <div class="row" style="margin-top:20px">
       <a class="btn big" href="#/documents">Upload documents</a>
@@ -490,22 +658,29 @@ async function pageDocuments() {
   const renderStaged = (clear) => {
     if (clear) staged = [];
     uploadBtn.disabled = staged.length === 0;
-    uploadBtn.textContent = staged.length ? `Upload ${staged.length} file(s)` : "Upload";
+    uploadBtn.textContent = staged.length
+      ? `Upload ${staged.length} file(s)`
+      : "Upload";
   };
   const stage = (files) => {
     staged = staged.concat(Array.from(files));
     renderStaged();
   };
   picker.addEventListener("change", () => stage(picker.files));
-  ["dragenter", "dragover"].forEach((evt) => drop.addEventListener(evt, (event) => {
-    event.preventDefault();
-    drop.classList.add("over");
-  }));
-  ["dragleave", "dragend"].forEach((evt) => drop.addEventListener(evt, () => drop.classList.remove("over")));
+  ["dragenter", "dragover"].forEach((evt) =>
+    drop.addEventListener(evt, (event) => {
+      event.preventDefault();
+      drop.classList.add("over");
+    }),
+  );
+  ["dragleave", "dragend"].forEach((evt) =>
+    drop.addEventListener(evt, () => drop.classList.remove("over")),
+  );
   drop.addEventListener("drop", (event) => {
     event.preventDefault();
     drop.classList.remove("over");
-    if (event.dataTransfer && event.dataTransfer.files.length) stage(event.dataTransfer.files);
+    if (event.dataTransfer && event.dataTransfer.files.length)
+      stage(event.dataTransfer.files);
   });
   uploadBtn.addEventListener("click", () => runUpload(staged, renderStaged));
 
@@ -514,29 +689,48 @@ async function pageDocuments() {
     const needle = document.getElementById("q").value.trim().toLowerCase();
     const status = document.getElementById("f-status").value;
     const kind = document.getElementById("f-kind").value;
-    tableHost.innerHTML = documentTable(rows.filter((r) => {
-      if (status && r.processing !== status && r.classification !== status) return false;
-      if (kind && !r.file.toLowerCase().endsWith(kind)) return false;
-      if (needle && !(r.file.toLowerCase().includes(needle) || (r.reason || "").toLowerCase().includes(needle))) return false;
-      return true;
-    }));
+    tableHost.innerHTML = documentTable(
+      rows.filter((r) => {
+        if (status && r.processing !== status && r.classification !== status)
+          return false;
+        if (kind && !r.file.toLowerCase().endsWith(kind)) return false;
+        if (
+          needle &&
+          !(
+            r.file.toLowerCase().includes(needle) ||
+            (r.reason || "").toLowerCase().includes(needle)
+          )
+        )
+          return false;
+        return true;
+      }),
+    );
   };
-  ["q", "f-status", "f-kind"].forEach((id) => document.getElementById(id).addEventListener("input", apply));
+  ["q", "f-status", "f-kind"].forEach((id) =>
+    document.getElementById(id).addEventListener("input", apply),
+  );
 }
 
 function documentTable(rows) {
   if (!rows.length) {
-    return empty("No documents yet. Upload one above — it is parsed and hash-checked on this machine.");
+    return empty(
+      "No documents yet. Upload one above — it is parsed and hash-checked on this machine.",
+    );
   }
   return `<div class="panel"><table>
     <thead><tr><th>Document</th><th class="num">Size</th><th>What the agent decided</th><th>Reading</th><th>Lane</th><th></th></tr></thead>
-    <tbody>${rows.map((r) => `
+    <tbody>${rows
+      .map(
+        (r) => `
       <tr>
         <td><a class="name" href="#/documents/${esc(r.id)}">${esc(fileName(r.file))}</a>
           ${r.reason ? `<div class="sub">${esc(clip(r.reason, 110))}</div>` : ""}</td>
         <td class="num meta">${esc(fileSize(r.size_bytes))}<div class="sub">${esc(ago(r.created_at))}</div></td>
-        <td>${classificationChip(r)}${r.confidence !== null && r.confidence !== undefined
-          ? ` <span class="meta">${esc(Math.round(r.confidence * 100))}% sure</span>` : ""}</td>
+        <td>${classificationChip(r)}${
+          r.confidence !== null && r.confidence !== undefined
+            ? ` <span class="meta">${esc(Math.round(r.confidence * 100))}% sure</span>`
+            : ""
+        }</td>
         <td>${processingChip(r)}</td>
         <td class="meta">${r.shipment_label ? `<a href="#/shipments/${esc(r.shipment_id)}">${esc(r.shipment_label)}</a>` : "—"}</td>
         <td class="row tight">
@@ -546,7 +740,9 @@ function documentTable(rows) {
             >${r.processing === "processed" ? "Read again" : "Read this document"}</button>
           ${r.classification !== "irrelevant" ? `<button class="btn small destructive" data-act="ignore" data-id="${esc(r.id)}" data-file="${esc(r.file)}">Not a quote</button>` : `<span class="chip plain">Retained as not a quote</span>`}
         </td>
-      </tr>`).join("")}</tbody></table></div>`;
+      </tr>`,
+      )
+      .join("")}</tbody></table></div>`;
 }
 
 async function runUpload(files, renderStaged) {
@@ -560,23 +756,48 @@ async function runUpload(files, renderStaged) {
     const result = await api.upload(files, "error");
     host.innerHTML = `<div class="panel"><table>
       <thead><tr><th>File</th><th>Result</th><th></th></tr></thead>
-      <tbody>${result.results.map((entry) => `
+      <tbody>${result.results
+        .map(
+          (entry) => `
         <tr>
           <td class="name">${esc(fileName(entry.file))}</td>
-          <td>${chip(entry.status === "registered" ? "Stored" : entry.status === "duplicate" ? "Already imported" : "Rejected",
-                     entry.status === "registered" ? "ok" : entry.status === "duplicate" ? "warn" : "bad")}
+          <td>${chip(
+            entry.status === "registered"
+              ? "Stored"
+              : entry.status === "duplicate"
+                ? "Already imported"
+                : "Rejected",
+            entry.status === "registered"
+              ? "ok"
+              : entry.status === "duplicate"
+                ? "warn"
+                : "bad",
+          )}
             <div class="sub">${esc(clip(entry.error || entry.message || "", 140))}</div></td>
           <td class="row tight">
-            ${entry.intake_id && entry.status !== "duplicate"
-              ? `<a class="btn small neutral" href="#/documents/${esc(entry.intake_id)}">Open</a>
-                 <button class="btn small" data-act="process" data-id="${esc(entry.intake_id)}" data-force="0">Read this document</button>` : ""}
-            ${entry.status === "duplicate" && entry.intake_id
-              ? `<button class="btn small neutral" data-act="skip" data-id="${esc(entry.intake_id)}">Keep the existing copy</button>
-                 <button class="btn small subtle" data-act="process" data-id="${esc(entry.intake_id)}" data-force="1">Read it again anyway</button>` : ""}
+            ${
+              entry.intake_id && entry.status !== "duplicate"
+                ? `<a class="btn small neutral" href="#/documents/${esc(entry.intake_id)}">Open</a>
+                 <button class="btn small" data-act="process" data-id="${esc(entry.intake_id)}" data-force="0">Read this document</button>`
+                : ""
+            }
+            ${
+              entry.status === "duplicate" && entry.intake_id
+                ? `<button class="btn small neutral" data-act="skip" data-id="${esc(entry.intake_id)}">Keep the existing copy</button>
+                 <button class="btn small subtle" data-act="process" data-id="${esc(entry.intake_id)}" data-force="1">Read it again anyway</button>`
+                : ""
+            }
           </td>
-        </tr>`).join("")}</tbody></table></div>`;
+        </tr>`,
+        )
+        .join("")}</tbody></table></div>`;
     const ok = result.results.filter((r) => r.status === "registered").length;
-    toast(ok ? `${ok} file(s) stored locally` : "nothing was stored — see the result above", ok ? "ok" : "error");
+    toast(
+      ok
+        ? `${ok} file(s) stored locally`
+        : "nothing was stored — see the result above",
+      ok ? "ok" : "error",
+    );
     renderStaged(true);
   });
   renderStaged(true);
@@ -619,10 +840,12 @@ async function pageReview(intakeId) {
         ${doc.sender ? `<p class="meta">From ${esc(doc.sender)}${doc.subject ? " · " + esc(clip(doc.subject, 80)) : ""}</p>` : ""}
         ${doc.reason ? `<div class="note warn" style="margin-top:8px">${esc(clip(doc.reason, 400))}</div>` : ""}
         <div class="row tight" style="margin:12px 0">
-          ${doc.classification === "irrelevant"
-            ? '<button class="btn neutral" disabled>Marked not a quote</button>'
-            : `<button class="btn" data-act="process" data-id="${esc(doc.id)}" data-force="${hasQuote ? "1" : "0"}"
-            >${hasQuote ? "Read this document again" : "Read this document"}</button>`}
+          ${
+            doc.classification === "irrelevant"
+              ? '<button class="btn neutral" disabled>Marked not a quote</button>'
+              : `<button class="btn" data-act="process" data-id="${esc(doc.id)}" data-force="${hasQuote ? "1" : "0"}"
+            >${hasQuote ? "Read this document again" : "Read this document"}</button>`
+          }
           <a class="btn neutral" href="/api/documents/${esc(doc.id)}/source" download="${esc(doc.file)}">Open the original</a>
         </div>
         <p class="meta">The text below is the document itself. It is data only: nothing written inside it can
@@ -631,10 +854,16 @@ async function pageReview(intakeId) {
       </section>
 
       <section class="list">
-        ${doc.shipment ? shipmentCard(doc.shipment, shipment)
-          : '<div class="empty">No lane is linked to this document yet. Reading it resolves the route and proposes one for your approval.</div>'}
-        ${hasQuote ? quotations.map((block) => quoteBlock(block, shipment)).join("")
-          : '<div class="empty">Nothing has been extracted from this document yet.</div>'}
+        ${
+          doc.shipment
+            ? shipmentCard(doc.shipment, shipment)
+            : '<div class="empty">No lane is linked to this document yet. Reading it resolves the route and proposes one for your approval.</div>'
+        }
+        ${
+          hasQuote
+            ? quotations.map((block) => quoteBlock(block, shipment)).join("")
+            : '<div class="empty">Nothing has been extracted from this document yet.</div>'
+        }
       </section>
     </div>`;
 
@@ -655,11 +884,29 @@ function shipmentCard(docShipment, fullShipment) {
       <div><div class="k">Route type</div><div class="v">${show(docShipment.route_category, "not stated")}</div></div>
     </div>
     <p class="meta">As written in the document: ${esc(clip(docShipment.origin || "?", 90))} → ${esc(clip(docShipment.destination || "?", 90))}</p>
-    ${evidence.length ? `<p class="evidence">Where the route came from:
-      ${evidence.map((e) => typeof e === "string" ? esc(e) : esc([field(e.field_name), e.page_or_sheet].filter(Boolean).join(" · "))
-        + (e.source_filename ? " in " + esc(fileName(e.source_filename)) : "")
-        + (e.snippet ? ` — <q>${esc(clip(e.snippet, 120))}</q>` : "")).join("; ")}</p>` : ""}
-    ${editable ? `
+    ${
+      evidence.length
+        ? `<p class="evidence">Where the route came from:
+      ${evidence
+        .map((e) =>
+          typeof e === "string"
+            ? esc(e)
+            : esc(
+                [field(e.field_name), e.page_or_sheet]
+                  .filter(Boolean)
+                  .join(" · "),
+              ) +
+              (e.source_filename
+                ? " in " + esc(fileName(e.source_filename))
+                : "") +
+              (e.snippet ? ` — <q>${esc(clip(e.snippet, 120))}</q>` : ""),
+        )
+        .join("; ")}</p>`
+        : ""
+    }
+    ${
+      editable
+        ? `
       <div class="row tight" style="margin-top:10px">
         <input type="text" id="sh-origin" placeholder="Origin" value="${esc(docShipment.origin || "")}" aria-label="Origin">
         <input type="text" id="sh-destination" placeholder="Destination" value="${esc(docShipment.destination || "")}" aria-label="Destination">
@@ -670,7 +917,9 @@ function shipmentCard(docShipment, fullShipment) {
           data-updated="${esc(fullShipment.updated_at || "")}">Approve this lane</button>
         <button class="btn small destructive" data-act="shipment-reject" data-id="${esc(docShipment.id)}">Reject</button>
       </div>
-      <p class="meta">Approving the lane also prepares the questions for the carrier.</p>` : ""}
+      <p class="meta">Approving the lane also prepares the questions for the carrier.</p>`
+        : ""
+    }
   </section>`;
 }
 
@@ -680,10 +929,14 @@ function quoteBlock(block, shipment) {
   const evidence = block.evidence || [];
   const blocking = gaps.filter((g) => g.severity === "critical").length;
   const charges = q.known_additional_charges || [];
-  const yesNo = (value) => (value === null || value === undefined ? null : (value ? "yes" : "no"));
+  const yesNo = (value) =>
+    value === null || value === undefined ? null : value ? "yes" : "no";
   const row = (key, value) => `<li>
-      <div class="row spread"><strong>${esc(field(key))}</strong>${value === null || value === undefined || value === ""
-        ? chip("Missing", "pending") : chip("Extracted", "ok")}</div>
+      <div class="row spread"><strong>${esc(field(key))}</strong>${
+        value === null || value === undefined || value === ""
+          ? chip("Missing", "pending")
+          : chip("Extracted", "ok")
+      }</div>
       <div>${show(value)}</div>
     </li>`;
   const carrier = q.carrier || "carrier not named";
@@ -698,9 +951,22 @@ function quoteBlock(block, shipment) {
       <div><div class="k">Known total</div><div class="v">${show(q.total_known_cost, "cannot be totalled yet")}</div></div>
       <div><div class="k">Comparison</div><div class="v">${show(q.comparison_status, "not comparable yet")}</div></div>
     </div>
-    ${charges.length ? `<p class="evidence">Extra charges: ${charges.map((c) => esc(c.label) + " "
-      + esc(c.amount === null ? "price not stated" : c.amount) + esc(c.currency ? " " + c.currency : "")
-      + (c.included_in_base_price === false ? " (not in the base price)" : "")).join(" · ")}</p>` : ""}
+    ${
+      charges.length
+        ? `<p class="evidence">Extra charges: ${charges
+            .map(
+              (c) =>
+                esc(c.label) +
+                " " +
+                esc(c.amount === null ? "price not stated" : c.amount) +
+                esc(c.currency ? " " + c.currency : "") +
+                (c.included_in_base_price === false
+                  ? " (not in the base price)"
+                  : ""),
+            )
+            .join(" · ")}</p>`
+        : ""
+    }
     ${q.included_services && q.included_services.length ? `<p class="evidence">Included: ${q.included_services.map(esc).join(", ")}</p>` : ""}
     ${q.excluded_services && q.excluded_services.length ? `<p class="evidence">Excluded: ${q.excluded_services.map(esc).join(", ")}</p>` : ""}
     ${q.assumptions && q.assumptions.length ? `<p class="evidence">Assumptions: ${q.assumptions.map(esc).join("; ")}</p>` : ""}
@@ -710,22 +976,36 @@ function quoteBlock(block, shipment) {
       ${row("quote_reference", q.quote_reference)}
       ${row("origin", q.origin)}
       ${row("destination", q.destination)}
-      ${row("transit_days", q.transit_days_min === null || q.transit_days_min === undefined
-        ? null : q.transit_days_min + "–" + q.transit_days_max + " days")}
+      ${row(
+        "transit_days",
+        q.transit_days_min === null || q.transit_days_min === undefined
+          ? null
+          : q.transit_days_min + "–" + q.transit_days_max + " days",
+      )}
       ${row("valid_until", q.valid_until)}
       ${row("delivery_scope", q.delivery_scope ? scope(q.delivery_scope) : null)}
       ${row("insurance_included", yesNo(q.insurance_included))}
       ${row("customs_included", yesNo(q.customs_included))}
       ${row("base_price", q.base_price === null ? null : q.base_price + " " + (q.currency || ""))}
     </ul>
-    ${evidence.length ? `<h4>Evidence (${evidence.length})</h4><ul class="fields">
-      ${evidence.map((e) => `
+    ${
+      evidence.length
+        ? `<h4>Evidence (${evidence.length})</h4><ul class="fields">
+      ${evidence
+        .map(
+          (e) => `
         <li>
           <div class="row spread">
             <strong>${esc(field(e.field_name))}</strong>
-            ${e.validation_status === "needs_review" ? chip("Not confirmed", "warn")
-              : e.validation_status === "rejected" ? chip("Sent back", "bad")
-              : e.validation_status === "accepted" ? chip("Confirmed", "ok") : chip("New", "plain")}
+            ${
+              e.validation_status === "needs_review"
+                ? chip("Not confirmed", "warn")
+                : e.validation_status === "rejected"
+                  ? chip("Sent back", "bad")
+                  : e.validation_status === "accepted"
+                    ? chip("Confirmed", "ok")
+                    : chip("New", "plain")
+            }
           </div>
           <div>Read as: <strong>${esc(e.value_as_extracted)}</strong></div>
           <div class="evidence">${esc(fileName(e.source_filename))}${e.page_or_sheet ? " · " + esc(e.page_or_sheet) : ""}
@@ -735,14 +1015,26 @@ function quoteBlock(block, shipment) {
             <button class="btn small" data-act="evidence" data-id="${esc(e.id)}" data-accept="1"
               data-quoted="${esc(field(e.field_name))}">Confirm this value</button>
             <button class="btn small destructive" data-act="evidence" data-id="${esc(e.id)}" data-accept="0"
-              data-quoted="${esc(field(e.field_name))}">Send back</button>
+              data-quoted="${esc(field(e.field_name))}">Flag for review</button>
           </div>
-        </li>`).join("")}</ul>` : ""}
+        </li>`,
+        )
+        .join("")}</ul>`
+        : ""
+    }
 
     <h4>Still missing (${gaps.length})</h4>
-    ${blocking ? `<div class="note bad">${plural(blocking, "item")} block${blocking === 1 ? "s" : ""} a fair price
-      comparison — a charge with no stated price is never treated as zero.</div>` : ""}
-    ${gaps.length ? `<ul class="fields">${gaps.map((g) => `
+    ${
+      blocking
+        ? `<div class="note bad">${plural(blocking, "item")} block${blocking === 1 ? "s" : ""} a fair price
+      comparison — a charge with no stated price is never treated as zero.</div>`
+        : ""
+    }
+    ${
+      gaps.length
+        ? `<ul class="fields">${gaps
+            .map(
+              (g) => `
       <li>
         <div class="row spread"><strong>${esc(field(g.field_name))}</strong>${severityChip(g.severity)}</div>
         <div class="meta">${esc(clip(g.description, 260))}</div>
@@ -751,7 +1043,11 @@ function quoteBlock(block, shipment) {
           <button class="btn small neutral" data-act="waive" data-id="${esc(g.id)}" data-field="${esc(field(g.field_name))}">
             Waive — with a reason</button>
         </div>
-      </li>`).join("")}</ul>` : `<p class="meta">Nothing is missing from this quote.</p>`}
+      </li>`,
+            )
+            .join("")}</ul>`
+        : `<p class="meta">Nothing is missing from this quote.</p>`
+    }
 
     <h4>Your review notes</h4>
     <textarea id="notes-${esc(q.id)}" placeholder="Kept with the decision on this computer only."
@@ -764,10 +1060,13 @@ function quoteBlock(block, shipment) {
       <button class="btn destructive" data-act="review-reject" data-id="${esc(q.id)}"
         ${q.review_status === "imported" ? "disabled" : ""}>Reject</button>
     </div>
-    ${q.review_status === "imported"
-      ? `<p class="meta">In the database since ${esc(when(q.imported_at))} — reading the document again creates a new version to review.</p>`
-      : q.review_status === "approved"
-        ? `<p class="meta">Approved ${esc(when(q.reviewed_at))}. Importing is a separate, deliberate step.</p>` : ""}
+    ${
+      q.review_status === "imported"
+        ? `<p class="meta">In the database since ${esc(when(q.imported_at))} — reading the document again creates a new version to review.</p>`
+        : q.review_status === "approved"
+          ? `<p class="meta">Approved ${esc(when(q.reviewed_at))}. Importing is a separate, deliberate step.</p>`
+          : ""
+    }
     ${shipment ? `<p style="margin-top:10px"><a class="btn small neutral" href="#/shipments/${esc(shipment.id)}">Open this lane and its comparison</a></p>` : ""}
   </section>`;
 }
@@ -775,7 +1074,11 @@ function quoteBlock(block, shipment) {
 function watchExistingJob(intakeId) {
   busy("jobs", async () => {
     const jobs = await api.get("/api/jobs");
-    const live = jobs.find((j) => j.subject_id === intakeId && (j.status === "queued" || j.status === "running"));
+    const live = jobs.find(
+      (j) =>
+        j.subject_id === intakeId &&
+        (j.status === "queued" || j.status === "running"),
+    );
     if (live) trackJob(live);
   });
 }
@@ -787,10 +1090,18 @@ function readingResultMessage(result) {
   }
   if (result.created_quote) return "Quote extracted — ready for review";
   const notes = (result.notes || []).join(" ").toLowerCase();
-  if (notes.includes("not a quote") || notes.includes("marked irrelevant") || notes.includes("irrelevant/rejected")) {
+  if (
+    notes.includes("not a quote") ||
+    notes.includes("marked irrelevant") ||
+    notes.includes("irrelevant/rejected")
+  ) {
     return "No quote extracted — this document is marked not a quote";
   }
-  if (notes.includes("needs_review") || notes.includes("classification review") || notes.includes("no quotation created")) {
+  if (
+    notes.includes("needs_review") ||
+    notes.includes("classification review") ||
+    notes.includes("no quotation created")
+  ) {
     return "Reading stopped with a review item — no quote was created";
   }
   return "Processing completed with no quote created — check the document details";
@@ -804,7 +1115,8 @@ function trackJob(job) {
     slot.innerHTML = jobLine(update);
   };
   paint(job);
-  api.pollJob(job.id, paint)
+  api
+    .pollJob(job.id, paint)
     .then((finalJob) => {
       toast(readingResultMessage(finalJob.result), "ok");
       state.watched = null;
@@ -829,50 +1141,90 @@ async function pageQueue() {
   const threshold = limits().confidence_threshold;
   const rows = [];
   for (const doc of review.documents) {
-    const uncertain = doc.classification === "needs_review" || doc.classification === "pending";
-    const failed = doc.classification === "failed" || doc.processing === "failed";
+    const uncertain =
+      doc.classification === "needs_review" || doc.classification === "pending";
+    const failed =
+      doc.classification === "failed" || doc.processing === "failed";
     rows.push({
-      kind: "document", id: doc.id, title: fileName(doc.file),
-      reason: doc.reason ? clip(doc.reason, 180) : "This document has not been read yet.",
-      blocking: failed, chips: [classificationChip(doc), processingChip(doc)],
-      lowConfidence: doc.confidence !== null && doc.confidence !== undefined && doc.confidence < threshold,
+      kind: "document",
+      id: doc.id,
+      title: fileName(doc.file),
+      reason: doc.reason
+        ? clip(doc.reason, 180)
+        : "This document has not been read yet.",
+      blocking: failed,
+      chips: [classificationChip(doc), processingChip(doc)],
+      lowConfidence:
+        doc.confidence !== null &&
+        doc.confidence !== undefined &&
+        doc.confidence < threshold,
       uncertain,
-      target: "#/documents/" + doc.id, action: "Open the document",
+      target: "#/documents/" + doc.id,
+      action: "Open the document",
     });
   }
   for (const shipment of review.shipments) {
     if (shipment.status === "needs_review") {
       rows.push({
-        kind: "route", id: shipment.id, title: `New lane: ${shipment.route}`,
-        reason: "The agent read this route from a document. Approving it locks the lane and prepares the carrier questions.",
-        blocking: true, chips: [chip("Needs your approval", "warn")],
-        lowConfidence: false, uncertain: true,
-        target: "#/documents/" + (shipment.quotes[0] ? shipment.quotes[0].intake_item_id : shipment.id),
+        kind: "route",
+        id: shipment.id,
+        title: `New lane: ${shipment.route}`,
+        reason:
+          "The agent read this route from a document. Approving it locks the lane and prepares the carrier questions.",
+        blocking: true,
+        chips: [chip("Needs your approval", "warn")],
+        lowConfidence: false,
+        uncertain: true,
+        target:
+          "#/documents/" +
+          (shipment.quotes[0]
+            ? shipment.quotes[0].intake_item_id
+            : shipment.id),
         action: "Check the route",
       });
     }
     for (const q of shipment.quotes) {
       const blocking = q.gaps.filter((g) => g.severity === "critical").length;
       const undecided = q.review_evidence.length;
-      if (q.review_status !== "extracted" && blocking === 0 && undecided === 0) continue;
+      if (q.review_status !== "extracted" && blocking === 0 && undecided === 0)
+        continue;
       rows.push({
-        kind: "quote", id: q.id, title: `${shipment.route} · ${q.carrier}`,
-        reason: `${plural(q.gaps.length, "missing item")}${blocking ? `, ${blocking} of them block a fair comparison` : ""}`
-          + (undecided ? ` · ${plural(undecided, "extracted value")} not confirmed` : ""),
-        blocking: blocking > 0, chips: [reviewChip(q.review_status)],
+        kind: "quote",
+        id: q.id,
+        title: `${shipment.route} · ${q.carrier}`,
+        reason:
+          `${plural(q.gaps.length, "missing item")}${blocking ? `, ${blocking} of them block a fair comparison` : ""}` +
+          (undecided
+            ? ` · ${plural(undecided, "extracted value")} not confirmed`
+            : ""),
+        blocking: blocking > 0,
+        chips: [reviewChip(q.review_status)],
         lowConfidence: q.review_evidence.some((e) => e.status !== "accepted"),
         uncertain: false,
-        target: "#/documents/" + q.intake_item_id, action: "Review this quote",
+        target: "#/documents/" + q.intake_item_id,
+        action: "Review this quote",
       });
     }
   }
-  const filters = [["", "Everything"], ["critical", "Blocking comparison"], ["low", "Agent unsure"],
-                   ["uncertain", "Needs a decision"], ["ready", "Quotes to review"]];
+  const filters = [
+    ["", "Everything"],
+    ["critical", "Blocking comparison"],
+    ["low", "Agent unsure"],
+    ["uncertain", "Needs a decision"],
+    ["ready", "Quotes to review"],
+  ];
   view.innerHTML = `
     <div class="row spread">
       <div class="row tight" id="queue-filters">
-        ${filters.map(([value, label], i) => `<button class="btn small ${i === 0 ? "" : "neutral"}"
-          data-filter="${esc(value)}">${esc(label)}</button>`).join("")}
+        ${filters
+          .map(
+            (
+              [value, label],
+              i,
+            ) => `<button class="btn small ${i === 0 ? "" : "neutral"}"
+          data-filter="${esc(value)}">${esc(label)}</button>`,
+          )
+          .join("")}
       </div>
       <button class="btn neutral" data-act="reload">Refresh</button>
     </div>
@@ -889,29 +1241,46 @@ async function pageQueue() {
       if (filter === "ready") return r.kind === "quote";
       return true;
     });
-    list.innerHTML = subset.length ? subset.map((r) => `
+    list.innerHTML = subset.length
+      ? subset
+          .map(
+            (r) => `
       <div class="panel">
         <div class="row spread"><strong>${esc(r.title)}</strong><span class="row tight">${r.chips.join(" ")}</span></div>
         <div class="meta">${esc(r.reason)}</div>
         <div class="row tight" style="margin-top:8px">
           <a class="btn small" href="${esc(r.target)}">${esc(r.action)}</a>
-          ${r.kind === "route" ? `<button class="btn small subtle" data-act="shipment-approve" data-id="${esc(r.id)}"
+          ${
+            r.kind === "route"
+              ? `<button class="btn small subtle" data-act="shipment-approve" data-id="${esc(r.id)}"
             data-updated="">Approve lane</button>
-            <button class="btn small destructive" data-act="shipment-reject" data-id="${esc(r.id)}">Reject</button>` : ""}
-          ${r.kind === "document" ? `<button class="btn small neutral" data-act="process" data-id="${esc(r.id)}"
-            data-force="1">Read this document</button>` : ""}
+            <button class="btn small destructive" data-act="shipment-reject" data-id="${esc(r.id)}">Reject</button>`
+              : ""
+          }
+          ${
+            r.kind === "document"
+              ? `<button class="btn small neutral" data-act="process" data-id="${esc(r.id)}"
+            data-force="1">Read this document</button>`
+              : ""
+          }
           ${r.kind === "quote" ? `<button class="btn small subtle" data-act="review-approve" data-id="${esc(r.id)}">Approve review</button>` : ""}
         </div>
-      </div>`).join("") : empty("Nothing matches this filter.");
+      </div>`,
+          )
+          .join("")
+      : empty("Nothing matches this filter.");
   };
   paint("");
-  document.getElementById("queue-filters").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-filter]");
-    if (!button) return;
-    for (const node of document.querySelectorAll("#queue-filters .btn")) node.className = "btn small neutral";
-    button.className = "btn small";
-    paint(button.dataset.filter);
-  });
+  document
+    .getElementById("queue-filters")
+    .addEventListener("click", (event) => {
+      const button = event.target.closest("[data-filter]");
+      if (!button) return;
+      for (const node of document.querySelectorAll("#queue-filters .btn"))
+        node.className = "btn small neutral";
+      button.className = "btn small";
+      paint(button.dataset.filter);
+    });
 }
 
 // ---------------------------------------------------------------- quotations
@@ -925,7 +1294,11 @@ async function pageShipments() {
   }
   view.innerHTML = `<div class="row"><button class="btn neutral" data-act="reload">Refresh</button></div>
     <div class="grid" style="margin-top:12px">
-      ${review.shipments.length ? review.shipments.map((s) => `
+      ${
+        review.shipments.length
+          ? review.shipments
+              .map(
+                (s) => `
         <div class="panel">
           <div class="row spread"><h3>${esc(s.route)}</h3>
             ${s.status === "needs_review" ? chip("Needs approval", "warn") : chip("Lane approved", "ok")}</div>
@@ -936,17 +1309,29 @@ async function pageShipments() {
             <div><div class="k">Drafts</div><div class="v">${esc(s.drafts.length)}</div></div>
           </div>
           <ul class="fields">
-            ${s.quotes.map((q) => `<li><strong>${esc(q.carrier)}</strong> ${reviewChip(q.review_status)}
+            ${s.quotes
+              .map(
+                (
+                  q,
+                ) => `<li><strong>${esc(q.carrier)}</strong> ${reviewChip(q.review_status)}
               <div class="evidence">${esc(q.base_price === null ? "no base price stated" : q.base_price + " " + (q.currency || ""))}
                 · known total ${esc(q.total_known_cost === null ? "not available" : q.total_known_cost)}
                 · ${plural(q.gaps.length, "missing item")}
-                · <a href="#/documents/${esc(q.intake_item_id)}">source document</a></div></li>`).join("")}
+                · <a href="#/documents/${esc(q.intake_item_id)}">source document</a></div></li>`,
+              )
+              .join("")}
           </ul>
           <div class="row tight">
             <a class="btn small" href="#/shipments/${esc(s.id)}">Open</a>
             <a class="btn small neutral" href="#/comparison/${esc(s.id)}">Compare</a>
           </div>
-        </div>`).join("") : empty("No lanes yet — reading a quotation creates or matches one automatically.")}
+        </div>`,
+              )
+              .join("")
+          : empty(
+              "No lanes yet — reading a quotation creates or matches one automatically.",
+            )
+      }
     </div>`;
 }
 
@@ -958,7 +1343,8 @@ async function pageShipment(id) {
     return fail(exc);
   }
   const shipment = findShipment(id);
-  if (!shipment) return (view.innerHTML = empty("This lane is not in the database."));
+  if (!shipment)
+    return (view.innerHTML = empty("This lane is not in the database."));
   view.innerHTML = `
     <div class="row tight"><a class="btn neutral small" href="#/shipments">Back to quotations</a>
       <a class="btn neutral small" href="#/comparison/${esc(shipment.id)}">Compare</a></div>
@@ -983,7 +1369,9 @@ async function pageShipment(id) {
     </div>
     <h2>Quotes (${shipment.quotes.length})</h2>
     <div class="list">
-      ${shipment.quotes.map((q) => `
+      ${shipment.quotes
+        .map(
+          (q) => `
         <div class="panel">
           <div class="row spread"><h3>${esc(q.carrier)}${q.quote_reference ? " · " + esc(q.quote_reference) : ""}
             <span class="meta">version ${esc(q.version)}</span></h3>${reviewChip(q.review_status)}</div>
@@ -1001,12 +1389,22 @@ async function pageShipment(id) {
             <button class="btn small subtle" data-act="review-import" data-id="${esc(q.id)}"
               ${q.review_status !== "approved" ? "disabled" : ""}>Import to database</button>
           </div>
-        </div>`).join("")}
+        </div>`,
+        )
+        .join("")}
     </div>
     ${shipment.drafts.length ? `<h2>Questions for the carrier</h2><div class="list">${shipment.drafts.map(draftCard).join("")}</div>` : ""}
-    ${shipment.replies.length ? `<h2>Carrier replies</h2><ul class="fields">${shipment.replies.map((r) => `
+    ${
+      shipment.replies.length
+        ? `<h2>Carrier replies</h2><ul class="fields">${shipment.replies
+            .map(
+              (r) => `
       <li>${esc(when(r.created_at))} <span class="meta">reply ${esc(r.association.replace("_", " "))} to this lane</span>
-        <button class="btn small neutral" data-act="reply-process" data-id="${esc(r.id)}">Apply this reply again</button></li>`).join("")}</ul>` : ""}`;
+        <button class="btn small neutral" data-act="reply-process" data-id="${esc(r.id)}">Apply this reply again</button></li>`,
+            )
+            .join("")}</ul>`
+        : ""
+    }`;
 }
 
 // ---------------------------------------------------------------- comparison
@@ -1018,7 +1416,10 @@ async function pageComparisonIndex() {
   } catch (exc) {
     return fail(exc);
   }
-  if (!rows.length) return (view.innerHTML = empty("No lanes yet, so there is nothing to compare."));
+  if (!rows.length)
+    return (view.innerHTML = empty(
+      "No lanes yet, so there is nothing to compare.",
+    ));
   view.innerHTML = `
     <div class="row tight">
       <select id="cmp" aria-label="Lane to compare">
@@ -1041,12 +1442,15 @@ async function pageComparison(id) {
     return fail(exc);
   }
   const shipment = findShipment(id);
-  if (!shipment) return (view.innerHTML = empty("This lane is not in the database."));
+  if (!shipment)
+    return (view.innerHTML = empty("This lane is not in the database."));
   const report = shipment.comparison;
   if (!report) {
     view.innerHTML = `<a class="btn neutral small" href="#/comparison">Choose another lane</a>
-      <div class="note warn" style="margin-top:12px">${esc(shipment.comparison_error
-        || "Nothing to compare yet — at least one quote needs to be imported for this lane.")}</div>`;
+      <div class="note warn" style="margin-top:12px">${esc(
+        shipment.comparison_error ||
+          "Nothing to compare yet — at least one quote needs to be imported for this lane.",
+      )}</div>`;
     return;
   }
   view.innerHTML = `
@@ -1060,9 +1464,12 @@ async function pageComparison(id) {
         <div><div class="k">Quotes</div><div class="v">${esc(report.rows.length)}</div></div>
         <div><div class="k">Calculated</div><div class="v">${esc(when(report.generated_at))}</div></div>
       </div>
-      ${report.recommendation ? `<div class="note">Recommendation: ${esc(report.recommendation)}</div>
+      ${
+        report.recommendation
+          ? `<div class="note">Recommendation: ${esc(report.recommendation)}</div>
         <p class="evidence">Because: ${report.recommendation_basis.map(esc).join("; ")}</p>`
-        : '<div class="note warn">No recommendation yet: these quotes are not comparable as they stand. Missing values are not guessed.</div>'}
+          : '<div class="note warn">No recommendation yet: these quotes are not comparable as they stand. Missing values are not guessed.</div>'
+      }
     </div>
     <div class="panel" style="margin-top:12px;overflow:auto">
       <table>
@@ -1071,14 +1478,19 @@ async function pageComparison(id) {
           <th>Carrier</th><th class="num">Base</th><th class="num">Known extras</th>
           <th class="num">Known subtotal</th><th>Scope</th><th>Transit</th><th>Valid until</th><th>Status</th><th>Still missing</th>
         </tr></thead>
-        <tbody>${report.rows.map((r) => `
+        <tbody>${report.rows
+          .map(
+            (r) => `
           <tr>
             <td><span class="name">${esc(r.carrier_name || "carrier not named")}</span>
               ${r.quote_reference ? `<div class="sub">${esc(r.quote_reference)}</div>` : ""}</td>
             <td class="num">${r.base_price === null ? '<span class="meta">not stated</span>' : esc(r.base_price)}</td>
             <td class="num">${r.known_additional_total === null ? '<span class="meta">not stated</span>' : esc(r.known_additional_total)}</td>
-            <td class="num">${r.known_subtotal === null ? '<span class="meta">cannot total yet</span>'
-              : esc(r.known_subtotal) + " " + esc(r.currency || "")}
+            <td class="num">${
+              r.known_subtotal === null
+                ? '<span class="meta">cannot total yet</span>'
+                : esc(r.known_subtotal) + " " + esc(r.currency || "")
+            }
               ${r.converted_subtotal !== null ? `<div class="sub">= ${esc(r.converted_subtotal)} ${esc(report.target_currency)}${r.fx_note ? " · " + esc(r.fx_note) : ""}</div>` : ""}</td>
             <td>${esc(scope(r.delivery_scope))}${r.scope_compatible ? "" : " " + chip("Wrong scope", "bad")}</td>
             <td>${esc(r.transit_time || "not stated")}</td>
@@ -1086,7 +1498,9 @@ async function pageComparison(id) {
             <td>${r.comparison_status === "comparable" ? chip("Comparable", "ok") : chip("Incomplete", "warn")}</td>
             <td class="meta">${esc(r.unresolved_critical_gaps.length)} blocking · ${esc(r.unresolved_other_gaps.length)} other
               ${r.uncertain_charges.length ? `<div class="sub">uncertain: ${r.uncertain_charges.map(esc).join(", ")}</div>` : ""}</td>
-          </tr>`).join("")}</tbody>
+          </tr>`,
+          )
+          .join("")}</tbody>
       </table>
     </div>
     ${report.caveats.length ? `<h2>Read before deciding</h2><ul class="fields">${report.caveats.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}
@@ -1111,18 +1525,28 @@ async function pageDrafts() {
       approving records your decision, exporting saves a file on this computer.</div>
     <div class="row" style="margin-top:10px"><button class="btn neutral" data-act="reload">Refresh</button></div>
     <div class="list" style="margin-top:12px">
-      ${rows.length ? rows.map(draftCard).join("")
-      : empty("No open drafts. They are prepared once a proposed lane is approved and figures are still missing.")}
+      ${
+        rows.length
+          ? rows.map(draftCard).join("")
+          : empty(
+              "No open drafts. They are prepared once a proposed lane is approved and figures are still missing.",
+            )
+      }
     </div>`;
 }
 
 function draftCard(d) {
   return `<div class="panel">
     <div class="row spread"><strong>${esc(d.subject)}</strong>
-      ${d.status === "draft" ? chip("Awaiting your approval", "pending")
-        : d.status === "approved" ? chip("Approved — not sent", "info")
-        : d.status === "exported" ? chip("Exported as a file", "ok")
-        : chip(String(d.status).replace("_", " "), "plain")}</div>
+      ${
+        d.status === "draft"
+          ? chip("Awaiting your approval", "pending")
+          : d.status === "approved"
+            ? chip("Approved — not sent", "info")
+            : d.status === "exported"
+              ? chip("Exported as a file", "ok")
+              : chip(String(d.status).replace("_", " "), "plain")
+      }</div>
     <div class="meta">${esc(d.shipment_reference || "")}${d.recipient ? " · to " + esc(d.recipient) : ""}</div>
     <pre class="text" style="max-height:240px;margin-top:8px">${esc(d.body)}</pre>
     <div class="row tight" style="margin-top:10px">
@@ -1141,29 +1565,43 @@ async function pageSettings() {
   await refreshStatus();
   const s = state.status;
   if (!s) {
-    view.innerHTML = '<div class="note bad">The backend is not answering. Start it in a terminal with <code>freight review</code>.</div>';
+    view.innerHTML =
+      '<div class="note bad">The backend is not answering. Start it in a terminal with <code>freight review</code>.</div>';
     return;
   }
   const problems = [];
   if (!s.ollama.reachable) {
-    problems.push('<div class="note bad"><strong>The local model is offline.</strong> Run <code>ollama serve</code>. '
-      + "Until it answers, documents cannot be read. There is no cloud fallback by design.</div>");
+    problems.push(
+      '<div class="note bad"><strong>The local model is offline.</strong> Run <code>ollama serve</code>. ' +
+        "Until it answers, documents cannot be read. There is no cloud fallback by design.</div>",
+    );
   } else if (s.ollama.model_installed === false) {
-    problems.push(`<div class="note warn"><strong>${esc(s.ollama.model)} is not installed.</strong> `
-      + `Run <code>ollama pull ${esc(s.ollama.model)}</code>, or set <code>OLLAMA_MODEL</code> in <code>.env</code> `
-      + "to a model you already have.</div>");
+    problems.push(
+      `<div class="note warn"><strong>${esc(s.ollama.model)} is not installed.</strong> ` +
+        `Run <code>ollama pull ${esc(s.ollama.model)}</code>, or set <code>OLLAMA_MODEL</code> in <code>.env</code> ` +
+        "to a model you already have.</div>",
+    );
   }
   if (!s.database.initialized) {
-    problems.push('<div class="note warn"><strong>The database is not set up yet.</strong> Run <code>freight init</code>.</div>');
+    problems.push(
+      '<div class="note warn"><strong>The database is not set up yet.</strong> Run <code>freight init</code>.</div>',
+    );
   }
-  const missingParsers = Object.entries(s.parsers).filter(([, ok]) => !ok).map(([name]) => name);
+  const missingParsers = Object.entries(s.parsers)
+    .filter(([, ok]) => !ok)
+    .map(([name]) => name);
   if (missingParsers.length) {
-    problems.push(`<div class="note warn"><strong>These file types cannot be read yet:</strong> `
-      + `${esc(missingParsers.join(", "))}. Everything else keeps working.</div>`);
+    problems.push(
+      `<div class="note warn"><strong>These file types cannot be read yet:</strong> ` +
+        `${esc(missingParsers.join(", "))}. Everything else keeps working.</div>`,
+    );
   }
   view.innerHTML = `
-    ${problems.length ? `<div class="list">${problems.join("")}</div>`
-      : '<div class="note"><strong>Everything is working.</strong> The model answers locally and the database is ready.</div>'}
+    ${
+      problems.length
+        ? `<div class="list">${problems.join("")}</div>`
+        : '<div class="note"><strong>Everything is working.</strong> The model answers locally and the database is ready.</div>'
+    }
 
     <h2>Where things run</h2>
     <div class="panel">
@@ -1205,121 +1643,173 @@ async function pageSettings() {
 const ACTIONS = {
   reload: async () => route(),
 
-  process: async (button) => busy("process-" + button.dataset.id, async () => {
-    button.disabled = true;
-    const response = await api.post(`/api/documents/${encodeURIComponent(button.dataset.id)}/process?force=${button.dataset.force === "1" ? "true" : "false"}`);
-    if (document.getElementById("job-slot")) {
-      trackJob(response.job);
-    } else {
-      toast("Reading started — opening the document so you can watch it", "ok");
-      location.hash = "#/documents/" + button.dataset.id;
-    }
-  }),
+  process: async (button) =>
+    busy("process-" + button.dataset.id, async () => {
+      button.disabled = true;
+      const response = await api.post(
+        `/api/documents/${encodeURIComponent(button.dataset.id)}/process?force=${button.dataset.force === "1" ? "true" : "false"}`,
+      );
+      if (document.getElementById("job-slot")) {
+        trackJob(response.job);
+      } else {
+        toast(
+          "Reading started — opening the document so you can watch it",
+          "ok",
+        );
+        location.hash = "#/documents/" + button.dataset.id;
+      }
+    }),
 
   skip: async (button) => {
     button.textContent = "Keeping the existing copy";
     button.disabled = true;
   },
 
-  ignore: async (button) => busy("ignore-" + button.dataset.id, async () => {
-    const reason = await askReason({
-      title: "Mark this document as not a quote?",
-      body: `<p><strong>${esc(fileName(button.dataset.file))}</strong> will stay in the database with your note,
+  ignore: async (button) =>
+    busy("ignore-" + button.dataset.id, async () => {
+      const reason = await askReason({
+        title: "Mark this document as not a quote?",
+        body: `<p><strong>${esc(fileName(button.dataset.file))}</strong> will stay in the database with your note,
              so the decision is traceable. Nothing is deleted.</p>`,
-      label: "Why is this not a freight quote?",
-      placeholder: "e.g. carrier newsletter, no prices offered",
-      confirmLabel: "Mark as not a quote",
-      danger: true,
-    });
-    if (!reason) return;
-    const r = await api.action("intake.ignore", { id: button.dataset.id, reason });
-    toast(r.message, "ok");
-    await route();
-  }),
+        label: "Why is this not a freight quote?",
+        placeholder: "e.g. carrier newsletter, no prices offered",
+        confirmLabel: "Mark as not a quote",
+        danger: true,
+      });
+      if (!reason) return;
+      const r = await api.action("intake.ignore", {
+        id: button.dataset.id,
+        reason,
+      });
+      toast(r.message, "ok");
+      await route();
+    }),
 
-  "shipment-save": async (button) => busy("sh-save", async () => {
-    const origin = document.getElementById("sh-origin").value.trim();
-    const destination = document.getElementById("sh-destination").value.trim();
-    if (!origin || !destination) throw new api.ApiError("Origin and destination cannot be empty.", 400);
-    const r = await api.action("shipment.edit", { id: button.dataset.id, fields: { origin, destination } });
-    setDirty(false);
-    toast(r.message, "ok");
-    await route();
-  }),
+  "shipment-save": async (button) =>
+    busy("sh-save", async () => {
+      const origin = document.getElementById("sh-origin").value.trim();
+      const destination = document
+        .getElementById("sh-destination")
+        .value.trim();
+      if (!origin || !destination)
+        throw new api.ApiError("Origin and destination cannot be empty.", 400);
+      const r = await api.action("shipment.edit", {
+        id: button.dataset.id,
+        fields: { origin, destination },
+      });
+      setDirty(false);
+      toast(r.message, "ok");
+      await route();
+    }),
 
-  "shipment-approve": async (button) => busy("sh-approve-" + button.dataset.id, async () => {
-    const r = await api.action("shipment.approve", { id: button.dataset.id, expected_updated_at: button.dataset.updated || null });
-    setDirty(false);
-    toast(r.message + (r.notes && r.notes.length ? " · " + r.notes.join(" ") : ""), "ok");
-    await route();
-  }),
+  "shipment-approve": async (button) =>
+    busy("sh-approve-" + button.dataset.id, async () => {
+      const r = await api.action("shipment.approve", {
+        id: button.dataset.id,
+        expected_updated_at: button.dataset.updated || null,
+      });
+      setDirty(false);
+      toast(
+        r.message +
+          (r.notes && r.notes.length ? " · " + r.notes.join(" ") : ""),
+        "ok",
+      );
+      await route();
+    }),
 
-  "shipment-reject": async (button) => busy("sh-reject-" + button.dataset.id, async () => {
-    const reason = await askReason({
-      title: "Reject this proposed lane?",
-      body: "<p>The lane is closed and future documents will not be matched to it. Your reason is kept in the audit trail.</p>",
-      label: "What is wrong with this route?",
-      placeholder: "e.g. this carrier quoted from their own office, not our origin",
-      confirmLabel: "Reject lane",
-      danger: true,
-    });
-    if (!reason) return;
-    const r = await api.action("shipment.reject", { id: button.dataset.id, reason });
-    toast(r.message, "ok");
-    await route();
-  }),
+  "shipment-reject": async (button) =>
+    busy("sh-reject-" + button.dataset.id, async () => {
+      const reason = await askReason({
+        title: "Reject this proposed lane?",
+        body: "<p>The lane is closed and future documents will not be matched to it. Your reason is kept in the audit trail.</p>",
+        label: "What is wrong with this route?",
+        placeholder:
+          "e.g. this carrier quoted from their own office, not our origin",
+        confirmLabel: "Reject lane",
+        danger: true,
+      });
+      if (!reason) return;
+      const r = await api.action("shipment.reject", {
+        id: button.dataset.id,
+        reason,
+      });
+      toast(r.message, "ok");
+      await route();
+    }),
 
-  waive: async (button) => busy("waive-" + button.dataset.id, async () => {
-    const reason = await askReason({
-      title: `Waive the missing ${button.dataset.field}?`,
-      body: "<p>Use this when the carrier will not answer and you accept the quote as it stands. "
-        + "The comparison keeps showing that this figure was waived, not found.</p>",
-      label: "Why can this be waived?",
-      placeholder: "e.g. carrier confirmed by phone that terminal handling is included",
-      confirmLabel: "Waive with this reason",
-      danger: true,
-    });
-    if (!reason) return;
-    const r = await api.action("gap.waive", { id: button.dataset.id, reason });
-    toast(r.message, "ok");
-    await route();
-  }),
+  waive: async (button) =>
+    busy("waive-" + button.dataset.id, async () => {
+      const reason = await askReason({
+        title: `Waive the missing ${button.dataset.field}?`,
+        body:
+          "<p>Use this when the carrier will not answer and you accept the quote as it stands. " +
+          "The comparison keeps showing that this figure was waived, not found.</p>",
+        label: "Why can this be waived?",
+        placeholder:
+          "e.g. carrier confirmed by phone that terminal handling is included",
+        confirmLabel: "Waive with this reason",
+        danger: true,
+      });
+      if (!reason) return;
+      const r = await api.action("gap.waive", {
+        id: button.dataset.id,
+        reason,
+      });
+      toast(r.message, "ok");
+      await route();
+    }),
 
-  evidence: async (button) => busy("evidence-" + button.dataset.id, async () => {
-    const accept = button.dataset.accept === "1";
-    const r = await api.post(`/api/evidence/${encodeURIComponent(button.dataset.id)}/decide`, { accept });
-    toast(`${button.dataset.quoted}: ${r.validation_status === "accepted" ? "confirmed" : "sent back for another look"}`, "ok");
-    await route();
-  }),
+  evidence: async (button) =>
+    busy("evidence-" + button.dataset.id, async () => {
+      const accept = button.dataset.accept === "1";
+      const r = await api.post(
+        `/api/evidence/${encodeURIComponent(button.dataset.id)}/decide`,
+        { accept },
+      );
+      toast(
+        `${button.dataset.quoted}: ${r.validation_status === "accepted" ? "confirmed" : "flagged for review"}`,
+        "ok",
+      );
+      await route();
+    }),
 
-  "review-approve": async (button) => busy("approve-" + button.dataset.id, async () => {
-    const notes = document.getElementById("notes-" + button.dataset.id);
-    const r = await api.post(`/api/quotes/${encodeURIComponent(button.dataset.id)}/review/approve`,
-                             { notes: notes ? notes.value : null });
-    setDirty(false);
-    toast(r.message, "ok");
-    await route();
-  }),
+  "review-approve": async (button) =>
+    busy("approve-" + button.dataset.id, async () => {
+      const notes = document.getElementById("notes-" + button.dataset.id);
+      const r = await api.post(
+        `/api/quotes/${encodeURIComponent(button.dataset.id)}/review/approve`,
+        { notes: notes ? notes.value : null },
+      );
+      setDirty(false);
+      toast(r.message, "ok");
+      await route();
+    }),
 
-  "review-reject": async (button) => busy("reject-" + button.dataset.id, async () => {
-    const notes = document.getElementById("notes-" + button.dataset.id);
-    const go = await confirmDialog({
-      title: "Reject this quote?",
-      body: "<p>Nothing is written to the database. Your decision and note stay in the audit trail.</p>",
-      confirmLabel: "Reject quote",
-      danger: true,
-    });
-    if (!go) return;
-    const r = await api.post(`/api/quotes/${encodeURIComponent(button.dataset.id)}/review/reject`,
-                             { reason: notes ? notes.value : null });
-    setDirty(false);
-    toast(r.message, "ok");
-    await route();
-  }),
+  "review-reject": async (button) =>
+    busy("reject-" + button.dataset.id, async () => {
+      const notes = document.getElementById("notes-" + button.dataset.id);
+      const go = await confirmDialog({
+        title: "Reject this quote?",
+        body: "<p>Nothing is written to the database. Your decision and note stay in the audit trail.</p>",
+        confirmLabel: "Reject quote",
+        danger: true,
+      });
+      if (!go) return;
+      const r = await api.post(
+        `/api/quotes/${encodeURIComponent(button.dataset.id)}/review/reject`,
+        { reason: notes ? notes.value : null },
+      );
+      setDirty(false);
+      toast(r.message, "ok");
+      await route();
+    }),
 
-  "review-import": async (button) => busy("preview-" + button.dataset.id, async () => {
-    const preview = await api.get(`/api/quotes/${encodeURIComponent(button.dataset.id)}/import/preview`);
-    const body = `
+  "review-import": async (button) =>
+    busy("preview-" + button.dataset.id, async () => {
+      const preview = await api.get(
+        `/api/quotes/${encodeURIComponent(button.dataset.id)}/import/preview`,
+      );
+      const body = `
       <p>${esc(preview.linked.shipment)} · quote version ${esc(preview.version)} · currently
          <strong>${esc(reviewWord(preview.review_status))}</strong></p>
       <table>
@@ -1338,33 +1828,56 @@ const ACTIONS = {
       ${preview.warnings.map((w) => `<div class="note warn" style="margin-top:8px">${esc(w)}</div>`).join("")}
       ${preview.already_imported ? '<div class="note" style="margin-top:8px">Already imported — importing again changes nothing.</div>' : ""}
       <p class="meta" style="margin-top:10px">This happens in one database transaction. Clicking twice never creates a duplicate.</p>`;
-    const go = await confirmDialog({ title: "Import this approved quote", body, confirmLabel: "Import now" });
-    if (!go) return;
-    const result = await api.post(`/api/quotes/${encodeURIComponent(button.dataset.id)}/import`);
-    toast(result.already_imported ? "Already imported — nothing changed" : "Imported into the database", "ok");
-    await route();
-  }),
+      const go = await confirmDialog({
+        title: "Import this approved quote",
+        body,
+        confirmLabel: "Import now",
+      });
+      if (!go) return;
+      const result = await api.post(
+        `/api/quotes/${encodeURIComponent(button.dataset.id)}/import`,
+      );
+      toast(
+        result.already_imported
+          ? "Already imported — nothing changed"
+          : "Imported into the database",
+        "ok",
+      );
+      await route();
+    }),
 
-  "draft-approve": async (button) => busy("draft-approve-" + button.dataset.id, async () => {
-    const r = await api.post(`/api/drafts/${encodeURIComponent(button.dataset.id)}/approve`);
-    toast(r.message + " — still not sent", "ok");
-    await route();
-  }),
+  "draft-approve": async (button) =>
+    busy("draft-approve-" + button.dataset.id, async () => {
+      const r = await api.post(
+        `/api/drafts/${encodeURIComponent(button.dataset.id)}/approve`,
+      );
+      toast(r.message + " — still not sent", "ok");
+      await route();
+    }),
 
-  "draft-export": async (button) => busy("draft-export-" + button.dataset.id, async () => {
-    const format = button.dataset.format;
-    const recipientField = document.getElementById("rec-" + button.dataset.id);
-    await api.downloadBlob(`/api/drafts/${encodeURIComponent(button.dataset.id)}/export`,
-                           { format, recipient: recipientField ? recipientField.value.trim() : null },
-                           `clarification.${format}`);
-    toast("Saved on this computer — nothing was sent", "ok");
-  }),
+  "draft-export": async (button) =>
+    busy("draft-export-" + button.dataset.id, async () => {
+      const format = button.dataset.format;
+      const recipientField = document.getElementById(
+        "rec-" + button.dataset.id,
+      );
+      await api.downloadBlob(
+        `/api/drafts/${encodeURIComponent(button.dataset.id)}/export`,
+        {
+          format,
+          recipient: recipientField ? recipientField.value.trim() : null,
+        },
+        `clarification.${format}`,
+      );
+      toast("Saved on this computer — nothing was sent", "ok");
+    }),
 
-  "reply-process": async (button) => busy("reply-" + button.dataset.id, async () => {
-    const r = await api.action("reply.process", { id: button.dataset.id });
-    toast(r.message, "ok");
-    await route();
-  }),
+  "reply-process": async (button) =>
+    busy("reply-" + button.dataset.id, async () => {
+      const r = await api.action("reply.process", { id: button.dataset.id });
+      toast(r.message, "ok");
+      await route();
+    }),
 };
 
 document.addEventListener("click", (event) => {
@@ -1378,7 +1891,11 @@ document.addEventListener("click", (event) => {
 
 document.addEventListener("input", (event) => {
   const target = event.target;
-  if ((target.id || "").startsWith("notes-") || target.id === "sh-origin" || target.id === "sh-destination") {
+  if (
+    (target.id || "").startsWith("notes-") ||
+    target.id === "sh-origin" ||
+    target.id === "sh-destination"
+  ) {
     setDirty(true);
   }
 });

@@ -112,6 +112,7 @@ a.card { text-decoration:none; color:inherit; display:block; }
 .btn.neutral { background:var(--white); color:var(--ink); border-color:var(--line-strong); }
 .btn.neutral:hover:not(:disabled) { background:var(--mint-100); border-color:var(--mint-300); }
 .btn.subtle { background:var(--white); color:var(--green-700); border-color:var(--mint-300); }
+.btn.subtle:hover:not(:disabled) { background:var(--green-700); border-color:var(--green-700); color:var(--white); }
 .btn.destructive { background:var(--white); color:var(--red-ink); border-color:#e7cdc7; }
 .btn.destructive:hover:not(:disabled) { background:var(--red-bg); }
 .btn.big { font-size:var(--fs-body); padding:11px 20px; }

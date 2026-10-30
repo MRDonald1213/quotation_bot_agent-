@@ -51,7 +51,7 @@ _ACTIVITY_ACTIONS = {
     "rejected": "Document marked not relevant",
     "marked_irrelevant": "Document marked not relevant",
     "evidence_accepted": "Extracted value accepted",
-    "evidence_rejected": "Extracted value sent back to review",
+    "evidence_rejected": "Extracted value flagged for review",
     "gap_waived": "Open item waived with a reason",
     "generated": "Clarification questions prepared",
     "superseded": "Questions replaced by a newer quote version",
@@ -302,7 +302,7 @@ def preview_import(settings: Settings, quotation_id: str) -> dict[str, Any]:
                          else ["Approve the review first — importing only commits an approved extraction"])
                         + ([f"{len(critical)} item(s) still missing that block a fair price comparison"]
                            if critical else [])
-                        + ([f"{len(unreviewed)} extracted value(s) not yet accepted or sent back"]
+                        + ([f"{len(unreviewed)} extracted value(s) not yet confirmed or currently flagged for review"]
                            if unreviewed else []),
         }
 
@@ -438,7 +438,7 @@ def apply_action(settings: Settings, action: str, payload: dict[str, Any]) -> di
     if action == "evidence.decide":
         evidence = set_evidence_status(settings, entity_id, bool(payload.get("accept")))
         return {"message": f"evidence for {evidence.field_name} "
-                           f"{'accepted' if payload.get('accept') else 'sent back to review'}"}
+                           f"{'accepted' if payload.get('accept') else 'flagged for review'}"}
     if action == "refresh":
         return {"message": "refreshed"}
     raise NotFoundError(f"unknown review action: {action}")
