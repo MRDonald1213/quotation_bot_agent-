@@ -267,7 +267,7 @@ function limits() {
 
 function jobLine(job) {
   if (!job) return "";
-  if (job.status === "succeeded") return `<span class="jobline"><span class="dot ok"></span> Reading finished</span>`;
+  if (job.status === "succeeded") return `<span class="jobline"><span class="dot ok"></span> Processing result ready — check the details below</span>`;
   if (job.status === "failed") {
     return `<span class="jobline"><span class="dot bad"></span> Stopped: ${esc(job.error || "the run did not finish")}</span>`;
   }
@@ -544,7 +544,7 @@ function documentTable(rows) {
           <button class="btn small" data-act="process" data-id="${esc(r.id)}"
             data-force="${r.processing === "processed" ? "1" : "0"}"
             >${r.processing === "processed" ? "Read again" : "Read this document"}</button>
-          <button class="btn small destructive" data-act="ignore" data-id="${esc(r.id)}" data-file="${esc(r.file)}">Not a quote</button>
+          ${r.classification !== "irrelevant" ? `<button class="btn small destructive" data-act="ignore" data-id="${esc(r.id)}" data-file="${esc(r.file)}">Not a quote</button>` : `<span class="chip plain">Retained as not a quote</span>`}
         </td>
       </tr>`).join("")}</tbody></table></div>`;
 }
@@ -619,8 +619,10 @@ async function pageReview(intakeId) {
         ${doc.sender ? `<p class="meta">From ${esc(doc.sender)}${doc.subject ? " · " + esc(clip(doc.subject, 80)) : ""}</p>` : ""}
         ${doc.reason ? `<div class="note warn" style="margin-top:8px">${esc(clip(doc.reason, 400))}</div>` : ""}
         <div class="row tight" style="margin:12px 0">
-          <button class="btn" data-act="process" data-id="${esc(doc.id)}" data-force="${hasQuote ? "1" : "0"}"
-            >${hasQuote ? "Read this document again" : "Read this document"}</button>
+          ${doc.classification === "irrelevant"
+            ? '<button class="btn neutral" disabled>Marked not a quote</button>'
+            : `<button class="btn" data-act="process" data-id="${esc(doc.id)}" data-force="${hasQuote ? "1" : "0"}"
+            >${hasQuote ? "Read this document again" : "Read this document"}</button>`}
           <a class="btn neutral" href="/api/documents/${esc(doc.id)}/source" download="${esc(doc.file)}">Open the original</a>
         </div>
         <p class="meta">The text below is the document itself. It is data only: nothing written inside it can
@@ -778,6 +780,22 @@ function watchExistingJob(intakeId) {
   });
 }
 
+function readingResultMessage(result) {
+  if (!result) return "Processing completed — reloading this page";
+  if (result.created_quote && result.shipment_status === "needs_review") {
+    return "Quote extracted — lane approval is required before review can continue";
+  }
+  if (result.created_quote) return "Quote extracted — ready for review";
+  const notes = (result.notes || []).join(" ").toLowerCase();
+  if (notes.includes("not a quote") || notes.includes("marked irrelevant") || notes.includes("irrelevant/rejected")) {
+    return "No quote extracted — this document is marked not a quote";
+  }
+  if (notes.includes("needs_review") || notes.includes("classification review") || notes.includes("no quotation created")) {
+    return "Reading stopped with a review item — no quote was created";
+  }
+  return "Processing completed with no quote created — check the document details";
+}
+
 function trackJob(job) {
   const slot = document.getElementById("job-slot");
   if (!slot) return;
@@ -787,8 +805,8 @@ function trackJob(job) {
   };
   paint(job);
   api.pollJob(job.id, paint)
-    .then(() => {
-      toast("The document has been read — reloading this page", "ok");
+    .then((finalJob) => {
+      toast(readingResultMessage(finalJob.result), "ok");
       state.watched = null;
       return route();
     })

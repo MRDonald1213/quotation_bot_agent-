@@ -344,13 +344,18 @@ def set_evidence_status(settings: Settings, evidence_id: str, accept: bool) -> F
 def _mark_intake_irrelevant(settings: Settings, intake_id: str, reason: str | None) -> IntakeItem:
     with with_session(settings) as repos, repos.atomic():
         item = repos.get_intake(intake_id)
+        already_irrelevant = item.classification_status == ClassificationStatus.irrelevant
+        updated_reason = reason if reason and reason.strip() else item.classification_reason
+        updated_reason = updated_reason or "marked irrelevant in the review console"
         updated = item.model_copy(update={
             "classification_status": ClassificationStatus.irrelevant,
-            "classification_reason": reason or item.classification_reason or "marked irrelevant in the review console",
+            "classification_reason": updated_reason,
+            "processing_status": ProcessingStatus.processed if item.processing_status == ProcessingStatus.pending else item.processing_status,
         })
         repos.update_intake(updated)
-        repos.add_audit(AuditEvent(entity_type="intake_item", entity_id=item.id, action="marked_irrelevant",
-                                   details_json=json.dumps({"reason": reason})))
+        if not already_irrelevant:
+            repos.add_audit(AuditEvent(entity_type="intake_item", entity_id=item.id, action="marked_irrelevant",
+                                       details_json=json.dumps({"reason": updated_reason})))
         return updated
 
 
@@ -372,8 +377,13 @@ def apply_action(settings: Settings, action: str, payload: dict[str, Any]) -> di
         return {"message": f"processed {summary.intake_item_id}", "notes": summary.notes,
                 "shipment_id": str(summary.shipment_id) if summary.shipment_id else None}
     if action == "intake.ignore":
+        already_irrelevant = False
+        with with_session(settings) as repos:
+            already_irrelevant = repos.get_intake(entity_id).classification_status == ClassificationStatus.irrelevant
         item = _mark_intake_irrelevant(settings, entity_id, payload.get("reason"))
-        return {"message": f"{item.original_filename} marked irrelevant (audited)"}
+        return {"message": (f"{item.original_filename} is already marked as not a quote; the existing disposition was retained"
+                            if already_irrelevant
+                            else f"{item.original_filename} marked as not a quote and retained for audit")}
     if action == "shipment.approve":
         current = get_shipment(settings, entity_id)
         approved = approve_proposed_shipment(settings, entity_id, payload.get("expected_updated_at")

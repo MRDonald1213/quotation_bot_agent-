@@ -174,6 +174,25 @@ def test_source_download_returns_the_stored_file(client: TestClient, quote_a_fil
     assert response.content == quote_a_file.read_bytes()
 
 
+def test_not_a_quote_is_clear_and_idempotent(client: TestClient, quote_a_file: Path) -> None:
+    intake_id = _upload(client, quote_a_file)["results"][0]["intake_id"]
+    first = client.post("/api/action", json={
+        "action": "intake.ignore", "id": intake_id, "reason": "carrier newsletter",
+    })
+    assert first.status_code == 200
+    assert "marked as not a quote" in first.json()["message"]
+
+    detail = client.get(f"/api/documents/{intake_id}").json()
+    assert detail["classification"] == "irrelevant"
+    assert detail["reason"] == "carrier newsletter"
+
+    second = client.post("/api/action", json={
+        "action": "intake.ignore", "id": intake_id, "reason": "carrier newsletter",
+    })
+    assert second.status_code == 200
+    assert "already marked" in second.json()["message"]
+
+
 def test_missing_records_return_structured_404(client: TestClient) -> None:
     response = client.get("/api/documents/00000000-0000-0000-0000-000000000000")
     assert response.status_code == 404
@@ -196,6 +215,24 @@ def test_processing_through_the_web_creates_quote_and_proposal(
     assert block["gaps"], "critical gaps must stay visible in the review payload"
     rows = client.get("/api/documents").json()
     assert [r for r in rows if r["id"] == intake_id][0]["processing"] == "needs_review"
+
+
+def test_irrelevant_document_processing_has_no_quote_and_persists_disposition(
+        client: TestClient, fake_llm, quote_a_file: Path) -> None:
+    irrelevant = {
+        "is_freight_quote": False, "reason": "marketing newsletter", "confidence": 0.99,
+        "carrier_name": None, "shipment_reference": None,
+        "needs_human_review": False, "document_type": "unrelated",
+    }
+    fake_llm.responses = {f'filename="{quote_a_file.name}"': irrelevant}
+    intake_id = _upload(client, quote_a_file)["results"][0]["intake_id"]
+    result = _processed(client, intake_id)
+    assert result["created_quote"] is False
+    assert any("not a quote" in note.lower() for note in result["notes"])
+    detail = client.get(f"/api/documents/{intake_id}").json()
+    assert detail["classification"] == "irrelevant"
+    assert detail["processing"] == "processed"
+    assert detail["quotations"] == []
 
 
 def test_second_processing_of_the_same_document_is_refused(

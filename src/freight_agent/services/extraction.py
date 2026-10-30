@@ -71,16 +71,22 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
                         {"reason": item.classification_reason})))
                 return ProcessingSummary(
                     intake_item_id=item.id, classification=classification,
-                    notes=["marked irrelevant/rejected: " + (item.classification_reason or "")],
+                    notes=["Reading stopped: the document was classified as not a quote. " + (item.classification_reason or "")],
                 )
             notes.append("forced processing of an irrelevant classification (human override, audited)")
 
         if item.classification_status in (ClassificationStatus.needs_review,
                                          ClassificationStatus.failed) and not force:
+            processing_status = (ProcessingStatus.needs_review
+                                 if item.classification_status == ClassificationStatus.needs_review
+                                 else ProcessingStatus.failed)
+            gate_item = item.model_copy(update={"processing_status": processing_status})
+            if not dry_run:
+                repos.update_intake(gate_item)
             return ProcessingSummary(
                 intake_item_id=item.id, classification=classification,
-                notes=["classification is needs_review — review with `freight intake show last`, "
-                       "then re-run `freight intake process last --force` to extract anyway"],
+                notes=["Reading stopped at classification review; no quote was extracted. "
+                       "Review the classification decision, then choose Read again to retry with an explicit override."],
             )
 
         if selected_shipment is not None and item.shipment_id is None:
@@ -121,7 +127,17 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
             cleaned, evidence_items, field_statuses, issues = validate_extraction(
                 extraction, item.raw_text, item.original_filename)
         except ValidationFailureError as exc:
-            raise LLMOutputInvalidError(f"extraction failed domain validation: {exc}") from exc
+            invalid = LLMOutputInvalidError(f"extraction failed domain validation: {exc}")
+            failed = item.model_copy(update={
+                "processing_status": ProcessingStatus.failed,
+                "classification_status": item.classification_status,
+            })
+            if not dry_run:
+                repos.update_intake(failed)
+                repos.add_audit(AuditEvent(entity_type="intake_item", entity_id=item.id,
+                                           action="extraction_failed",
+                                           details_json=json.dumps({"error": str(invalid)[:500]})))
+            raise invalid from exc
         notes += issues
 
         # 4. autonomous shipment resolution: match an existing route, propose a new
@@ -287,10 +303,10 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
             try:
                 drafts = generate_clarification_drafts(settings, str(shipment_id))
             except ModelUnavailableError as exc:
-                raise ModelUnavailableError(
-                    f"Quotation {quote.id} was saved, but clarification wording failed. "
-                    f"Retry `freight questions generate {shipment.reference}` after checking Ollama. {exc}"
-                ) from exc
+                notes.append(
+                    f"Quotation {quote.id} was saved. Clarification wording could not be generated; "
+                    f"retry it later for shipment {shipment.reference}."
+                )
             notes.extend(f"clarification draft awaiting approval: {draft.id}" for draft in drafts)
 
         return ProcessingSummary(
