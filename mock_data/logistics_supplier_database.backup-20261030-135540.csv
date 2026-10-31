@@ -1,0 +1,11 @@
+Supplier_ID,Supplier_Name,Category,Primary_Lanes_Regions,Service_Contract_Type,Compliance_Status,Payment_Terms,OTD_Rating_Pct,Billing_Accuracy_Pct,Primary_Contact_Email
+SUP-1001,Maersk Line,Ocean Carrier (VOCC),Transpacific (China - US West Coast),Annual Contract,Active / C-TPAT Certified,Net 30,94.5,98.2,rates@maersk-desk.com
+SUP-1002,CMA CGM,Ocean Carrier (VOCC),Asia - Europe / Mediterranean,Spot Rate / Quarterly Tariff,Active / AEO Tier 2,Net 15,91.2,96.0,pricing@cmacgm-asia.com
+SUP-1003,Apex Drayage & Logistics,Drayage & Port Transport,Port of Yantian / Shekou Local,Master Service Agreement (MSA),Active / Licensed Drayage,Net 30,98.0,99.5,dispatch@apexdrayage.cn
+SUP-1004,TransEast Trucking Co.,Long-Haul Trucking,South China (Guangdong - Hunan/Jiangxi),Spot Rate / Framework Agreement,Under Review / Pending Renewal,Net 7,88.5,92.0,ops@transeast-truck.com
+SUP-1005,Pacific Air Cargo Brokers,Air Freight Charter,PVG/CAN to JFK/ORD/LAX,Ad-hoc Charter / Fixed Block Space,Active / IATA Member,Prepayment / Immediate,96.8,97.0,charter@pacificair.com
+SUP-1006,Shenzhen Bonded Warehouse Group,Warehousing & 3PL,Zhuhai / Shenzhen Free Trade Zone,Multi-Year Storage Agreement,Active / Bonded Zone Approved,Net 45,99.1,99.8,storage@szbondedwh.com
+SUP-1007,Sino-Euro Railway Express,Rail & Intermodal,Yiwu / Chongqing to Duisburg / Hamburg,Annual Tariff Agreement,Active / CIS Rail Certified,Net 30,92.4,94.5,intermodal@sinoeuro-rail.cn
+SUP-1008,Global Transit Customs Agency,Customs Brokerage,China Ports & Customs Outposts,Fixed Fee Per Entry (Retainer),Active / Licensed Customs Broker,Net 30,97.5,99.0,clearance@gt customs.com
+SUP-1009,South China Bunkering Ltd.,Fleet Fuel / Bunkering,Hong Kong / Zhuhai Bunkering Hubs,Index-Linked Pricing (Platts),Active / ISO 8217 Compliant,Net 14,99.5,98.5,fuel@scbunkering.hk
+SUP-1010,Textainer Container Leasing,Equipment Leasing,Global Dry & Reefer Depot Network,Long-Term Master Lease,Active / ISO 6346 Certified,Net 30,95.0,97.8,leasing@textainer-depot.com

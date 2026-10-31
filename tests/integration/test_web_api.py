@@ -7,6 +7,7 @@ real services and database.
 from __future__ import annotations
 
 import time
+import json
 from pathlib import Path
 
 import pytest
@@ -110,10 +111,130 @@ def test_status_reports_local_model_and_schema_without_calling_it(client: TestCl
     payload = client.get("/api/status").json()
     assert payload["backend"] == "ok"
     assert payload["database"]["initialized"] is True
-    assert payload["database"]["schema_version"] == 4
+    assert payload["database"]["schema_version"] == 7
     assert payload["ollama"]["model"] == "fake-model"
     assert set(payload["parsers"]) == {"pdf", "docx", "xlsx"}
     assert ".eml" in payload["limits"]["supported_extensions"]
+
+
+def test_supplier_database_preview_connect_update_and_disconnect(client: TestClient, tmp_path: Path) -> None:
+    csv_file = tmp_path / "freight_suppliers.csv"
+    csv_file.write_text(
+        "supplier_name,hourly_rate,currency,available_date\n"
+        "North Freight,125.50,EUR,2026-11-01\n"
+        "Coastal Carrier,140,EUR,2026-11-15\n",
+        encoding="utf-8",
+    )
+
+    preview = client.post(
+        "/api/supplier-databases/preview",
+        files={"file": (csv_file.name, csv_file.read_bytes(), "text/csv")},
+    )
+    assert preview.status_code == 200
+    preview_payload = preview.json()
+    assert preview_payload["record_count"] == 2
+    assert {field["name"]: field["type"] for field in preview_payload["schema"]} == {
+        "supplier_name": "supplier",
+        "hourly_rate": "currency",
+        "currency": "text",
+        "available_date": "date",
+    }
+
+    connected = client.post(
+        "/api/supplier-databases",
+        files={"file": (csv_file.name, csv_file.read_bytes(), "text/csv")},
+        data={
+            "name": "Freight & Carrier Rate Quotes",
+            "description": "Carrier supplier pricing by freight service and route",
+            "category": "Freight quotations",
+            "routing_aliases": '["freight", "carrier rates"]',
+            "schema_json": __import__("json").dumps(preview_payload["schema"]),
+        },
+    )
+    assert connected.status_code == 201
+    database = connected.json()["database"]
+    database_id = database["id"]
+    assert database["record_count"] == 2
+    assert len(database["schema"]) == 4
+
+    listed = client.get("/api/supplier-databases").json()
+    assert [item["id"] for item in listed] == [database_id]
+
+    updated = client.patch(
+        "/api/supplier-databases/" + database_id,
+        json={"description": "Updated freight supplier database"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["database"]["description"] == "Updated freight supplier database"
+
+    detail = client.get("/api/supplier-databases/" + database_id)
+    assert detail.status_code == 200
+    assert detail.json()["name"] == "Freight & Carrier Rate Quotes"
+
+    deleted = client.delete("/api/supplier-databases/" + database_id)
+    assert deleted.status_code == 200
+    assert deleted.json()["database"]["status"] == "disconnected"
+    assert client.get("/api/supplier-databases").json() == []
+    assert client.get("/api/supplier-databases/" + database_id).status_code == 404
+
+
+def test_complete_supplier_database_flow(client: TestClient, tmp_path: Path) -> None:
+    csv_file = tmp_path / "fuel_suppliers.csv"
+    csv_file.write_text(
+        "supplier_name,fuel_type,currency,unit_price,unit,valid_until\n"
+        "Fuel House Baku,Diesel,EUR,1.42,Litre,2026-12-15\n"
+        "Metro Fuel Co,Diesel,EUR,1.38,Litre,2026-12-20\n",
+        encoding="utf-8",
+    )
+    preview = client.post("/api/supplier-databases/preview", files={"file": (csv_file.name, csv_file.read_bytes(), "text/csv")})
+    schema = preview.json()["schema"]
+    for field in schema:
+        if field["name"] in {"supplier_name", "fuel_type", "currency", "unit_price", "unit"}:
+            field["required"] = True
+    connected = client.post(
+        "/api/supplier-databases",
+        files={"file": (csv_file.name, csv_file.read_bytes(), "text/csv")},
+        data={"name": "Fleet Fuel Suppliers", "description": "Fuel supplier quotations for fleet operations",
+              "category": "Fuel quotations", "routing_aliases": '["fuel","diesel","fleet"]',
+              "schema_json": json.dumps(schema)},
+    )
+    database_id = connected.json()["database"]["id"]
+
+    quotation = tmp_path / "fuel_quote.txt"
+    quotation.write_text(
+        "Supplier name: New Fuel Supplier\nFuel type: Diesel\nCurrency: EUR\nUnit price: 1.29 EUR per litre\nUnit: Litre\nValid until: 2026-12-31\n",
+        encoding="utf-8",
+    )
+    with quotation.open("rb") as handle:
+        upload = client.post("/api/documents", files={"files": (quotation.name, handle)}, data={"on_duplicate": "error"})
+    intake_id = upload.json()["results"][0]["intake_id"]
+
+    processed = client.post(f"/api/supplier-quotations/{intake_id}/process", params={"database_id": database_id})
+    assert processed.status_code == 200, processed.text
+    action = processed.json()["action"]
+    assert action["database_id"] == database_id
+    assert action["status"] == "ready_for_approval"
+    assert action["proposed_row"]["supplier_name"] == "New Fuel Supplier"
+    assert action["proposed_row"]["unit_price"] == "1.29"
+
+    approved = client.post(f"/api/supplier-actions/{action['id']}/approve")
+    assert approved.status_code == 200, approved.text
+    created = approved.json()["action"]
+    assert created["status"] == "record_created"
+    assert created["created_csv_row"]["supplier_name"] == "New Fuel Supplier"
+
+    second_approval = client.post(f"/api/supplier-actions/{action['id']}/approve")
+    assert second_approval.status_code == 200
+
+    chat = client.post("/api/supplier-agent/chat", json={"question": "Which is the cheapest fuel supplier?", "database_id": database_id})
+    assert chat.status_code == 200
+    assert "1.29" in chat.json()["answer"] or "lowest" in chat.json()["answer"]
+    assert chat.json()["citations"]
+
+    managed_csv = Path(connected.json()["database"]["csv_path"])
+    lines = managed_csv.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 4
+    assert any("New Fuel Supplier" in line for line in lines)
 
 
 def test_dashboard_counts_come_from_the_database(client: TestClient, settings) -> None:

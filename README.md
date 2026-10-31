@@ -36,6 +36,231 @@ page itself needs no Node, no bundler and no internet access. Everything below w
 same from the CLI or the browser — the web app is a second front door over these services,
 not a separate system.
 
+## v2 Usage
+
+> **Current implementation status:** The local V2 supplier workflow and unified Supplier Workspace navigation are available.
+> Connect one or more CSV supplier databases, route and analyze quotations against their schemas,
+> approve proposed records, manage action statuses, and query managed databases through Supplier Agent.
+> Gmail account and draft infrastructure is included; live Gmail use requires protected OAuth credentials.
+> All supplier-record mutations and email sends require human approval. Existing freight workflows remain available.
+
+### Gmail OAuth setup (optional)
+
+1. In Google Cloud Console, create an OAuth 2.0 Web application client.
+2. Add `http://127.0.0.1:8765/api/gmail/oauth/callback` as an authorized redirect URI.
+3. Enable the Gmail API and set the application status according to Google's verification requirements.
+4. Download the client-secrets JSON outside browser-visible directories and configure `.env`:
+
+```bash
+GOOGLE_OAUTH_CREDENTIALS_PATH=/absolute/path/to/client_secret.json
+GOOGLE_OAUTH_TOKEN_PATH=./data/google-oauth-token.json
+```
+
+The application requests `gmail.readonly` and `gmail.compose`. Synchronization never sends email.
+Refresh tokens are stored only in the protected token file. Email sends require an explicit approved Gmail Draft Review action, exact content approval, confirmation, and an idempotency key.
+
+### 1. Clone and enter the repository
+
+```bash
+git clone <repository-url>
+cd <repository-directory>/freight-agent
+```
+
+If you already have the repository locally, open a terminal in the repository root and run:
+
+```bash
+cd freight-agent
+```
+
+### 2. Create a local environment
+
+Python 3.11 or newer is required. A virtual environment is recommended:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e '.[dev]'
+cp .env.example .env
+```
+
+On Windows PowerShell, activate the environment with `.venv\Scripts\Activate.ps1` instead.
+
+Configure `.env` with an Ollama model that is already installed locally:
+
+```dotenv
+OLLAMA_MODEL=<your-installed-model>
+OLLAMA_BASE_URL=http://localhost:11434/v1
+```
+
+Start Ollama separately if it is not already running:
+
+```bash
+ollama serve
+ollama list
+ollama pull <your-installed-model>
+```
+
+The V2 CSV connection and schema preview do not require Ollama. Existing quotation processing
+still requires the local model.
+
+### 3. Initialize and run the app
+
+```bash
+freight init
+freight health
+freight review
+```
+
+The web app opens at `http://127.0.0.1:8765/`. To choose another port or prevent browser
+launching, run:
+
+```bash
+freight review --port 8801 --no-open
+```
+
+Stop the server with `Ctrl-C`.
+
+### 4. Prepare one or more supplier CSV databases
+
+Each CSV represents records in a supplier database for a particular business domain. For
+example, a freight CSV might contain carrier rates, and a fleet CSV might contain fuel prices.
+Use header names that clearly describe the supplier fields.
+
+Example: `freight_suppliers.csv`
+
+```csv
+supplier_name,route,service,currency,hourly_rate,valid_until
+North Freight,Baku-Hamburg,Port handling,EUR,125.50,2026-12-31
+Coastal Carrier,Baku-Hamburg,Ocean freight,EUR,3200,2026-11-30
+```
+
+Example: `fleet_fuel_suppliers.csv`
+
+```csv
+supplier_name,fuel_type,currency,unit_price,unit,valid_until
+Fuel House Baku,Diesel,EUR,1.42,Litre,2026-12-15
+Metro Fuel Co,Diesel,EUR,1.38,Litre,2026-12-20
+```
+
+CSV requirements:
+
+- A header row is required.
+- Header names must be unique and non-empty.
+- UTF-8, UTF-8 BOM, and Windows-1252 encoding are accepted.
+- The file must be under `MAX_FILE_SIZE_MB` from `.env`.
+- The first bounded sample is used to infer column types and record count.
+- The CSV path is retained locally in the supplier database metadata.
+
+### 5. Connect a supplier database
+
+1. Open the app.
+2. In the sidebar, find **Supplier Operations** and select **Databases**.
+3. Select **Connect database**.
+4. Enter the absolute file path of a supplier CSV accessible to the local server.
+5. Select **Inspect CSV and preview schema** and wait for the detected schema preview.
+6. Enter a database name, such as `Freight & Carrier Rate Quotes`.
+7. Enter a category and description describing the domain of the database.
+8. Add routing aliases separated by commas, such as `freight, carrier rates, ocean quotes`.
+9. Review the detected column names and inferred types.
+10. Select **Connect database**.
+
+Repeat this process for as many supplier databases as needed. SQLite stores only the connection
+metadata and the direct CSV path; it does not copy supplier records or replace the CSV. The
+application reads from and writes to that CSV path directly after explicit approval. You can
+list, inspect, or update metadata through the API, or disconnect a database from the Database
+Connections screen. Disconnecting does not modify or delete the CSV file.
+
+> The Database Connections UI does not yet edit the inferred type or guidance for each column.
+> The API accepts schema metadata, and future phases will expose complete per-column editing.
+
+### 6. What you can currently test end to end
+
+You can currently test the complete V2 Phase 1 flow:
+
+1. Connect a freight supplier CSV.
+2. Connect a second fleet or fuel supplier CSV.
+3. Verify that both databases appear separately.
+4. Inspect the detected column names and inferred types.
+5. Open one database schema and confirm the record count.
+6. Disconnect one database and confirm that it disappears from the connection list.
+7. Reconnect it if needed.
+
+Example result for a database named `Fleet Fuel Suppliers`:
+
+```text
+Category: Fleet quotations
+Records: 2
+Columns: 6
+Schema: supplier_name, fuel_type, currency, unit_price, unit, valid_until
+```
+
+### 7. Test the complete quotation-to-record flow
+
+1. In **Supplier Operations**, select **Databases**, connect the fuel CSV, and keep the database active.
+2. Select **Incoming Quotations** and upload a text, PDF, DOCX, XLSX, or supported image quotation.
+3. If routing is ambiguous, select the intended database manually; otherwise confirm the suggested database.
+4. Process the quotation. The system creates a grounded proposed row using the connected CSV schema.
+5. A complete row moves to **Ready for approval**; missing required fields move to **Needs clarification**; uncertain routing moves to **Needs human review**.
+6. In **Action Center**, open the action and review the proposed row, evidence, and missing fields.
+7. Approve it to append one new row to the managed CSV copy. Approving again does not create a duplicate.
+8. Reject or hold an action when supplier feedback or human clarification is required.
+
+Example fuel quotation:
+
+```text
+Supplier name: New Fuel Supplier
+Fuel type: Diesel
+Currency: EUR
+Unit price: 1.29 EUR per litre
+Unit: Litre
+Valid until: 2026-12-31
+```
+
+After approval, select **Record created** in the Action Center to verify the source action and audit details. The connected CSV file is updated directly.
+
+### 8. Query the managed databases through Supplier Agent
+
+1. Select **Supplier Agent** under **Supplier Operations**.
+2. Optionally select a database or leave the question available to connected databases.
+3. Try questions such as:
+   - `Which is the cheapest fuel supplier?`
+   - `Who supplied fuel with the newest validity date?`
+   - `Show records matching Diesel.`
+   - `Which was the most recently added supplier?`
+4. Review the answer and its database/CSV-row citations.
+
+Chat is read-only. It does not append records or mutate CSV data. The existing **Documents**, **Review queue**, **Quotations**, **Comparison**, and **Clarification drafts** screens remain independent and preserve the original freight workflow.
+
+### 9. Relevant API checks
+
+The local API is available only on the bound local server. Useful checks include:
+
+```bash
+curl http://127.0.0.1:8765/api/supplier-databases
+curl http://127.0.0.1:8765/api/status
+```
+
+With a running server, a CSV preview can be tested through the UI or with:
+
+```bash
+curl -F 'file=@freight_suppliers.csv' \
+  http://127.0.0.1:8765/api/supplier-databases/preview
+```
+
+A database connection can be submitted with multipart form fields:
+
+```bash
+curl -F 'file=@freight_suppliers.csv' \
+  -F 'name=Freight & Carrier Rate Quotes' \
+  -F 'description=Carrier rates and freight supplier quotations' \
+  -F 'category=Freight quotations' \
+  -F 'routing_aliases=["freight","carrier rates"]' \
+  http://127.0.0.1:8765/api/supplier-databases
+```
+
+For full V2 implementation and release criteria, see the
+[Supplier Database Workflow Plan](../docs/plans/SUPPLIER_DATABASE_WORKFLOW_PLAN.md).
+
 ## Sample workflow (Workflow A)
 
 `freight intake add` classifies, extracts, validates and resolves the route in one
@@ -156,9 +381,9 @@ First end-to-end path (the whole flow in one sitting):
   *skip* to reuse it or *reprocess* when the previous attempt was wrong (a new intake record is
   created and the old quotation version is kept).
 - Data lives outside the code: SQLite at `data/freight.db`, imported copies and exports under
-  `data/workspace/`. `freight init` migrates the schema in place (v4 adds the review/import
-  state and baselines older rows as already imported); `freight db backup <path>` takes a
-  consistent copy. `data/` and `.env` are git-ignored — never commit them.
+  `data/workspace/`. `freight init` migrates the schema in place (v4 adds review/import
+  state, v5 adds supplier database connections and CSV schema metadata);
+  `freight db backup <path>` takes a consistent copy. `data/` and `.env` are git-ignored — never commit them.
 
 ## Clarification loop (Workflow B)
 

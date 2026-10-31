@@ -7,11 +7,14 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 class Settings(BaseSettings):
     """Configuration via environment or .env (spec §8). No remote LLM endpoints."""
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=str(PROJECT_ROOT / ".env"), env_file_encoding="utf-8", extra="ignore"
     )
 
     ollama_base_url: str = Field(
@@ -40,6 +43,34 @@ class Settings(BaseSettings):
                     '{"USD->EUR": {"rate": 0.92, "as_of": "2026-10-28"}}. '
                     "Without an entry, foreign-currency quotes are never summed or ranked.",
     )
+    google_oauth_credentials_path: str = Field(
+        default="", validation_alias="GOOGLE_OAUTH_CREDENTIALS_PATH",
+        description="Protected local path to an OAuth 2.0 client-secrets JSON file.",
+    )
+    google_oauth_token_path: str = Field(
+        default="data/google-oauth-token.json", validation_alias="GOOGLE_OAUTH_TOKEN_PATH",
+        description="Protected local path for Gmail refresh-token metadata. Never browser-visible.",
+    )
+    gmail_sync_interval_seconds: int = Field(
+        default=30, ge=5, validation_alias="GMAIL_SYNC_INTERVAL_SECONDS",
+        description="Automatic Gmail polling interval in seconds.",
+    )
+    gmail_backfill_days: int = Field(
+        default=30, ge=1, validation_alias="GMAIL_BACKFILL_DAYS",
+        description="Initial Gmail historical backfill window in days.",
+    )
+
+    @property
+    def project_credentials_path(self) -> Path:
+        if not self.google_oauth_credentials_path:
+            return Path("").resolve()
+        path = Path(self.google_oauth_credentials_path).expanduser()
+        return (path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve())
+
+    @property
+    def project_oauth_token_path(self) -> Path:
+        path = Path(self.google_oauth_token_path).expanduser()
+        return (path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve())
 
     @property
     def ollama_root_url(self) -> str:

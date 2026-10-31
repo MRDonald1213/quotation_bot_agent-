@@ -95,6 +95,24 @@ def init_schema(session: Session) -> list[str]:
                 description="schema v4: quotation review and explicit database import state",
             ))
             applied.append("v4")
+        if current < 5:
+            session.add(SchemaVersionRow(
+                version=5, applied_at=utcnow_iso(),
+                description="schema v5: connected supplier databases and CSV schemas",
+            ))
+            applied.append("v5")
+        if current < 6:
+            session.add(SchemaVersionRow(
+                version=6, applied_at=utcnow_iso(),
+                description="schema v6: supplier quotation actions and chat history",
+            ))
+            applied.append("v6")
+        if current < 7:
+            session.add(SchemaVersionRow(
+                version=7, applied_at=utcnow_iso(),
+                description="schema v7: supplier master, quotation register and Gmail workflow records",
+            ))
+            applied.append("v7")
     return applied
 
 

@@ -58,6 +58,15 @@
     return post("/api/action", Object.assign({ action: kind }, payload || {}));
   }
 
+  async function multipart(path, fields, file, fieldName) {
+    const form = new FormData();
+    Object.entries(fields || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) form.append(key, value);
+    });
+    if (file) form.append(fieldName || "file", file);
+    return request(path, { method: "POST", body: form });
+  }
+
   async function downloadBlob(path, body, filename) {
     const response = await fetch(path, {
       method: "POST",
@@ -110,5 +119,5 @@
     });
   }
 
-  global.api = { ApiError, get, post, upload, action, downloadBlob, pollJob };
+  global.api = { ApiError, get, post, upload, multipart, action, downloadBlob, pollJob };
 })(window);

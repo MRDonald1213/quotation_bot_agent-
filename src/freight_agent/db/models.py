@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 
 def utcnow_iso() -> str:
@@ -166,6 +166,155 @@ class SchemaVersionRow(Base):
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     applied_at: Mapped[str] = mapped_column(String(32))
     description: Mapped[str] = mapped_column(Text)
+
+
+class SupplierDatabaseRow(Base):
+    __tablename__ = "supplier_databases"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str | None] = mapped_column(String(120))
+    routing_aliases_json: Mapped[str] = mapped_column(Text, default="[]")
+    csv_filename: Mapped[str] = mapped_column(String(300))
+    csv_path: Mapped[str] = mapped_column(Text)
+    schema_json: Mapped[str] = mapped_column(Text, default="[]")
+    record_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))
+
+
+class SupplierQuotationActionRow(Base):
+    __tablename__ = "supplier_quotation_actions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    intake_id: Mapped[str] = mapped_column(String(36), ForeignKey("intake_items.id"), index=True, unique=True)
+    database_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("supplier_databases.id"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="received", index=True)
+    routing_json: Mapped[str] = mapped_column(Text, default="[]")
+    proposed_row_json: Mapped[str] = mapped_column(Text, default="{}")
+    missing_fields_json: Mapped[str] = mapped_column(Text, default="[]")
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_csv_row_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))
+
+
+class SupplierChatRow(Base):
+    __tablename__ = "supplier_chat"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str] = mapped_column(Text)
+    citations_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[str] = mapped_column(String(32))
+
+
+class SupplierMasterRow(Base):
+    __tablename__ = "supplier_master"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    database_id: Mapped[str] = mapped_column(String(36), ForeignKey("supplier_databases.id"), index=True)
+    source_row: Mapped[int] = mapped_column(Integer)
+    supplier_identity: Mapped[str] = mapped_column(String(300), index=True)
+    record_json: Mapped[str] = mapped_column(Text, default="{}")
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))
+
+
+class QuotationRegisterRow(Base):
+    __tablename__ = "quotation_register"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    supplier_master_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("supplier_master.id"), index=True)
+    database_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("supplier_databases.id"), index=True)
+    intake_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("intake_items.id"), index=True)
+    gmail_message_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(24), default="pending_review", index=True)
+    data_json: Mapped[str] = mapped_column(Text, default="{}")
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    source_hash: Mapped[str] = mapped_column(String(64))
+    approved_at: Mapped[str | None] = mapped_column(String(32))
+    imported_at: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))
+
+
+class GmailAccountRow(Base):
+    __tablename__ = "gmail_accounts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True)
+    token_path: Mapped[str | None] = mapped_column(Text)
+    scopes_json: Mapped[str] = mapped_column(Text, default="[]")
+    status: Mapped[str] = mapped_column(String(24), default="disconnected", index=True)
+    history_id: Mapped[str | None] = mapped_column(String(64))
+    last_synced_at: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))
+
+
+class GmailMessageRow(Base):
+    __tablename__ = "gmail_messages"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    gmail_message_id: Mapped[str] = mapped_column(String(255), unique=True)
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    account_id: Mapped[str] = mapped_column(String(36), ForeignKey("gmail_accounts.id"), index=True)
+    sender: Mapped[str] = mapped_column(String(320))
+    recipients_json: Mapped[str] = mapped_column(Text, default="[]")
+    subject: Mapped[str] = mapped_column(Text, default="")
+    body_text: Mapped[str] = mapped_column(Text, default="")
+    sent_at: Mapped[str | None] = mapped_column(String(32))
+    classification: Mapped[str] = mapped_column(String(32), default="unclassified", index=True)
+    processing_status: Mapped[str] = mapped_column(String(32), default="received", index=True)
+    source_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[str] = mapped_column(String(32))
+
+
+class GmailAttachmentRow(Base):
+    __tablename__ = "gmail_attachments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    message_id: Mapped[str] = mapped_column(String(36), ForeignKey("gmail_messages.id"), index=True)
+    gmail_attachment_id: Mapped[str] = mapped_column(String(255))
+    filename: Mapped[str] = mapped_column(String(500))
+    mime_type: Mapped[str] = mapped_column(String(200))
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    source_hash: Mapped[str] = mapped_column(String(64))
+    stored_path: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32))
+
+
+class SupplierEmailDraftRow(Base):
+    __tablename__ = "supplier_email_drafts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    quotation_register_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("quotation_register.id"), index=True)
+    supplier_master_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("supplier_master.id"), index=True)
+    gmail_account_id: Mapped[str] = mapped_column(String(36), ForeignKey("gmail_accounts.id"), index=True)
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    gmail_draft_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    recipient: Mapped[str] = mapped_column(Text)
+    cc: Mapped[str] = mapped_column(Text, default="")
+    subject: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    immutable_approved_body: Mapped[str | None] = mapped_column(Text)
+    approved_subject: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="draft", index=True)
+    sent_message_id: Mapped[str | None] = mapped_column(String(255), unique=True)
+    sent_at: Mapped[str | None] = mapped_column(String(32))
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))
+
+
+class GmailSupplierReplyRow(Base):
+    __tablename__ = "supplier_reply_history"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    gmail_message_id: Mapped[str] = mapped_column(String(36), ForeignKey("gmail_messages.id"), index=True)
+    gmail_thread_id: Mapped[str] = mapped_column(String(255), index=True)
+    supplier_master_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("supplier_master.id"), index=True)
+    quotation_register_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("quotation_register.id"), index=True)
+    action: Mapped[str] = mapped_column(String(32), default="received")
+    details_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String(32))
 
 
 class QuestionSetRow(Base):

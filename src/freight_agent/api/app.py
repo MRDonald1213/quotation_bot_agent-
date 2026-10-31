@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
+from secrets import token_urlsafe
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, File, Query, Request, Response, UploadFile
+from fastapi import Body, FastAPI, File, Form, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -91,6 +94,7 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="Freight AI Agent", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.settings = settings
     app.state.runner = JobRunner()
+    app.state.oauth_pending_states: dict[str, tuple[float, str]] = {}
     with get_session(settings) as bootstrap_session:
         init_schema(bootstrap_session)
 
@@ -163,6 +167,164 @@ def create_app(settings: Settings) -> FastAPI:
                 "proposals": [s["label"] for s in review["shipments"]
                               if s["status"] == str(ShipmentStatus.needs_review)],
                 "activity": review["activity"][:6], "jobs": runner().recent(5)}
+
+    # ------------------------------------------------ supplier databases
+    @app.get("/api/supplier-databases")
+    def supplier_databases() -> list[dict[str, Any]]:
+        from ..services.supplier_databases import list_supplier_databases
+        return list_supplier_databases(settings)
+
+    @app.post("/api/supplier-databases/preview", status_code=200)
+    async def supplier_database_preview(file: UploadFile = File(...)) -> dict[str, Any]:
+        from ..services.supplier_databases import infer_schema
+        if not (file.filename or "").lower().endswith(".csv"):
+            raise ValidationFailureError("only CSV supplier databases are supported")
+        payload = await file.read(_upload_limit(settings) + 1)
+        if len(payload) > _upload_limit(settings):
+            raise ValidationFailureError(f"CSV is larger than the configured limit of {_upload_limit(settings) // 1024 // 1024} MB")
+        with tempfile.TemporaryDirectory(prefix="supplier-preview-") as staging:
+            path = Path(staging) / (Path(file.filename or "supplier.csv").name or "supplier.csv")
+            path.write_bytes(payload)
+            fields, record_count = infer_schema(path)
+        return {"csv_filename": Path(file.filename or "supplier.csv").name,
+                "record_count": record_count, "schema": fields}
+
+    @app.post("/api/supplier-databases/preview-path", status_code=200)
+    def supplier_database_preview_path(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_databases import preview_supplier_database_path
+        return preview_supplier_database_path(settings, str(body.get("path") or ""))
+
+    @app.post("/api/supplier-databases/from-path", status_code=201)
+    def supplier_database_connect_path(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_databases import connect_supplier_database_path
+        aliases_value = body.get("routing_aliases") or []
+        aliases = ([str(item).strip() for item in aliases_value if str(item).strip()]
+                   if isinstance(aliases_value, list)
+                   else [item.strip() for item in str(aliases_value).split(",") if item.strip()])
+        custom_schema = body.get("schema") if isinstance(body.get("schema"), list) else None
+        database = connect_supplier_database_path(
+            settings,
+            str(body.get("path") or ""),
+            name=str(body.get("name") or "").strip(),
+            description=str(body.get("description") or "").strip(),
+            category=str(body.get("category") or "").strip() or None,
+            routing_aliases=aliases,
+            schema=custom_schema,
+        )
+        return {"ok": True, "database": database}
+
+    @app.post("/api/supplier-databases", status_code=201)
+    async def supplier_database_connect(
+        file: UploadFile = File(...),
+        name: str = Form(...),
+        description: str = Form(default=""),
+        category: str = Form(default=""),
+        routing_aliases: str = Form(default=""),
+        schema_data: str = Form(default="", alias="schema_json"),
+    ) -> dict[str, Any]:
+        from ..services.supplier_databases import connect_supplier_database
+        payload = await file.read(_upload_limit(settings) + 1)
+        if len(payload) > _upload_limit(settings):
+            raise ValidationFailureError(f"CSV is larger than the configured limit of {_upload_limit(settings) // 1024 // 1024} MB")
+        aliases: list[str] = []
+        if routing_aliases.strip():
+            try:
+                parsed = json.loads(routing_aliases)
+                aliases = [str(item).strip() for item in parsed if str(item).strip()] if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                aliases = [item.strip() for item in routing_aliases.split(",") if item.strip()]
+        custom_schema: list[dict[str, Any]] | None = None
+        if schema_data.strip():
+            parsed_schema = json.loads(schema_data)
+            if isinstance(parsed_schema, list):
+                custom_schema = parsed_schema
+        return {"ok": True, "database": connect_supplier_database(
+            settings,
+            file.filename or "supplier.csv",
+            payload,
+            name=name,
+            description=description,
+            category=category or None,
+            routing_aliases=aliases,
+            schema=custom_schema,
+        )}
+
+    @app.get("/api/supplier-databases/{database_id}")
+    def supplier_database_detail(database_id: str) -> dict[str, Any]:
+        from ..services.supplier_databases import get_supplier_database
+        return get_supplier_database(settings, database_id)
+
+    @app.patch("/api/supplier-databases/{database_id}")
+    def supplier_database_update(database_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_databases import update_supplier_database
+        return {"ok": True, "database": update_supplier_database(settings, database_id, body)}
+
+    @app.delete("/api/supplier-databases/{database_id}")
+    def supplier_database_disconnect(database_id: str) -> dict[str, Any]:
+        from ..services.supplier_databases import disconnect_supplier_database
+        return {"ok": True, "database": disconnect_supplier_database(settings, database_id)}
+
+    # ------------------------------------------------ supplier quotations and agent
+    @app.get("/api/supplier-quotations")
+    def supplier_quotations() -> dict[str, Any]:
+        actions = __import__("freight_agent.services.supplier_workflow", fromlist=["list_actions"]).list_actions(settings)
+        action_by_intake = {item["intake_id"]: item for item in actions}
+        unprocessed = []
+        for document in _document_rows(settings):
+            if document["id"] in action_by_intake:
+                continue
+            unprocessed.append({"id": None, "intake_id": document["id"], "file": document["file"],
+                                "database_id": None, "database_name": None, "status": "received",
+                                "routing": [], "proposed_row": {}, "missing_fields": [], "evidence": {},
+                                "notes": "Received quotation is waiting for supplier database routing and analysis.",
+                                "created_csv_row": None, "created_at": document["created_at"], "updated_at": document["created_at"]})
+        return {"received": unprocessed, "actions": actions}
+
+    @app.post("/api/supplier-quotations/{intake_id}/process")
+    def supplier_quotation_process(intake_id: str, database_id: str | None = Query(default=None)) -> dict[str, Any]:
+        from ..services.supplier_workflow import process_supplier_quotation
+        return {"ok": True, "action": process_supplier_quotation(settings, intake_id, database_id)}
+
+    @app.get("/api/supplier-actions")
+    def supplier_actions() -> list[dict[str, Any]]:
+        from ..services.supplier_workflow import list_actions
+        return list_actions(settings)
+
+    @app.get("/api/supplier-actions/{action_id}")
+    def supplier_action_detail(action_id: str) -> dict[str, Any]:
+        from ..services.supplier_workflow import get_action
+        return get_action(settings, action_id)
+
+    @app.patch("/api/supplier-actions/{action_id}/proposal")
+    def supplier_action_proposal(action_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_workflow import update_proposal
+        return {"ok": True, "action": update_proposal(settings, action_id,
+                                                       body.get("proposed_row") if isinstance(body.get("proposed_row"), dict) else {},
+                                                       body.get("notes"))}
+
+    @app.post("/api/supplier-actions/{action_id}/approve")
+    def supplier_action_approve(action_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_workflow import approve_action
+        row = body.get("proposed_row") if isinstance(body.get("proposed_row"), dict) else None
+        return {"ok": True, "action": approve_action(settings, action_id, row, body.get("notes"))}
+
+    @app.post("/api/supplier-actions/{action_id}/status")
+    def supplier_action_status(action_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_workflow import set_action_status
+        return {"ok": True, "action": set_action_status(settings, action_id, str(body.get("status") or "needs_human_review"), body.get("notes"))}
+
+    @app.post("/api/supplier-agent/chat")
+    def supplier_agent_chat(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_workflow import chat_supplier_databases
+        question = str(body.get("question") or "").strip()
+        if not question:
+            raise ValidationFailureError("enter a supplier database question")
+        return chat_supplier_databases(settings, question, body.get("database_id"))
+
+    @app.get("/api/supplier-agent/history")
+    def supplier_agent_history(limit: int = Query(default=30, ge=1, le=100)) -> list[dict[str, Any]]:
+        from ..services.supplier_workflow import chat_history
+        return chat_history(settings, limit)
 
     @app.get("/api/review")
     def review_payload() -> dict[str, Any]:
@@ -371,12 +533,130 @@ def create_app(settings: Settings) -> FastAPI:
         return Response(content=data, media_type="application/octet-stream",
                         headers={"Content-Disposition": f'attachment; filename="{Path(path).name}"'})
 
+    # ------------------------------------------------------------- Gmail integration
+    @app.get("/api/gmail/status")
+    def gmail_status() -> dict[str, Any]:
+        from ..services.gmail_sync import gmail_status
+        return gmail_status(settings)
+
+    @app.post("/api/gmail/authorize")
+    def gmail_authorize(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.gmail_sync import gmail_authorization_url
+        redirect_uri = "http://127.0.0.1:8765/api/gmail/oauth/callback"
+        if body.get("redirect_uri") not in (None, "", redirect_uri):
+            raise ValidationFailureError("OAuth redirect URI must be exactly the configured callback URI")
+        code_verifier = token_urlsafe(64)
+        result = gmail_authorization_url(settings, redirect_uri, code_verifier)
+        now = time.monotonic()
+        app.state.oauth_pending_states = {
+            pending_state: pending
+            for pending_state, pending in app.state.oauth_pending_states.items()
+            if pending[0] > now
+        }
+        app.state.oauth_pending_states[str(result["state"])] = (now + 600, code_verifier)
+        return result
+
+    @app.get("/api/gmail/oauth/callback")
+    def gmail_oauth_callback(code: str = Query(...), state: str = Query(...)) -> RedirectResponse:
+        from ..services.gmail_sync import gmail_oauth_callback
+        pending = app.state.oauth_pending_states.pop(state, None)
+        if pending is None:
+            raise ValidationFailureError("OAuth state is invalid or has already been used")
+        expires_at, code_verifier = pending
+        if time.monotonic() > expires_at:
+            raise ValidationFailureError("OAuth state has expired")
+        redirect_uri = "http://127.0.0.1:8765/api/gmail/oauth/callback"
+        gmail_oauth_callback(settings, code, redirect_uri, code_verifier)
+        return RedirectResponse(url="/#/inbox", status_code=303)
+
+    @app.post("/api/gmail/sync", status_code=200)
+    def gmail_sync(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.gmail_sync import gmail_sync
+        return gmail_sync(settings, int(body.get("limit") or 25))
+
+    @app.get("/api/gmail/inbox")
+    def gmail_inbox(limit: int = Query(default=100, ge=1, le=100)) -> list[dict[str, Any]]:
+        from ..services.gmail_sync import gmail_inbox
+        return gmail_inbox(settings, limit)
+
+    @app.delete("/api/gmail/accounts/{account_id}")
+    def gmail_disconnect(account_id: str) -> dict[str, Any]:
+        from ..services.gmail_sync import gmail_disconnect
+        return gmail_disconnect(settings, account_id)
+
+    @app.get("/api/supplier-email-drafts")
+    def supplier_email_drafts() -> list[dict[str, Any]]:
+        from ..services.gmail_drafts import list_drafts
+        return list_drafts(settings)
+
+    @app.post("/api/supplier-email-drafts", status_code=201)
+    def supplier_email_draft_create(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.gmail_drafts import create_draft
+        return create_draft(settings, recipient=str(body.get("recipient") or ""), cc=str(body.get("cc") or ""),
+                            subject=str(body.get("subject") or ""), body=str(body.get("body") or ""),
+                            gmail_account_id=str(body.get("gmail_account_id") or ""),
+                            quotation_register_id=body.get("quotation_register_id"),
+                            supplier_master_id=body.get("supplier_master_id"),
+                            gmail_thread_id=body.get("gmail_thread_id"))
+
+    @app.get("/api/supplier-email-drafts/{draft_id}")
+    def supplier_email_draft_detail(draft_id: str) -> dict[str, Any]:
+        from ..services.gmail_drafts import get_draft
+        return get_draft(settings, draft_id)
+
+    @app.patch("/api/supplier-email-drafts/{draft_id}")
+    def supplier_email_draft_save(draft_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.gmail_drafts import save_draft
+        return save_draft(settings, draft_id, recipient=str(body.get("recipient") or ""),
+                          cc=str(body.get("cc") or ""), subject=str(body.get("subject") or ""),
+                          body=str(body.get("body") or ""))
+
+    @app.post("/api/supplier-email-drafts/{draft_id}/approve")
+    def supplier_email_draft_approve(draft_id: str) -> dict[str, Any]:
+        from ..services.gmail_drafts import approve_draft
+        return {"ok": True, "draft": approve_draft(settings, draft_id)}
+
+    @app.post("/api/supplier-email-drafts/{draft_id}/send")
+    def supplier_email_draft_send(draft_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.gmail_send import send_approved_draft
+        return send_approved_draft(settings, draft_id, str(body.get("confirmation") or ""),
+                                   str(body.get("idempotency_key") or ""))
+
+    # ------------------------------------------------------------- Supplier master and register
+    @app.get("/api/supplier-master")
+    def supplier_master(database_id: str | None = Query(default=None)) -> list[dict[str, Any]]:
+        from ..services.supplier_master import list_supplier_master
+        return list_supplier_master(settings, database_id)
+
+    @app.post("/api/supplier-master/{database_id}/sync")
+    def supplier_master_sync(database_id: str) -> dict[str, Any]:
+        from ..services.supplier_master import sync_supplier_master
+        return sync_supplier_master(settings, database_id)
+
+    @app.get("/api/quotation-register")
+    def quotation_register() -> list[dict[str, Any]]:
+        from ..services.quotation_register import list_register
+        return list_register(settings)
+
+    @app.post("/api/supplier-actions/{action_id}/import-register")
+    def supplier_action_import_register(action_id: str) -> dict[str, Any]:
+        from ..services.quotation_register import import_quotation_action
+        return {"ok": True, "quotation": import_quotation_action(settings, action_id)}
+
     # ------------------------------------------------------------- generic verbs
     @app.post("/api/action")
     def action(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         return {"ok": True, **apply_action(settings, str(body.get("action") or ""), body)}
 
+    @app.on_event("shutdown")
+    def stop_gmail_monitor() -> None:
+        app.state.gmail_stop_event.set()
+
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    app.state.gmail_stop_event = threading.Event()
+    from ..services.gmail_sync import start_background_monitor
+    app.state.gmail_monitor_thread = start_background_monitor(settings, app.state.gmail_stop_event)
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:

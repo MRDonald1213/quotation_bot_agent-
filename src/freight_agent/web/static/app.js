@@ -22,13 +22,19 @@ const state = {
   dirty: false,
   busy: new Set(),
   watched: null,
+  supplierPreview: null,
 };
 
 const PAGES = {
   "": {
-    title: "Dashboard",
+    title: "Overview",
     guide:
-      "What the agent read, what still waits for you, and what is already in the database.",
+      "Operational status, quotations, supplier records, inbox activity and decisions waiting for approval.",
+  },
+  inbox: {
+    title: "Quotation Inbox",
+    guide:
+      "Quotation-related supplier conversations and attachments automatically synchronized from Gmail.",
   },
   documents: {
     title: "Documents",
@@ -59,6 +65,10 @@ const PAGES = {
     title: "System",
     guide:
       "What runs on this computer, where your data lives, and what to check if something fails.",
+  },
+  supplier: {
+    title: "Supplier Workspace",
+    guide: "Manage supplier master data, received quotations, approvals and supplier conversations.",
   },
 };
 
@@ -442,6 +452,8 @@ async function route() {
     return id ? pageComparison(id) : pageComparisonIndex();
   if (page === "drafts") return pageDrafts();
   if (page === "settings") return pageSettings();
+  if (page === "inbox") return pageInbox();
+  if (page === "supplier") return pageSupplier(id || "databases");
   view.innerHTML = empty("This page does not exist.");
 }
 
@@ -1513,26 +1525,68 @@ async function pageComparison(id) {
 
 // --------------------------------------------------------------------- drafts
 async function pageDrafts() {
+  view.className = "supplier-work";
   skeleton();
-  let rows;
-  try {
-    rows = await api.get("/api/drafts");
-  } catch (exc) {
-    return fail(exc);
-  }
+  let rows = [];
+  let supplierDrafts = [];
+  try { rows = await api.get("/api/drafts"); } catch (exc) { return fail(exc); }
+  try { supplierDrafts = await api.get("/api/supplier-email-drafts"); } catch (exc) { supplierDrafts = []; }
   view.innerHTML = `
-    <div class="note">These are written for you to read and send yourself. The app never sends anything:
-      approving records your decision, exporting saves a file on this computer.</div>
-    <div class="row" style="margin-top:10px"><button class="btn neutral" data-act="reload">Refresh</button></div>
+    <div class="supplier-header">
+      <div><span class="supplier-kicker">Human review required</span><h2>Supplier draft review</h2></div>
+      <button class="supplier-btn supplier-btn-neutral" type="button" data-supplier-drafts-refresh>Refresh</button>
+    </div>
+    <div class="supplier-action-group">
+      ${supplierDrafts.length ? supplierDrafts.map(supplierDraftCard).join("") : `<div class="supplier-empty"><span class="supplier-kicker">No Gmail drafts</span><h2>Nothing is waiting for email review</h2><p>Clarification drafts will appear here after supplier quotation analysis or mailbox processing.</p></div>`}
+    </div>
+    <div class="supplier-header" style="margin-top:28px">
+      <div><span class="supplier-kicker">Existing local drafts</span><h2>Document clarification drafts</h2></div>
+    </div>
+    <div class="note">These are written for you to read and send yourself. The app never sends anything: approving records your decision, exporting saves a file on this computer.</div>
     <div class="list" style="margin-top:12px">
-      ${
-        rows.length
-          ? rows.map(draftCard).join("")
-          : empty(
-              "No open drafts. They are prepared once a proposed lane is approved and figures are still missing.",
-            )
-      }
+      ${rows.length ? rows.map(draftCard).join("") : empty("No open local clarification drafts.")}
     </div>`;
+
+  document.querySelectorAll("[data-supplier-drafts-refresh]").forEach((button) => button.addEventListener("click", pageDrafts));
+  document.querySelectorAll("[data-supplier-draft-save]").forEach((button) => button.addEventListener("click", async (event) => {
+    const draftId = event.currentTarget.dataset.supplierDraftSave;
+    const form = document.querySelector(`[data-supplier-draft-form="${CSS.escape(draftId)}"]`);
+    if (!form) return;
+    const payload = { recipient: form.elements.recipient.value, cc: form.elements.cc.value, subject: form.elements.subject.value, body: form.elements.body.value };
+    try {
+      const response = await fetch(`/api/supplier-email-drafts/${encodeURIComponent(draftId)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const result = await response.json(); if (!response.ok) throw new Error(result.error || "Could not save draft"); toast("Draft saved."); await pageDrafts();
+    } catch (error) { toast(error.message, true); }
+  }));
+  document.querySelectorAll("[data-supplier-draft-approve]").forEach((button) => button.addEventListener("click", async (event) => {
+    try { await api.post(`/api/supplier-email-drafts/${encodeURIComponent(event.currentTarget.dataset.supplierDraftApprove)}/approve`, {}); toast("Exact draft content locked for sending."); await pageDrafts(); } catch (error) { toast(error.message, true); }
+  }));
+  document.querySelectorAll("[data-supplier-draft-send]").forEach((button) => button.addEventListener("click", async (event) => {
+    const approved = await confirmDialog({ title: "Send this approved Gmail draft?", body: "<p>The exact approved recipient, subject and body will be sent. This action is recorded and cannot be retried as a new send.</p>", confirmLabel: "Type SEND in the next confirmation", danger: true });
+    if (!approved) return;
+    const confirmation = window.prompt('Type SEND to confirm this email');
+    if (confirmation !== "SEND") { toast("Email not sent: confirmation was not SEND.", true); return; }
+    const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+    try { const result = await api.post(`/api/supplier-email-drafts/${encodeURIComponent(event.currentTarget.dataset.supplierDraftSend)}/send`, { confirmation, idempotency_key: idempotencyKey }); toast(result.status === "sent" ? "Email sent through Gmail." : "Draft send resolved."); await pageDrafts(); } catch (error) { toast(error.message, true); }
+  }));
+}
+
+function supplierDraftCard(draft) {
+  const locked = draft.status === "approved" || draft.status === "sent";
+  return `<article class="supplier-action-card supplier-action-card-draft">
+    <div class="supplier-action-head"><div><span class="supplier-kicker">Gmail draft</span><h3>${esc(draft.subject || "Untitled")}</h3></div><span class="supplier-status">${esc(draft.status)}</span></div>
+    <form class="supplier-form" data-supplier-draft-form="${esc(draft.id)}">
+      <label>Recipient<input name="recipient" value="${esc(draft.recipient)}" ${locked ? "disabled" : ""}></label>
+      <label>CC<input name="cc" value="${esc(draft.cc)}" ${locked ? "disabled" : ""}></label>
+      <label>Subject<input name="subject" value="${esc(draft.subject)}" ${locked ? "disabled" : ""}></label>
+      <label>Body<textarea name="body" rows="10" ${locked ? "disabled" : ""}>${esc(draft.body)}</textarea></label>
+      <div class="supplier-card-actions">
+        ${draft.status === "draft" ? `<button type="button" class="supplier-btn supplier-btn-neutral" data-supplier-draft-save="${esc(draft.id)}">Save changes</button><button type="button" class="supplier-btn supplier-btn-primary" data-supplier-draft-approve="${esc(draft.id)}">Approve exact content</button>` : ""}
+        ${draft.status === "approved" ? `<button type="button" class="supplier-btn supplier-btn-primary" data-supplier-draft-send="${esc(draft.id)}">Send email</button>` : ""}
+        ${draft.status === "sent" ? `<span class="supplier-meta-text">Sent: ${esc(draft.sent_message_id || "confirmed")}</span>` : ""}
+      </div>
+    </form>
+  </article>`;
 }
 
 function draftCard(d) {
@@ -1557,6 +1611,352 @@ function draftCard(d) {
       <button class="btn small neutral" data-act="draft-export" data-format="eml" data-id="${esc(d.id)}">Save as .eml</button>
     </div>
   </div>`;
+}
+
+// ------------------------------------------------ unified supplier workspace
+async function pageInbox() {
+  view.className = "supplier-work";
+  skeleton();
+  let status = { configured: false, accounts: [] };
+  let messages = [];
+  try { status = await api.get("/api/gmail/status"); } catch (error) { /* status unavailable */ }
+  try { messages = await api.get("/api/gmail/inbox"); } catch (error) { /* no synchronized inbox */ }
+  const connected = status.accounts && status.accounts.some((account) => account.status === "connected");
+  view.innerHTML = `
+    <div class="supplier-header">
+      <div><span class="supplier-kicker">Gmail connection</span><h2>Quotation Inbox</h2><p class="supplier-meta-text">Automatic synchronization: ${status.automatic_status || "stopped"}${status.last_successful_sync_at ? ` · Last sync ${esc(status.last_successful_sync_at)}` : ""}${status.error ? ` · ${esc(status.error)}` : ""}</p></div>
+      <div class="supplier-card-actions">
+        <button class="supplier-btn supplier-btn-neutral" id="gmail-sync" ${connected ? "" : "disabled"}>Sync inbox</button>
+        <button class="supplier-btn supplier-btn-primary" id="gmail-connect">${connected ? "Manage Gmail" : "Connect Gmail"}</button>
+      </div>
+    </div>
+    ${!status.configured ? `
+      <div class="supplier-empty">
+        <span class="supplier-kicker">OAuth setup required</span>
+        <h2>Configure Gmail credentials</h2>
+        <p>Set <code>GOOGLE_OAUTH_CREDENTIALS_PATH</code> to a protected Google OAuth client-secrets file and <code>GOOGLE_OAUTH_TOKEN_PATH</code> to a local token location. No credentials are exposed in this screen.</p>
+      </div>` : connected ? "" : `
+      <div class="supplier-empty">
+        <span class="supplier-kicker">Account required</span>
+        <h2>Connect your Gmail account</h2>
+        <p>Automatic synchronization runs every 30 seconds. Sending is always a separate explicit human action.</p>
+      </div>`}
+    <div class="supplier-action-group">
+      <div class="supplier-group-head"><h3>Messages</h3><span>${messages.length}</span></div>
+      ${messages.length ? messages.map((message) => `
+        <article class="supplier-action-card">
+          <div class="supplier-action-head">
+            <div><span class="supplier-kicker">${esc(message.classification)}</span><h3>${esc(message.subject || "No subject")}</h3></div>
+            <span class="supplier-status">${esc(message.processing_status)}</span>
+          </div>
+          <p><strong>From:</strong> ${esc(message.sender)}</p>
+          <p>${esc(message.body_preview)}</p>
+          <div class="supplier-card-actions"><span class="supplier-meta-text">${message.attachment_count} attachment(s)</span></div>
+        </article>`).join("") : `<div class="supplier-coming"><h2>No synchronized messages</h2><p>No new quotation emails found. Automatic synchronization will continue checking the inbox.</p></div>`}
+    </div>`;
+  document.getElementById("gmail-connect").addEventListener("click", async () => {
+    try {
+      const result = await api.post("/api/gmail/authorize", { redirect_uri: "http://127.0.0.1:8765/api/gmail/oauth/callback" });
+      window.location.assign(result.authorization_url);
+    } catch (error) { toast(error.message, true); }
+  });
+  document.getElementById("gmail-sync").addEventListener("click", async (event) => {
+    event.currentTarget.disabled = true;
+    try { const result = await api.post("/api/gmail/sync", { limit: 25 }); toast(result.message || `${result.imported} new message(s) synchronized.`); await pageInbox(); }
+    catch (error) { toast(error.message, true); event.currentTarget.disabled = false; }
+  });
+}
+
+// ------------------------------------------------ supplier operations
+async function pageSupplier(section) {
+  view.className = "supplier-work";
+  if (section === "quotations") return pageSupplierQuotations();
+  if (section === "actions") return pageSupplierActions();
+  if (section === "agent") return pageSupplierAgent();
+  if (section !== "databases") {
+    view.innerHTML = '<div class="supplier-coming"><h2>Unknown Supplier Operations screen</h2><a class="supplier-btn supplier-btn-primary" href="#/supplier/databases">Open Database Connections</a></div>';
+    return;
+  }
+
+  skeleton();
+  const databases = await api.get("/api/supplier-databases").catch(() => null);
+  if (databases === null) {
+    view.innerHTML = '<div class="supplier-note bad">The supplier database service is not available.</div>';
+    return;
+  }
+
+  const cards = databases.length ? databases.map((database) => `
+    <article class="supplier-db-card">
+      <div class="supplier-db-head">
+        <div>
+          <span class="supplier-kicker">${esc(database.category || "Supplier database")}</span>
+          <h2>${esc(database.name)}</h2>
+        </div>
+        <span class="supplier-status">${esc(database.status)}</span>
+      </div>
+      <p>${esc(database.description || "No database description yet.")}</p>
+      <dl class="supplier-meta">
+        <div><dt>CSV connection</dt><dd>${esc(database.csv_path || database.csv_filename)}</dd></div>
+        <div><dt>Records</dt><dd>${esc(database.record_count)}</dd></div>
+        <div><dt>Columns</dt><dd>${esc(database.schema.length)}</dd></div>
+      </dl>
+      <details class="supplier-schema">
+        <summary>View detected schema</summary>
+        <div class="supplier-schema-table">
+          ${database.schema.map((field) => `
+            <div><strong>${esc(field.label || field.name)}</strong><span>${esc(field.name)}</span><code>${esc(field.type)}</code></div>`).join("")}
+        </div>
+      </details>
+      <div class="supplier-card-actions">
+        <button class="supplier-btn supplier-btn-neutral" data-disconnect="${esc(database.id)}">Disconnect</button>
+      </div>
+    </article>`).join("") : `
+    <div class="supplier-empty">
+      <span class="supplier-kicker">No databases connected</span>
+      <h2>Connect your first supplier database</h2>
+      <p>Choose a CSV file, describe the supplier domain it represents, and review the detected schema.</p>
+    </div>`;
+
+  view.innerHTML = `
+    <div class="supplier-header">
+      <div>
+        <span class="supplier-kicker">CSV supplier databases</span>
+        <h2>Connected databases</h2>
+      </div>
+      <button class="supplier-btn supplier-btn-primary" id="supplier-connect-open">Connect database</button>
+    </div>
+    <div class="supplier-db-grid">${cards}</div>
+
+    <section class="supplier-connect-panel" id="supplier-connect-panel" hidden>
+      <div class="supplier-header">
+        <div><span class="supplier-kicker">New connection</span><h2>Connect a CSV supplier database</h2></div>
+        <button class="supplier-icon-btn" id="supplier-connect-close" aria-label="Close connection form">×</button>
+      </div>
+      <form id="supplier-connect-form" class="supplier-form">
+        <label>CSV file location<input type="text" id="supplier-file-path" required placeholder="data/supplier_databases/logistics_supplier_database.csv"></label>
+        <div class="supplier-form-actions" style="justify-content:flex-start"><button type="button" class="supplier-btn supplier-btn-neutral" id="supplier-preview-path">Inspect CSV and preview schema</button></div>
+        <div class="supplier-form-grid">
+          <label>Database name<input type="text" name="name" required placeholder="Freight & Carrier Rate Quotes"></label>
+          <label>Category<input type="text" name="category" placeholder="Freight quotations"></label>
+        </div>
+        <label>Description<textarea name="description" rows="3" placeholder="Describe the supplier domain this database represents and when quotations should use it."></textarea></label>
+        <label>Routing aliases<input type="text" name="routing_aliases" placeholder="carrier rates, freight suppliers, fuel quotes"></label>
+        <div id="supplier-preview"></div>
+        <div class="supplier-form-actions">
+          <button type="button" class="supplier-btn supplier-btn-neutral" id="supplier-cancel">Cancel</button>
+          <button type="submit" class="supplier-btn supplier-btn-primary" id="supplier-submit" disabled>Connect database</button>
+        </div>
+      </form>
+    </section>`;
+
+  const panel = document.getElementById("supplier-connect-panel");
+  const open = document.getElementById("supplier-connect-open");
+  const close = () => { panel.hidden = true; state.supplierPreview = null; document.getElementById("supplier-submit").disabled = true; };
+  open.addEventListener("click", () => { panel.hidden = false; panel.scrollIntoView({ behavior: "smooth", block: "start" }); });
+  document.getElementById("supplier-connect-close").addEventListener("click", close);
+  document.getElementById("supplier-cancel").addEventListener("click", close);
+
+  document.getElementById("supplier-preview-path").addEventListener("click", async () => {
+    const pathInput = document.getElementById("supplier-file-path");
+    const suppliedPath = pathInput.value.trim();
+    if (!suppliedPath) {
+      document.getElementById("supplier-preview").innerHTML = '<p class="supplier-note bad">Enter the location of the CSV file.</p>';
+      return;
+    }
+    document.getElementById("supplier-preview").innerHTML = '<p class="supplier-meta-text">Detecting CSV header and sample types…</p>';
+    try {
+      state.supplierPreview = await api.post("/api/supplier-databases/preview-path", { path: suppliedPath });
+      document.getElementById("supplier-preview").innerHTML = `
+        <div class="supplier-preview">
+          <div class="supplier-preview-head"><strong>${esc(state.supplierPreview.csv_filename)}</strong><span>${esc(state.supplierPreview.record_count)} sample records</span></div>
+          <div class="supplier-meta-text">The connected database will use this CSV path directly for reads and approved writes.</div>
+          <div class="supplier-schema-table">${state.supplierPreview.schema.map((field) => `
+            <div><strong>${esc(field.label)}</strong><span>${esc(field.name)}</span><code>${esc(field.type)}</code></div>`).join("")}</div>
+        </div>`;
+      document.getElementById("supplier-submit").disabled = false;
+    } catch (error) {
+      document.getElementById("supplier-preview").innerHTML = `<p class="supplier-note bad">${esc(error.message)}</p>`;
+    }
+  });
+
+  document.getElementById("supplier-connect-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const suppliedPath = document.getElementById("supplier-file-path").value.trim();
+    if (!suppliedPath || !state.supplierPreview) return;
+    const submit = document.getElementById("supplier-submit");
+    submit.disabled = true;
+    submit.textContent = "Connecting…";
+    try {
+      await api.post("/api/supplier-databases/from-path", {
+        path: suppliedPath,
+        name: form.elements.name.value,
+        description: form.elements.description.value,
+        category: form.elements.category.value,
+        routing_aliases: form.elements.routing_aliases.value,
+        schema: state.supplierPreview.schema,
+      });
+      toast("Supplier database connected", "ok");
+      await route();
+    } catch (error) {
+      submit.disabled = false;
+      submit.textContent = "Connect database";
+      toast(error.message, "bad");
+    }
+  });
+
+  document.querySelectorAll("[data-disconnect]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const confirmed = await confirmDialog({
+        title: "Disconnect this supplier database?",
+        body: "<p>The CSV file will remain on disk, but it will stop being available to the app.</p>",
+        confirmLabel: "Disconnect",
+        danger: true,
+      });
+      if (!confirmed) return;
+      const response = await fetch("/api/supplier-databases/" + encodeURIComponent(button.dataset.disconnect), {
+        method: "DELETE",
+      });
+      const payload = await response.json();
+      if (!response.ok) { toast(payload.error || "Could not disconnect database", "bad"); return; }
+      toast("Supplier database disconnected", "ok");
+      await route();
+    });
+  });
+}
+
+async function pageSupplierQuotations() {
+  skeleton();
+  const payload = await api.get("/api/supplier-quotations").catch(() => null);
+  const databases = await api.get("/api/supplier-databases").catch(() => []);
+  if (!payload) {
+    view.innerHTML = '<div class="supplier-note bad">Could not load supplier quotations.</div>';
+    return;
+  }
+  const options = databases.map((database) => `<option value="${esc(database.id)}">${esc(database.name)}</option>`).join("");
+  const receivedCards = payload.received.map((item) => `
+    <article class="supplier-action-card">
+      <div class="supplier-action-head"><div><span class="supplier-kicker">Received quotation</span><h3>${esc(fileName(item.file))}</h3></div><span class="supplier-status">Received</span></div>
+      <p class="supplier-meta-text">Waiting for database routing and schema analysis.</p>
+      <div class="supplier-card-actions"><select class="supplier-select" data-database-for="${esc(item.intake_id)}"><option value="">Auto-route</option>${options}</select><button class="supplier-btn supplier-btn-primary" data-process-supplier="${esc(item.intake_id)}">Analyze quotation</button></div>
+    </article>`).join("");
+  const actionCards = payload.actions.map((action) => supplierActionCard(action, true)).join("");
+  view.innerHTML = `
+    <div class="supplier-header"><div><span class="supplier-kicker">Incoming</span><h2>Supplier Quotations</h2></div></div>
+    <div class="supplier-db-grid">${receivedCards || ""}${actionCards || ""}</div>
+    ${!receivedCards && !actionCards ? '<div class="supplier-empty"><h2>No quotations received</h2><p>Connect Gmail and the application will automatically detect supplier quotation emails.</p></div>' : ""}`;
+
+  view.querySelectorAll("[data-process-supplier]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      const intakeId = button.dataset.processSupplier;
+      const databaseId = view.querySelector(`[data-database-for="${CSS.escape(intakeId)}"]`).value;
+      try {
+        const response = await api.post(`/api/supplier-quotations/${encodeURIComponent(intakeId)}/process${databaseId ? `?database_id=${encodeURIComponent(databaseId)}` : ""}`);
+        toast("Quotation analyzed against supplier database schema", "ok");
+        await pageSupplierQuotations();
+      } catch (error) { button.disabled = false; toast(error.message, "bad"); }
+    });
+  });
+  bindSupplierActionButtons(view);
+}
+
+function supplierActionCard(action, showOpen) {
+  const statusLabels = {
+    received: "Received", needs_human_review: "Pending human review", needs_clarification: "Needs clarification",
+    ready_for_approval: "Ready for approval", record_created: "Record created", rejected: "Rejected"
+  };
+  const missing = action.missing_fields.map((item) => `<li>${esc(item.label || item.field)} — ${esc(item.reason)}</li>`).join("");
+  const rowEntries = Object.entries(action.proposed_row).map(([key, value]) => `<div><dt>${esc(field(key))}</dt><dd>${esc(value)}</dd></div>`).join("");
+  return `<article class="supplier-action-card">
+    <div class="supplier-action-head"><div><span class="supplier-kicker">${esc(action.database_name || "Database not confirmed")}</span><h3>${esc(fileName(action.file) || "Quotation")}</h3></div><span class="supplier-status">${esc(statusLabels[action.status] || action.status)}</span></div>
+    <p>${esc(action.notes || "")}</p>
+    ${missing ? `<div class="supplier-missing"><strong>Missing fields</strong><ul>${missing}</ul></div>` : ""}
+    ${rowEntries ? `<dl class="supplier-meta supplier-row-preview">${rowEntries}</dl>` : ""}
+    ${showOpen ? `<div class="supplier-card-actions">
+      ${action.status === "ready_for_approval" ? `<button class="supplier-btn supplier-btn-primary" data-approve-supplier="${esc(action.id)}">Approve and add record</button>` : ""}
+      ${action.status === "needs_clarification" || action.status === "needs_human_review" ? `<button class="supplier-btn supplier-btn-neutral" data-review-supplier="${esc(action.id)}">Hold for review</button>` : ""}
+      ${action.status !== "record_created" && action.status !== "rejected" ? `<button class="supplier-btn supplier-btn-neutral" data-reject-supplier="${esc(action.id)}">Reject</button>` : ""}
+    </div>` : ""}
+  </article>`;
+}
+
+function bindSupplierActionButtons(container) {
+  container.querySelectorAll("[data-approve-supplier]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const approved = await confirmDialog({title: "Add supplier record to CSV?", body: "<p>The approved row will be appended once. A timestamped CSV backup will be created first.</p>", confirmLabel: "Approve and add record"});
+      if (!approved) return;
+      button.disabled = true;
+      try { await api.post(`/api/supplier-actions/${encodeURIComponent(button.dataset.approveSupplier)}/approve`); toast("Supplier record created", "ok"); await route(); }
+      catch (error) { button.disabled = false; toast(error.message, "bad"); }
+    });
+  });
+  container.querySelectorAll("[data-review-supplier]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await api.post(`/api/supplier-actions/${encodeURIComponent(button.dataset.reviewSupplier)}/status`, {status: "needs_human_review", notes: "Held for explicit human review"});
+      toast("Quotation held for human review", "ok"); await route();
+    });
+  });
+  container.querySelectorAll("[data-reject-supplier]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await api.post(`/api/supplier-actions/${encodeURIComponent(button.dataset.rejectSupplier)}/status`, {status: "rejected", notes: "Rejected by operator"});
+      toast("Supplier quotation rejected", "ok"); await route();
+    });
+  });
+}
+
+async function pageSupplierActions() {
+  skeleton();
+  const actions = await api.get("/api/supplier-actions").catch(() => []);
+  const groups = {
+    "Ready to add": actions.filter((action) => action.status === "ready_for_approval"),
+    "Needs clarification": actions.filter((action) => action.status === "needs_clarification"),
+    "Pending human review": actions.filter((action) => action.status === "needs_human_review"),
+    "Record created": actions.filter((action) => action.status === "record_created"),
+    "Rejected or set aside": actions.filter((action) => action.status === "rejected"),
+  };
+  view.innerHTML = `<div class="supplier-header"><div><span class="supplier-kicker">Workflow queue</span><h2>Action Center</h2></div></div>${Object.entries(groups).map(([name, items]) => `
+    <section class="supplier-action-group"><div class="supplier-group-head"><h3>${esc(name)}</h3><span>${items.length}</span></div>
+      <div class="supplier-db-grid">${items.length ? items.map((action) => supplierActionCard(action, true)).join("") : '<div class="supplier-empty"><p>No items.</p></div>'}</div>
+    </section>`).join("")}`;
+  bindSupplierActionButtons(view);
+}
+
+async function pageSupplierAgent() {
+  const history = await api.get("/api/supplier-agent/history?limit=30").catch(() => []);
+  const databases = await api.get("/api/supplier-databases").catch(() => []);
+  view.innerHTML = `
+    <div class="supplier-header"><div><span class="supplier-kicker">Read-only database assistant</span><h2>Supplier Agent</h2></div>
+      <select class="supplier-select" id="supplier-chat-database"><option value="">All connected databases</option>${databases.map((database) => `<option value="${esc(database.id)}">${esc(database.name)}</option>`).join("")}</select>
+    </div>
+    <div class="supplier-chat">
+      <div id="supplier-chat-messages" class="supplier-chat-messages">${history.map((item) => supplierChatBubble(item.question, item.answer, item.citations)).join("")}</div>
+      <form id="supplier-chat-form" class="supplier-chat-form"><input id="supplier-chat-input" aria-label="Ask the supplier database agent" placeholder="Ask about suppliers, prices, dates, or units…" autocomplete="off"><button class="supplier-btn supplier-btn-primary" type="submit">Ask</button></form>
+    </div>`;
+  const messages = document.getElementById("supplier-chat-messages");
+  document.getElementById("supplier-chat-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = document.getElementById("supplier-chat-input");
+    const question = input.value.trim();
+    if (!question) return;
+    input.value = "";
+    messages.insertAdjacentHTML("beforeend", `<div class="supplier-chat-bubble user">${esc(question)}</div><div class="supplier-chat-bubble agent">Thinking…</div>`);
+    messages.scrollTop = messages.scrollHeight;
+    try {
+      const databaseId = document.getElementById("supplier-chat-database").value;
+      const result = await api.post("/api/supplier-agent/chat", {question, database_id: databaseId || null});
+      messages.lastElementChild.remove();
+      messages.insertAdjacentHTML("beforeend", supplierChatBubble(result.question, result.answer, result.citations));
+      messages.scrollTop = messages.scrollHeight;
+    } catch (error) {
+      messages.lastElementChild.textContent = error.message;
+    }
+  });
+}
+
+function supplierChatBubble(question, answer, citations) {
+  const sources = (citations || []).slice(0, 5).map((citation) => `<li><strong>${esc(citation.database_name)}</strong> — CSV row ${esc(citation.csv_row)}</li>`).join("");
+  return `<div class="supplier-chat-bubble user">${esc(question)}</div><div class="supplier-chat-bubble agent"><p>${esc(answer)}</p>${sources ? `<div class="supplier-citations"><span>Sources</span><ul>${sources}</ul></div>` : ""}</div>`;
 }
 
 // --------------------------------------------------------------------- system
