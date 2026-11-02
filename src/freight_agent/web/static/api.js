@@ -46,6 +46,10 @@
     });
   }
 
+  function remove(path) {
+    return request(path, { method: "DELETE", headers: { Accept: "application/json" } });
+  }
+
   function upload(files, onDuplicate) {
     const form = new FormData();
     for (const file of files) form.append("files", file);
@@ -119,5 +123,5 @@
     });
   }
 
-  global.api = { ApiError, get, post, upload, multipart, action, downloadBlob, pollJob };
+  global.api = { ApiError, get, post, remove, upload, multipart, action, downloadBlob, pollJob };
 })(window);

@@ -26,11 +26,14 @@ class SourceType(StrEnum):
     upload = "upload"
     imported_email = "imported_email"
     imported_reply = "imported_reply"
+    gmail_body = "gmail_body"
+    gmail_attachment = "gmail_attachment"
 
 
 class ClassificationStatus(StrEnum):
     pending = "pending"
     relevant = "relevant"
+    quotation = "quotation"
     irrelevant = "irrelevant"
     needs_review = "needs_review"
     failed = "failed"

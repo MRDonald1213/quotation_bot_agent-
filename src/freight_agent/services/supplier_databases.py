@@ -156,6 +156,10 @@ def row_payload(row: SupplierDatabaseRow) -> dict:
         "routing_aliases": json.loads(row.routing_aliases_json),
         "csv_filename": row.csv_filename,
         "csv_path": row.csv_path,
+        "provider_type": "csv",
+        "connection_type": "csv_path",
+        "source_ref": row.csv_path,
+        "last_analyzed_at": row.updated_at,
         "schema": json.loads(row.schema_json),
         "record_count": row.record_count,
         "status": row.status,
@@ -328,6 +332,62 @@ def update_supplier_database(settings: Settings, database_id: str, updates: dict
             ))
             session.flush()
             return row_payload(row)
+
+
+def reanalyze_supplier_database(settings: Settings, database_id: str) -> dict:
+    """Re-read source metadata and preserve user-maintained field customizations."""
+    with get_session(settings) as session:
+        row = session.get(SupplierDatabaseRow, database_id)
+        if row is None or row.status == "disconnected":
+            raise NotFoundError("supplier database not found")
+        if not row.csv_path:
+            raise ValidationFailureError("the supplier database has no configured source path")
+        existing_schema = json.loads(row.schema_json)
+
+    path = resolve_supplier_csv_path(settings, row.csv_path)
+    inferred, record_count = infer_schema(path)
+    existing_by_name = {
+        field["name"]: field
+        for field in existing_schema
+        if isinstance(field, dict) and field.get("name")
+    }
+    merged_schema = []
+    removed_fields = []
+    inferred_names = {field["name"] for field in inferred}
+    for inferred_field in inferred:
+        custom = existing_by_name.get(inferred_field["name"], {})
+        merged_schema.append({
+            **inferred_field,
+            "label": str(custom.get("label") or inferred_field["label"]),
+            "required": bool(custom.get("required", False)),
+            "description": str(custom.get("description") or ""),
+            "aliases": list(custom.get("aliases") or []),
+            "searchable": bool(custom.get("searchable", True)),
+        })
+    removed_fields = [field["name"] for field in existing_schema if isinstance(field, dict) and field.get("name") not in inferred_names]
+
+    now = utcnow_iso()
+    with get_session(settings) as session:
+        with session.begin():
+            current = session.get(SupplierDatabaseRow, database_id)
+            current.csv_filename = path.name
+            current.schema_json = json.dumps(merged_schema)
+            current.record_count = record_count
+            current.updated_at = now
+            session.add(AuditEventRow(
+                id=str(uuid4()), entity_type="supplier_database", entity_id=database_id,
+                action="reanalyzed", details_json=json.dumps({
+                    "connection_type": "csv_path",
+                    "record_count": record_count,
+                    "removed_fields": removed_fields,
+                }), created_at=now,
+            ))
+            session.flush()
+            payload = row_payload(current)
+    from .supplier_master import sync_supplier_master
+    sync_supplier_master(settings, database_id)
+    payload["removed_fields"] = removed_fields
+    return payload
 
 
 def disconnect_supplier_database(settings: Settings, database_id: str) -> dict:

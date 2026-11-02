@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def utcnow_iso() -> str:
@@ -84,6 +84,9 @@ class IntakeItemRow(Base):
     classification_confidence: Mapped[float | None] = mapped_column(Float)
     classification_json: Mapped[str | None] = mapped_column(Text)
     processing_status: Mapped[str] = mapped_column(String(24), index=True)
+    gmail_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("gmail_messages.id", ondelete="SET NULL"), index=True
+    )
     created_at: Mapped[str] = mapped_column(String(32))
 
 
@@ -291,6 +294,11 @@ class SupplierEmailDraftRow(Base):
     gmail_account_id: Mapped[str] = mapped_column(String(36), ForeignKey("gmail_accounts.id"), index=True)
     gmail_thread_id: Mapped[str | None] = mapped_column(String(255), index=True)
     gmail_draft_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    supplier_action_id: Mapped[str | None] = mapped_column(
+        ForeignKey("supplier_quotation_actions.id", ondelete="SET NULL"), index=True
+    )
+    bound_recipient: Mapped[str | None] = mapped_column(Text)
+    approved_recipient: Mapped[str | None] = mapped_column(Text)
     recipient: Mapped[str] = mapped_column(Text)
     cc: Mapped[str] = mapped_column(Text, default="")
     subject: Mapped[str] = mapped_column(Text)

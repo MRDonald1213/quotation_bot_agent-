@@ -55,11 +55,14 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
                 f"(v{existing_quote.version}); use --force or `freight quote reprocess` "
                 "to reprocess without silently duplicating")
 
-        # 1. classify if needed
-        if item.classification_status == ClassificationStatus.pending:
+        # 1. classify if needed. Legacy Gmail imports used a non-product "quotation"
+        # classification and an empty classification JSON; both must be reclassified.
+        if item.classification_status in (ClassificationStatus.pending, ClassificationStatus.quotation):
             item, classification = classify_intake(settings, intake_id, dry_run=dry_run)
         else:
             classification = _load_classification(settings, item)
+            if classification is None:
+                item, classification = classify_intake(settings, intake_id, dry_run=dry_run)
 
         if item.classification_status == ClassificationStatus.irrelevant:
             if not force:
@@ -71,7 +74,7 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
                         {"reason": item.classification_reason})))
                 return ProcessingSummary(
                     intake_item_id=item.id, classification=classification,
-                    notes=["Reading stopped: the document was classified as not a quote. " + (item.classification_reason or "")],
+                    notes=["Reading stopped: the document was classified as irrelevant and is not a quote. " + (item.classification_reason or "")],
                 )
             notes.append("forced processing of an irrelevant classification (human override, audited)")
 
@@ -324,6 +327,7 @@ def _field_value(quote: Quotation, field: str):
 
 
 def _load_classification(settings: Settings, item) -> "object | None":
+    from pydantic import ValidationError
     from ..domain.models import ClassificationResult
     from ..db.engine import get_session as _gs
     from ..db import models as _m
@@ -331,7 +335,10 @@ def _load_classification(settings: Settings, item) -> "object | None":
     try:
         row = session.get(_m.IntakeItemRow, str(item.id))
         if row and row.classification_json:
-            return ClassificationResult.model_validate_json(row.classification_json)
+            try:
+                return ClassificationResult.model_validate_json(row.classification_json)
+            except (ValidationError, json.JSONDecodeError):
+                return None
         return None
     finally:
         session.close()

@@ -3,9 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
+import re
+from email.utils import parseaddr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from secrets import token_urlsafe
@@ -22,6 +25,7 @@ from ..db.models import GmailAccountRow, GmailAttachmentRow, GmailMessageRow, ut
 from ..domain.exceptions import ConfigurationError, ValidationFailureError
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose"]
+logger = logging.getLogger("freight_agent.gmail_sync")
 _SYNC_LOCK = threading.Lock()
 _SYNC_STATUS = {
     "automatic": False,
@@ -64,16 +68,26 @@ def gmail_status(settings: Settings) -> dict:
 
 
 def _classify_supplier_message(subject: str, body: str, attachments: list[str]) -> tuple[str, float, str]:
-    text = " \\n ".join([subject, body, *attachments]).lower()
+    text = " ".join([subject, body, *attachments]).lower()
     quotation_terms = ("quotation", "quote", "offer", "price", "pricing", "freight rate", "tariff", "incoterm", "valid until")
-    reply_terms = ("re:", "clarification", "regarding your quotation", "our quotation")
-    attachment_ext = any(name.lower().endswith((".pdf", ".xlsx", ".xls", ".doc", ".docx", ".csv")) for name in attachments)
+    reply_terms = ("re:", "clarification", "regarding your quotation", "our quotation", "in response to")
+    attachment_ext = any(name.lower().endswith((".pdf", ".xlsx", ".xls", ".doc", ".docx", ".csv", ".txt", ".eml")) for name in attachments)
     matches = sum(term in text for term in quotation_terms)
+    if any(term in text for term in reply_terms) and subject.lower().startswith(("re:", "clarification", "fw:")):
+        return "SUPPLIER_QUOTATION_REPLY", 0.82, "Detected a supplier reply to an existing quotation conversation"
     if matches >= 2 or attachment_ext and matches >= 1:
         return "NEW_QUOTATION", 0.82 if matches >= 3 else 0.68, "Detected quotation language or a quotation document attachment"
-    if any(term in text for term in reply_terms):
-        return "SUPPLIER_QUOTATION_REPLY", 0.74, "Detected supplier clarification/reply context"
+    if attachment_ext:
+        return "UNCERTAIN", 0.55, "Supported attachment found, but quotation evidence is not confirmed"
     return "NON_QUOTATION", 0.8, "No reliable quotation evidence found"
+
+
+def _sender_address(sender: str) -> str | None:
+    _, address = parseaddr(sender)
+    if not address:
+        return None
+    address = address.strip()
+    return address if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) else None
 
 
 def gmail_authorization_url(settings: Settings, redirect_uri: str, code_verifier: str) -> dict:
@@ -98,13 +112,19 @@ def gmail_oauth_callback(settings: Settings, code: str, redirect_uri: str, code_
     except Exception:
         raise ValidationFailureError("Gmail authorization failed or expired. Please start the connection again.")
     credential = flow.credentials
+
+    try:
+        service = build("gmail", "v1", credentials=credential, cache_discovery=False)
+        profile = service.users().getProfile(userId="me").execute()
+    except Exception as exc:
+        raise ValidationFailureError("Gmail authorization succeeded but account verification failed. Please try again.") from exc
+    email = profile.get("emailAddress", "")
+    if not email:
+        raise ValidationFailureError("Gmail authorization did not return an account email address. Please try again.")
+
     token_path = _token_path(settings)
     token_path.write_text(credential.to_json(), encoding="utf-8")
     os.chmod(token_path, 0o600)
-
-    service = build("gmail", "v1", credentials=credential, cache_discovery=False)
-    profile = service.users().getProfile(userId="me").execute()
-    email = profile.get("emailAddress", "")
     now = utcnow_iso()
     with get_session(settings) as session:
         existing = session.query(GmailAccountRow).filter(GmailAccountRow.email == email).first()
@@ -152,10 +172,18 @@ def _body(payload: dict) -> str:
     return ""
 
 
-def _process_quotation_message(settings: Settings, message_id: str, text_content: str, sender: str, subject: str, attachment_paths: list[Path]) -> None:
+def _attachment_parts(payload: dict) -> list[dict]:
+    found: list[dict] = []
+    if payload.get("filename"):
+        found.append(payload)
+    for child in payload.get("parts", []) or []:
+        found.extend(_attachment_parts(child))
+    return found
+
+
+def _process_quotation_message(settings: Settings, message_id: str, text_content: str, sender: str, subject: str, attachment_paths: list[Path]) -> str | None:
     from ..db.models import IntakeItemRow, SupplierDatabaseRow, utcnow_iso
     from ..parsers.base import parse_file
-    from .supplier_workflow import process_supplier_quotation
 
     parsed_text = text_content.strip()
     evidence_path = attachment_paths[0] if attachment_paths else None
@@ -168,7 +196,7 @@ def _process_quotation_message(settings: Settings, message_id: str, text_content
             except Exception:
                 continue
     if not parsed_text.strip():
-        return
+        return None
 
     now = utcnow_iso()
     filename = evidence_path.name if evidence_path else f"gmail-{message_id[:8]}-quotation.txt"
@@ -181,21 +209,99 @@ def _process_quotation_message(settings: Settings, message_id: str, text_content
         existing = session.query(IntakeItemRow).filter(IntakeItemRow.content_sha256 == digest).first()
         if existing:
             intake_id = existing.id
+            if (existing.source_type in {"gmail_body", "gmail_attachment"}
+                    and existing.classification_status == "quotation"):
+                existing.classification_status = "pending"
+                existing.classification_reason = "Gmail quotation waiting for classification"
+                existing.classification_confidence = None
+                existing.classification_json = None
+                existing.processing_status = "pending"
+            if existing.gmail_message_id is None:
+                existing.gmail_message_id = message_id
+            session.commit()
         else:
             row = IntakeItemRow(id=str(uuid4()), shipment_id=None, source_type="gmail_attachment" if evidence_path else "gmail_body",
                                 original_filename=filename, stored_path=str(stored_path.resolve()), content_sha256=digest,
                                 sender=sender, subject=subject, received_at=now, raw_text=parsed_text,
                                 file_size_bytes=stored_path.stat().st_size if stored_path.is_file() else len(parsed_text.encode()),
-                                classification_status="quotation", classification_reason="Automatic Gmail quotation classification",
-                                classification_confidence=0.8, classification_json="{}", processing_status="processed", created_at=now)
+                                classification_status="pending", classification_reason="Gmail quotation waiting for classification",
+                                classification_confidence=None, classification_json=None, processing_status="pending",
+                                gmail_message_id=message_id, created_at=now)
             session.add(row)
             session.flush()
             intake_id = row.id
             session.commit()
+    return intake_id
+
+
+def analyze_inbound_quotation(settings: Settings, message_row_id: str, intake_id: str) -> str:
+    """Run the whole inbound-quote path: extract, match the supplier database, reveal gaps, draft the reply.
+
+    Stopping at the draft is deliberate — a person still approves and sends it.
+    """
+    from .supplier_workflow import run_quotation_pipeline
+
     try:
-        process_supplier_quotation(settings, intake_id)
-    except Exception:
-        _SYNC_STATUS["error"] = "Quotation extracted but supplier routing or database processing failed"
+        outcome = run_quotation_pipeline(settings, intake_id)
+    except Exception as exc:  # noqa: BLE001 — one bad email must not stop the mailbox
+        logger.warning("automatic analysis failed for %s: %s", intake_id, type(exc).__name__, exc_info=True)
+        status = "extraction_failed"
+    else:
+        action = outcome["action"]
+        if outcome.get("draft"):
+            status = "draft_ready"
+        elif not action.get("database_id"):
+            status = "needs_database"
+        elif action["status"] == "ready_for_approval":
+            status = "ready_for_approval"
+        elif action["status"] == "needs_clarification":
+            status = "needs_clarification"
+        else:
+            status = "needs_human_review"
+    with get_session(settings) as session:
+        row = session.get(GmailMessageRow, message_row_id)
+        if row is not None:
+            row.processing_status = status
+            session.commit()
+    return status
+
+
+def ensure_message_quotation(settings: Settings, message_row_id: str) -> str | None:
+    with get_session(settings) as session:
+        message = session.get(GmailMessageRow, message_row_id)
+        if message is None:
+            raise ValidationFailureError("Gmail message not found")
+        if message.classification not in {"NEW_QUOTATION", "SUPPLIER_QUOTATION_REPLY", "UNCERTAIN"}:
+            return None
+        attachments = session.query(GmailAttachmentRow).filter(GmailAttachmentRow.message_id == message_row_id).all()
+        attachment_paths = [Path(attachment.stored_path) for attachment in attachments if attachment.stored_path and Path(attachment.stored_path).is_file()]
+        text_content = "\n".join(part for part in (message.subject, message.body_text) if part)
+    return _process_quotation_message(settings, message_row_id, text_content, message.sender, message.subject, attachment_paths)
+
+
+def gmail_message_detail(settings: Settings, message_row_id: str) -> dict:
+    intake_id = ensure_message_quotation(settings, message_row_id)
+    with get_session(settings) as session:
+        message = session.get(GmailMessageRow, message_row_id)
+        if message is None:
+            raise ValidationFailureError("Gmail message not found")
+        attachments = session.query(GmailAttachmentRow).filter(GmailAttachmentRow.message_id == message_row_id).order_by(GmailAttachmentRow.created_at).all()
+    return {
+        "id": message.id,
+        "gmail_message_id": message.gmail_message_id,
+        "gmail_thread_id": message.gmail_thread_id,
+        "sender": message.sender,
+        "subject": message.subject,
+        "body_text": message.body_text,
+        "classification": message.classification,
+        "processing_status": message.processing_status,
+        "sent_at": message.sent_at,
+        "created_at": message.created_at,
+        "intake_id": intake_id,
+        "attachments": [{"id": attachment.id, "filename": attachment.filename, "mime_type": attachment.mime_type,
+                         "size_bytes": attachment.size_bytes, "stored_path": attachment.stored_path,
+                         "created_at": attachment.created_at} for attachment in attachments],
+    }
 
 
 def gmail_sync(settings: Settings, limit: int = 100, backfill_days: int | None = None) -> dict:
@@ -247,7 +353,7 @@ def gmail_sync(settings: Settings, limit: int = 100, backfill_days: int | None =
             attachment_names: list[str] = []
             sent_at = utcnow_iso() if full.get("internalDate") else None
 
-            for part in full.get("payload", {}).get("parts", []) or []:
+            for part in _attachment_parts(full.get("payload", {})):
                 filename = part.get("filename")
                 attachment_id = part.get("body", {}).get("attachmentId")
                 if not filename or not attachment_id:
@@ -288,7 +394,10 @@ def gmail_sync(settings: Settings, limit: int = 100, backfill_days: int | None =
             if classification == "NEW_QUOTATION":
                 quotation_count += 1
                 message_text = "\n".join([subject, body_text])
-                _process_quotation_message(settings, row_id, message_text, sender, subject, attachment_paths)
+                intake_id = _process_quotation_message(settings, row_id, message_text, sender, subject, attachment_paths)
+                if intake_id:
+                    # a quotation that arrives by email is analyzed and drafted without another click
+                    analyze_inbound_quotation(settings, row_id, intake_id)
                 with get_session(settings) as session:
                     row = session.get(GmailMessageRow, row_id)
                     row.processing_status = "awaiting_supplier_review" if row.processing_status == "received" else row.processing_status

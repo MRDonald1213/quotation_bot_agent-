@@ -111,7 +111,7 @@ def test_status_reports_local_model_and_schema_without_calling_it(client: TestCl
     payload = client.get("/api/status").json()
     assert payload["backend"] == "ok"
     assert payload["database"]["initialized"] is True
-    assert payload["database"]["schema_version"] == 7
+    assert payload["database"]["schema_version"] == 8
     assert payload["ollama"]["model"] == "fake-model"
     assert set(payload["parsers"]) == {"pdf", "docx", "xlsx"}
     assert ".eml" in payload["limits"]["supported_extensions"]
@@ -170,6 +170,13 @@ def test_supplier_database_preview_connect_update_and_disconnect(client: TestCli
     detail = client.get("/api/supplier-databases/" + database_id)
     assert detail.status_code == 200
     assert detail.json()["name"] == "Freight & Carrier Rate Quotes"
+    assert detail.json()["provider_type"] == "csv"
+    assert detail.json()["connection_type"] == "csv_path"
+
+    reanalyzed = client.post("/api/supplier-databases/" + database_id + "/reanalyze")
+    assert reanalyzed.status_code == 200
+    assert reanalyzed.json()["database"]["record_count"] == 2
+    assert reanalyzed.json()["database"]["provider_type"] == "csv"
 
     deleted = client.delete("/api/supplier-databases/" + database_id)
     assert deleted.status_code == 200

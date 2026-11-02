@@ -8,7 +8,8 @@ app = typer.Typer(
     name="freight",
     help=("AI Freight Agent — Workflows A+B+C: local quotation intake, clarification "
           "drafts, supplier replies, and deterministic cross-carrier comparison. "
-          "Email approval/export only; never sends email."),
+          "The CLI approves and exports drafts only and never sends email; a Gmail "
+          "reply is sent only when a person confirms it in the web Draft review."),
     no_args_is_help=True,
 )
 shipment_app = typer.Typer(help="Shipment context for quotation workflows.", no_args_is_help=True)

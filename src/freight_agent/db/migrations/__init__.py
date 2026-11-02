@@ -113,6 +113,34 @@ def init_schema(session: Session) -> list[str]:
                 description="schema v7: supplier master, quotation register and Gmail workflow records",
             ))
             applied.append("v7")
+        if current < 8:
+            for table, additions in (
+                ("intake_items", (("gmail_message_id", "VARCHAR(36)"),)),
+                ("supplier_email_drafts", (
+                    ("supplier_action_id", "VARCHAR(36)"),
+                    ("bound_recipient", "TEXT"),
+                    ("approved_recipient", "TEXT"),
+                )),
+            ):
+                existing_columns = {column["name"] for column in inspect(connection).get_columns(table)}
+                for name, definition in additions:
+                    if name not in existing_columns:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                        )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_intake_items_gmail_message_id"
+                " ON intake_items (gmail_message_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_supplier_email_drafts_supplier_action_id"
+                " ON supplier_email_drafts (supplier_action_id)"
+            )
+            session.add(SchemaVersionRow(
+                version=8, applied_at=utcnow_iso(),
+                description="schema v8: Gmail source linked to each intake and supplier drafts bound to their sender",
+            ))
+            applied.append("v8")
     return applied
 
 

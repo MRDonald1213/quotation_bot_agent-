@@ -257,3 +257,48 @@ nav a.supplier-nav.active:hover { background:#111; color:#fff; }
 .supplier-citations ul { margin:4px 0 0; padding-left:18px; }
 .supplier-chat-form { border-top:1px solid var(--supplier-line); display:flex; gap:8px; padding:10px; background:#fff; }
 .supplier-chat-form input { flex:1; min-width:0; border:1px solid var(--supplier-line); border-radius:3px; padding:9px 10px; font:inherit; }
+
+/* Operations Inbox and split quotation workspace */
+.operations-header { align-items:flex-start; }
+.operations-import { border:1px solid var(--supplier-line); border-radius:4px; background:#fff; padding:14px; margin-bottom:14px; }
+.operations-import-head { display:flex; justify-content:space-between; gap:12px; margin-bottom:10px; font-size:13px; }
+.operations-import-head span { color:#777; }
+.operations-summary { display:grid; grid-template-columns:repeat(4, minmax(120px, 1fr)); border:1px solid var(--supplier-line); border-radius:4px; background:#fff; }
+.operations-summary div { padding:14px; border-right:1px solid var(--supplier-line); display:flex; flex-direction:column; }
+.operations-summary div:last-child { border-right:none; }
+.operations-summary span { font-size:18px; font-weight:800; }
+.operations-summary small { color:#777; margin-top:2px; }
+.operations-filters { display:flex; gap:8px; margin-bottom:10px; }
+.operations-filters input { flex:1; min-width:220px; border:1px solid var(--supplier-line); border-radius:3px; padding:9px 10px; }
+.operations-filters select { border:1px solid var(--supplier-line); border-radius:3px; padding:8px; background:#fff; }
+.operations-feed-item { border:1px solid var(--supplier-line); border-radius:4px; background:#fff; padding:14px 16px; margin-bottom:8px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+.operations-feed-main h3 { margin:3px 0 2px; }
+.operations-feed-main p { margin:4px 0; color:#666; font-size:13px; }
+.operations-feed-actions { min-width:210px; display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
+.operations-match { display:inline-block; margin-top:4px; color:#555; font-size:12px; }
+.supplier-status.info { background:#f1f1f1; }
+.supplier-status.warn { border-color:#8a6d1a; background:#fff8df; color:#654f0f; }
+.supplier-status.ok { border-color:#477a55; background:#eff8f1; color:#315d3d; }
+.supplier-status.bad { border-color:#9b4b43; background:#fff1ef; color:#7a2f27; }
+.supplier-intelligence { border:2px solid #111; }
+.supplier-review-label { display:flex; flex-direction:column; gap:5px; margin-top:12px; font-size:12px; font-weight:700; }
+.supplier-routing { margin-top:10px; font-size:12px; color:#555; }
+.supplier-routing ol { margin:6px 0 0; padding-left:22px; }
+.supplier-field-table-wrap { margin-top:12px; overflow:auto; border-top:1px solid var(--supplier-line); border-bottom:1px solid var(--supplier-line); }
+.supplier-field-table { width:100%; border-collapse:collapse; font-size:12px; }
+.supplier-field-table th { text-align:left; color:#777; text-transform:uppercase; letter-spacing:.05em; padding:7px 6px; }
+.supplier-field-table td { vertical-align:top; border-top:1px solid var(--supplier-line); padding:7px 6px; }
+.supplier-field-table td:first-child, .supplier-field-table td:first-child span { display:block; }
+.supplier-field-table td:first-child span { color:#777; margin-top:2px; font-size:11px; }
+.supplier-field-missing td { background:#fff8df; }
+.supplier-evidence { display:block; margin-top:4px; color:#777; max-width:260px; }
+.supplier-review-actions { border-top:1px solid var(--supplier-line); padding-top:12px; }
+@media (max-width:700px) {
+  .operations-summary { grid-template-columns:1fr 1fr; }
+  .operations-summary div:nth-child(2) { border-right:none; }
+  .operations-summary div:nth-child(-n+2) { border-bottom:1px solid var(--supplier-line); }
+  .operations-feed-item { align-items:flex-start; flex-direction:column; }
+  .operations-feed-actions { width:100%; align-items:flex-start; }
+  .operations-filters { flex-direction:column; }
+  .operations-header { flex-direction:column; }
+}

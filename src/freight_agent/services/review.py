@@ -26,6 +26,44 @@ ACTIONABLE_PROCESSING = {ProcessingStatus.pending, ProcessingStatus.needs_review
 OPEN_DRAFT_STATES = {DraftStatus.draft, DraftStatus.approved}
 
 
+def clear_quotation_data(settings: Settings) -> dict[str, int]:
+    """Remove uploaded/imported quotation workflow data while preserving supplier database configuration."""
+    from ..db.engine import get_session
+    from ..db.models import (
+        AuditEventRow, CarrierRow, ClarificationDraftRow, FieldEvidenceRow, GapRow,
+        GmailAccountRow, GmailAttachmentRow, GmailMessageRow, GmailSupplierReplyRow, IntakeItemRow,
+        QuestionSetRow, QuotationRegisterRow, QuotationRow, QuotationVersionRow,
+        ShipmentRow, SupplierEmailDraftRow, SupplierQuotationActionRow, SupplierReplyRow,
+    )
+
+    deleted: dict[str, int] = {}
+    models = (
+        SupplierEmailDraftRow, GmailSupplierReplyRow, QuotationRegisterRow,
+        SupplierQuotationActionRow, GmailAttachmentRow, GmailMessageRow, GmailAccountRow,
+        ClarificationDraftRow, QuestionSetRow, SupplierReplyRow, QuotationVersionRow,
+        FieldEvidenceRow, GapRow, QuotationRow, IntakeItemRow, ShipmentRow,
+        CarrierRow, AuditEventRow,
+    )
+    with get_session(settings) as session:
+        for model in models:
+            result = session.query(model).delete(synchronize_session=False)
+            deleted[model.__tablename__] = int(result)
+        session.commit()
+
+    workspace_files = 0
+    if settings.workspace_dir.exists():
+        for child in settings.workspace_dir.iterdir():
+            if child.is_file() or child.is_symlink():
+                child.unlink()
+                workspace_files += 1
+            elif child.is_dir():
+                import shutil
+                shutil.rmtree(child)
+                workspace_files += 1
+    deleted["workspace_files"] = workspace_files
+    return deleted
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 

@@ -82,6 +82,11 @@ def _next_step(row: dict[str, Any]) -> str:
     return "Read this document"
 
 
+def _processing_budget_seconds(settings: Settings) -> float:
+    """Two bounded model calls (extraction, then the reply wording) plus the deterministic work."""
+    return settings.llm_timeout_seconds * (settings.llm_max_retries + 1) * 2 + 120
+
+
 def _error(exc: Exception, status: int) -> JSONResponse:
     return JSONResponse(status_code=status, content={"ok": False, "error": str(exc),
                                                      "type": type(exc).__name__})
@@ -254,6 +259,11 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.supplier_databases import get_supplier_database
         return get_supplier_database(settings, database_id)
 
+    @app.post("/api/supplier-databases/{database_id}/reanalyze", status_code=200)
+    def supplier_database_reanalyze(database_id: str) -> dict[str, Any]:
+        from ..services.supplier_databases import reanalyze_supplier_database
+        return {"ok": True, "database": reanalyze_supplier_database(settings, database_id)}
+
     @app.patch("/api/supplier-databases/{database_id}")
     def supplier_database_update(database_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         from ..services.supplier_databases import update_supplier_database
@@ -282,8 +292,26 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/supplier-quotations/{intake_id}/process")
     def supplier_quotation_process(intake_id: str, database_id: str | None = Query(default=None)) -> dict[str, Any]:
-        from ..services.supplier_workflow import process_supplier_quotation
-        return {"ok": True, "action": process_supplier_quotation(settings, intake_id, database_id)}
+        from ..services.supplier_workflow import run_quotation_pipeline
+
+        outcome = run_quotation_pipeline(settings, intake_id, database_id)
+        return {"ok": True, "action": outcome["action"], "draft": outcome.get("draft"),
+                "notes": outcome["notes"]}
+
+    @app.post("/api/supplier-quotations/{intake_id}/analyze")
+    def supplier_quotation_analyze(intake_id: str, database_id: str | None = Query(default=None)) -> dict[str, Any]:
+        """The same pipeline as /process, run as a job so the browser keeps painting."""
+        from ..services.supplier_workflow import run_quotation_pipeline
+
+        def work(job) -> dict[str, Any]:
+            outcome = run_quotation_pipeline(
+                settings, intake_id, database_id,
+                progress=lambda step: setattr(job, "progress", step))
+            return {"supplier_action": outcome["action"], "draft": outcome.get("draft"),
+                    "notes": outcome["notes"]}
+
+        return {"ok": True, "job": runner().submit("supplier-analysis", intake_id, work,
+                                                   max_seconds=_processing_budget_seconds(settings)).as_dict()}
 
     @app.get("/api/supplier-actions")
     def supplier_actions() -> list[dict[str, Any]]:
@@ -307,6 +335,11 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.supplier_workflow import approve_action
         row = body.get("proposed_row") if isinstance(body.get("proposed_row"), dict) else None
         return {"ok": True, "action": approve_action(settings, action_id, row, body.get("notes"))}
+
+    @app.post("/api/supplier-actions/{action_id}/create-draft")
+    def supplier_action_create_draft(action_id: str) -> dict[str, Any]:
+        from ..services.supplier_workflow import create_supplier_review_draft
+        return {"ok": True, "draft": create_supplier_review_draft(settings, action_id)}
 
     @app.post("/api/supplier-actions/{action_id}/status")
     def supplier_action_status(action_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
@@ -448,7 +481,8 @@ def create_app(settings: Settings) -> FastAPI:
             summary = extract_and_store_quote(settings, intake_id, force=force)
             return summary.model_dump(mode="json")
 
-        return {"ok": True, "job": runner().submit("process", intake_id, work).as_dict()}
+        return {"ok": True, "job": runner().submit("process", intake_id, work,
+                                                   max_seconds=_processing_budget_seconds(settings)).as_dict()}
 
     @app.get("/api/jobs/{job_id}")
     def job_status(job_id: str) -> dict[str, Any]:
@@ -459,6 +493,11 @@ def create_app(settings: Settings) -> FastAPI:
         return runner().recent(20)
 
     # ------------------------------------------------------------------ review
+    @app.delete("/api/workspace/quotation-data")
+    def clear_quotation_data() -> dict[str, Any]:
+        from ..services.review import clear_quotation_data
+        return {"ok": True, "deleted": clear_quotation_data(settings)}
+
     @app.post("/api/quotes/{quotation_id}/review/approve")
     def quote_approve(quotation_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         quote = approve_review(settings, quotation_id, body.get("notes"))
@@ -557,27 +596,66 @@ def create_app(settings: Settings) -> FastAPI:
         return result
 
     @app.get("/api/gmail/oauth/callback")
-    def gmail_oauth_callback(code: str = Query(...), state: str = Query(...)) -> RedirectResponse:
+    def gmail_oauth_callback(
+        code: str | None = Query(default=None),
+        state: str | None = Query(default=None),
+        error: str | None = Query(default=None),
+        error_description: str | None = Query(default=None),  # noqa: ARG001
+    ) -> RedirectResponse:
         from ..services.gmail_sync import gmail_oauth_callback
+
+        def oauth_redirect(result: str) -> RedirectResponse:
+            return RedirectResponse(url=f"/#/inbox?gmail_error={result}", status_code=303)
+
+        if not state:
+            return oauth_redirect("invalid_state")
         pending = app.state.oauth_pending_states.pop(state, None)
         if pending is None:
-            raise ValidationFailureError("OAuth state is invalid or has already been used")
+            return oauth_redirect("invalid_state")
         expires_at, code_verifier = pending
         if time.monotonic() > expires_at:
-            raise ValidationFailureError("OAuth state has expired")
+            return oauth_redirect("expired_state")
+        if error:
+            return oauth_redirect(error[:80])
+        if not code:
+            return oauth_redirect("missing_code")
+
         redirect_uri = "http://127.0.0.1:8765/api/gmail/oauth/callback"
-        gmail_oauth_callback(settings, code, redirect_uri, code_verifier)
-        return RedirectResponse(url="/#/inbox", status_code=303)
+        try:
+            gmail_oauth_callback(settings, code, redirect_uri, code_verifier)
+        except FreightAgentError:
+            return oauth_redirect("authorization_failed")
+        except Exception:
+            return oauth_redirect("authorization_failed")
+        return RedirectResponse(url="/#/inbox?gmail_connected=1", status_code=303)
 
     @app.post("/api/gmail/sync", status_code=200)
     def gmail_sync(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-        from ..services.gmail_sync import gmail_sync
-        return gmail_sync(settings, int(body.get("limit") or 25))
+        """Synchronize in a job: reading the mailbox now also analyzes each new quotation."""
+        from ..services.gmail_sync import gmail_sync as sync_mailbox
+
+        def work(job) -> dict[str, Any]:
+            job.progress = "reading the mailbox and analyzing new quotations…"
+            return sync_mailbox(settings, int(body.get("limit") or 25))
+
+        return {"ok": True, "job": runner().submit("gmail-sync", "gmail", work,
+                                                   max_seconds=_processing_budget_seconds(settings) * 4).as_dict()}
 
     @app.get("/api/gmail/inbox")
     def gmail_inbox(limit: int = Query(default=100, ge=1, le=100)) -> list[dict[str, Any]]:
         from ..services.gmail_sync import gmail_inbox
         return gmail_inbox(settings, limit)
+
+    @app.get("/api/gmail/messages/{message_row_id}")
+    def gmail_message_detail(message_row_id: str) -> dict[str, Any]:
+        from ..services.gmail_sync import gmail_message_detail
+        return gmail_message_detail(settings, message_row_id)
+
+    @app.post("/api/gmail/messages/{message_row_id}/ensure-quotation")
+    def gmail_message_ensure_quotation(message_row_id: str) -> dict[str, Any]:
+        from ..services.gmail_sync import ensure_message_quotation
+        intake_id = ensure_message_quotation(settings, message_row_id)
+        return {"ok": True, "intake_id": intake_id}
 
     @app.delete("/api/gmail/accounts/{account_id}")
     def gmail_disconnect(account_id: str) -> dict[str, Any]:

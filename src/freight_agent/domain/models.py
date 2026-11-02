@@ -289,6 +289,12 @@ class GapAnalysisResult(DomainModel):
 
 # ------------------------------------------------------------- app-level DTOs
 
+class SupplierDraftWordings(DomainModel):
+    """Supplier-facing email text; validated bounds, never trusted before checking."""
+    subject: str = Field(min_length=3, max_length=120)
+    body: str = Field(min_length=20, max_length=4000)
+
+
 class ProcessingSummary(DomainModel):
     intake_item_id: UUID
     shipment_id: UUID | None = None

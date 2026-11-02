@@ -25,7 +25,8 @@ def review(
         raise exc
     url = f"http://127.0.0.1:{port}/"
     console.print(f"review app: [bold]{url}[/bold]  (Ctrl-C to stop)")
-    console.print("[dim]local only: document text stays on this machine; nothing is sent anywhere except Ollama[/dim]")
+    console.print("[dim]local only: document text stays on this machine and goes to Ollama; "
+                  "an email leaves only when you approve a draft and press Send yourself[/dim]")
     if open_browser:
         webbrowser.open(url)
     try:

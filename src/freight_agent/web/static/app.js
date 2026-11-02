@@ -32,34 +32,24 @@ const PAGES = {
       "Operational status, quotations, supplier records, inbox activity and decisions waiting for approval.",
   },
   inbox: {
-    title: "Quotation Inbox",
+    title: "Operations Inbox",
     guide:
-      "Quotation-related supplier conversations and attachments automatically synchronized from Gmail.",
+      "Unified email, document and supplier-workflow intake with explicit human review actions.",
   },
   documents: {
     title: "Documents",
     guide:
       "Drop quotation files in, run the reading step, then open a document to check it.",
   },
-  queue: {
-    title: "Review queue",
-    guide:
-      "Every decision still waiting for a person. Nothing is discarded silently.",
-  },
   shipments: {
-    title: "Quotations",
+    title: "Review & Quotations",
     guide:
-      "One lane, the carriers that quoted it, and where each quote stands.",
-  },
-  comparison: {
-    title: "Comparison",
-    guide:
-      "Prices compared by the Python service — the browser never does arithmetic.",
+      "Documents awaiting review and quotation lanes are shown on the same screen.",
   },
   drafts: {
     title: "Drafts",
     guide:
-      "Questions for the carrier, written for you to approve and send yourself.",
+      "Questions for the carrier, written by the agent. Nothing leaves this computer until you approve the exact text and send it yourself.",
   },
   settings: {
     title: "System",
@@ -214,6 +204,13 @@ const SEVERITY = {
   critical: ["Blocks comparison", "critical"],
   important: ["Should confirm", "warn"],
   informational: ["Good to know", "plain"],
+};
+
+const SUPPLIER_DRAFT_STATUS = {
+  draft: "Awaiting your approval",
+  approved: "Approved — ready to send",
+  sent: "Sent",
+  rejected: "Rejected",
 };
 
 function severityChip(value) {
@@ -410,7 +407,7 @@ async function refreshStatus() {
 
 // -------------------------------------------------------------------- routes
 function parseHash() {
-  const raw = (location.hash || "#/").replace(/^#\/?/, "");
+  const raw = (location.hash || "#/").replace(/^#\/?/, "").split("?")[0];
   const parts = raw.split("/").filter(Boolean);
   return { page: parts[0] || "", id: parts[1] || null };
 }
@@ -425,6 +422,18 @@ function markActive(page) {
 }
 
 async function route() {
+  const oauthMarker = (location.hash || "").includes("gmail_error=") || (location.hash || "").includes("gmail_connected=");
+  if (oauthMarker) {
+    const queryText = (location.hash.split("?")[1] || "");
+    const params = new URLSearchParams(queryText);
+    if (params.get("gmail_connected") === "1") {
+      toast("Gmail account connected successfully.");
+    } else if (params.get("gmail_error")) {
+      const error = params.get("gmail_error");
+      toast(error === "access_denied" ? "Gmail authorization was not granted. Add this account as a Test user, then try again." : "Gmail authorization failed. Please start the connection again.", true);
+    }
+    history.replaceState(null, "", location.pathname + location.search + "#/inbox");
+  }
   if (state.dirty) {
     const keep = await confirmDialog({
       title: "Discard unsaved edits?",
@@ -446,10 +455,9 @@ async function route() {
   await refreshStatus();
   if (page === "") return pageDashboard();
   if (page === "documents") return id ? pageReview(id) : pageDocuments();
-  if (page === "queue") return pageQueue();
+  if (page === "gmail") return id ? pageGmail(id) : pageInbox();
+  if (page === "queue" || page === "comparison") return pageShipments();
   if (page === "shipments") return id ? pageShipment(id) : pageShipments();
-  if (page === "comparison")
-    return id ? pageComparison(id) : pageComparisonIndex();
   if (page === "drafts") return pageDrafts();
   if (page === "settings") return pageSettings();
   if (page === "inbox") return pageInbox();
@@ -494,19 +502,19 @@ async function pageDashboard() {
     attention.push([
       plural(c.proposals, "new route", "s"),
       "awaiting your approval or correction",
-      "#/queue",
+      "#/shipments",
     ]);
   if (c.awaiting_review)
     attention.push([
       plural(c.awaiting_review, "extracted quote"),
       "awaiting your review",
-      "#/queue",
+      "#/shipments",
     ]);
   if (c.ready_to_import)
     attention.push([
       plural(c.ready_to_import, "approved quote"),
       "ready to import into the database",
-      "#/queue",
+      "#/shipments",
     ]);
   if (c.gaps)
     attention.push([
@@ -517,7 +525,7 @@ async function pageDashboard() {
   if (c.drafts)
     attention.push([
       plural(c.drafts, "question draft"),
-      "ready for you to approve and send yourself",
+      "waiting for you to approve — sending is a separate action you trigger",
       "#/drafts",
     ]);
   if (failed)
@@ -544,14 +552,13 @@ async function pageDashboard() {
   view.innerHTML = `
     <section class="hero rise">
       <h2>Carrier quotes, read and checked — so you compare prices, not PDFs.</h2>
-      <p>Drop a quotation in. The agent reads it on this computer, pulls out the price, currency,
-         transit time, delivery scope and every extra charge, shows the exact line in the document
-         behind each figure, and asks before anything is written to the database. What a carrier
-         did not state stays on screen as a question — it is never guessed and never treated as zero.</p>
+      <p>Upload or open a quotation. The agent reads it on this computer, matches it to a supplier database,
+         extracts fields against that database schema, and waits for an explicit human decision before
+         creating or updating a supplier record.</p>
       <div class="steps">
-        <div class="step rise-2"><i>1</i><b>Upload</b><span>Quotes and carrier replies, parsed and hashed locally.</span></div>
-        <div class="step rise-2"><i>2</i><b>Check</b><span>Each figure next to the sentence it came from.</span></div>
-        <div class="step rise-3"><i>3</i><b>Compare</b><span>Totals computed by the Python service, then exported.</span></div>
+        <div class="step rise-2"><i>1</i><b>Upload</b><span>Documents and email messages enter the inbox.</span></div>
+        <div class="step rise-2"><i>2</i><b>Process</b><span>The agent matches a database and extracts the schema fields.</span></div>
+        <div class="step rise-3"><i>3</i><b>Review</b><span>Review extracted data and approve or correct the record.</span></div>
       </div>
     </section>
 
@@ -591,7 +598,11 @@ async function pageDashboard() {
             <div class="sub">${esc(ago(d.created_at))}</div></td>
           <td>${classificationChip(d)} ${processingChip(d)}
             ${d.reason ? `<div class="sub">${esc(clip(d.reason, 110))}</div>` : ""}</td>
-          <td><a href="${esc(d.target)}">${esc(d.next_action)}</a></td>
+          <td>
+            ${d.processing === "processed" || d.classification === "irrelevant"
+              ? `<a href="${esc(d.target)}">${esc(d.next_action)}</a>`
+              : `<button class="btn small" data-act="process" data-id="${esc(d.id)}" data-force="${d.processing === "processed" ? "1" : "0"}">Process quotation</button>`}
+          </td>
         </tr>`,
         )
         .join("")}</tbody></table></div>`
@@ -616,7 +627,7 @@ async function pageDashboard() {
 
     <div class="row" style="margin-top:20px">
       <a class="btn big" href="#/documents">Upload documents</a>
-      <a class="btn neutral big" href="#/queue">Review queue</a>
+      <a class="btn neutral big" href="#/shipments">Review &amp; quotations</a>
       <button class="btn neutral big" data-act="reload">Refresh</button>
     </div>`;
 }
@@ -749,7 +760,7 @@ function documentTable(rows) {
           <a class="btn neutral small" href="#/documents/${esc(r.id)}">Open</a>
           <button class="btn small" data-act="process" data-id="${esc(r.id)}"
             data-force="${r.processing === "processed" ? "1" : "0"}"
-            >${r.processing === "processed" ? "Read again" : "Read this document"}</button>
+            >${r.processing === "processed" ? "Process quotation again" : "Process quotation"}</button>
           ${r.classification !== "irrelevant" ? `<button class="btn small destructive" data-act="ignore" data-id="${esc(r.id)}" data-file="${esc(r.file)}">Not a quote</button>` : `<span class="chip plain">Retained as not a quote</span>`}
         </td>
       </tr>`,
@@ -790,13 +801,13 @@ async function runUpload(files, renderStaged) {
             ${
               entry.intake_id && entry.status !== "duplicate"
                 ? `<a class="btn small neutral" href="#/documents/${esc(entry.intake_id)}">Open</a>
-                 <button class="btn small" data-act="process" data-id="${esc(entry.intake_id)}" data-force="0">Read this document</button>`
+                 <button class="btn small" data-act="process" data-id="${esc(entry.intake_id)}" data-force="0">Process quotation</button>`
                 : ""
             }
             ${
               entry.status === "duplicate" && entry.intake_id
                 ? `<button class="btn small neutral" data-act="skip" data-id="${esc(entry.intake_id)}">Keep the existing copy</button>
-                 <button class="btn small subtle" data-act="process" data-id="${esc(entry.intake_id)}" data-force="1">Read it again anyway</button>`
+                 <button class="btn small subtle" data-act="process" data-id="${esc(entry.intake_id)}" data-force="1">Process again anyway</button>`
                 : ""
             }
           </td>
@@ -813,6 +824,63 @@ async function runUpload(files, renderStaged) {
     renderStaged(true);
   });
   renderStaged(true);
+}
+
+// ---------------------------------------------------------- Gmail message workspace
+async function pageGmail(messageId) {
+  skeleton("loading Gmail message…");
+  let message;
+  try {
+    message = await api.get("/api/gmail/messages/" + encodeURIComponent(messageId));
+  } catch (exc) {
+    return fail(exc);
+  }
+
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  view.innerHTML = `
+    <div class="row spread">
+      <div class="row tight"><a class="btn neutral small" href="#/inbox">Back to Operations Inbox</a></div>
+      <div class="row tight" id="job-slot"></div>
+    </div>
+    <div class="split" style="margin-top:14px">
+      <section class="panel">
+        <span class="supplier-kicker">Gmail source</span>
+        <h3>${esc(message.subject || "No subject")}</h3>
+        <p class="meta">From ${esc(message.sender || "Unknown sender")}${message.sent_at ? " · " + esc(when(message.sent_at)) : ""}</p>
+        <div class="row tight" style="margin:12px 0">
+          ${message.intake_id ? `<a class="btn neutral" href="#/documents/${esc(message.intake_id)}">Open document workspace</a>` : ""}
+          <button class="btn" id="gmail-process-quotation">Process quotation</button>
+        </div>
+        <p class="meta">The email text and supported attachments are passed together to the quotation analysis workflow.</p>
+        <pre class="text" style="margin-top:8px">${esc(message.body_text || "No email body text")}</pre>
+      </section>
+      <section class="list">
+        <div class="panel">
+          <span class="supplier-kicker">Attachments</span>
+          <h3>${attachments.length ? attachments.length + " attachment(s)" : "No attachments"}</h3>
+          ${attachments.length ? `<ul>${attachments.map((attachment) => `<li>${esc(attachment.filename)} <span class="meta">${esc(fileSize(attachment.size_bytes))}</span></li>`).join("")}</ul>` : '<p class="meta">The email body is stored as an intake quotation.</p>'}
+        </div>
+        ${message.intake_id ? `<div class="panel"><span class="supplier-kicker">Quotation intake</span><h3>Quotation created</h3><p class="meta">Opening this message has created or found the linked intake document. “Process quotation” reads it as a freight quote; the supplier database match and the missing-field list are on the document workspace.</p></div>` : '<div class="empty">No quotation intake could be created from this message.</div>'}
+      </section>
+    </div>`;
+
+  const processButton = document.getElementById("gmail-process-quotation");
+  if (processButton) processButton.addEventListener("click", async () => {
+    processButton.disabled = true;
+    try {
+      const ensured = await api.post("/api/gmail/messages/" + encodeURIComponent(messageId) + "/ensure-quotation");
+      if (!ensured.intake_id) {
+        toast("This Gmail message is not classified as a quotation", "error");
+        processButton.disabled = false;
+        return;
+      }
+      const response = await api.post("/api/documents/" + encodeURIComponent(ensured.intake_id) + "/process?force=true");
+      trackJob(response.job);
+    } catch (exc) {
+      processButton.disabled = false;
+      toast(errorText(exc), "error");
+    }
+  });
 }
 
 // ---------------------------------------------------------- review workspace
@@ -832,12 +900,20 @@ async function pageReview(intakeId) {
   const shipment = doc.shipment ? findShipment(doc.shipment.id) : null;
   const quotations = doc.quotations || [];
   const hasQuote = quotations.length > 0;
+  let supplierAction = null;
+  let supplierDatabases = [];
+  try {
+    const supplierPayload = await api.get("/api/supplier-quotations");
+    supplierAction = (supplierPayload.actions || []).find((action) => action.intake_id === intakeId) ||
+      (supplierPayload.received || []).find((item) => item.intake_id === intakeId) || null;
+    supplierDatabases = await api.get("/api/supplier-databases");
+  } catch (error) { supplierAction = null; }
 
   view.innerHTML = `
     <div class="row spread">
       <div class="row tight">
         <a class="btn neutral small" href="#/documents">Back to documents</a>
-        <a class="btn neutral small" href="#/queue">Review queue</a>
+        <a class="btn neutral small" href="#/shipments">Review &amp; quotations</a>
       </div>
       <div class="row tight" id="job-slot"></div>
     </div>
@@ -856,8 +932,7 @@ async function pageReview(intakeId) {
             doc.classification === "irrelevant"
               ? '<button class="btn neutral" disabled>Marked not a quote</button>'
               : `<button class="btn" data-act="process" data-id="${esc(doc.id)}" data-force="${hasQuote ? "1" : "0"}"
-            >${hasQuote ? "Read this document again" : "Read this document"}</button>`
-          }
+            >${hasQuote ? "Process quotation again" : "Process quotation"}</button>`          }
           <a class="btn neutral" href="/api/documents/${esc(doc.id)}/source" download="${esc(doc.file)}">Open the original</a>
         </div>
         <p class="meta">The text below is the document itself. It is data only: nothing written inside it can
@@ -866,6 +941,7 @@ async function pageReview(intakeId) {
       </section>
 
       <section class="list">
+        ${supplierIntelligenceBlock(supplierAction, supplierDatabases, intakeId)}
         ${
           doc.shipment
             ? shipmentCard(doc.shipment, shipment)
@@ -879,7 +955,113 @@ async function pageReview(intakeId) {
       </section>
     </div>`;
 
+  const processButton = view.querySelector("[data-process-supplier-review]");
+  if (processButton) processButton.addEventListener("click", () => {
+    const selector = document.getElementById("supplier-review-database");
+    const databaseId = selector ? selector.value : "";
+    if (!databaseId) {
+      toast("Select a supplier database before analyzing the quotation", "error");
+      if (selector) selector.focus();
+      return;
+    }
+    analyzeQuotation(intakeId, databaseId, processButton);
+  });
+  const approveButton = view.querySelector("[data-approve-supplier-review]");
+  if (approveButton) approveButton.addEventListener("click", async () => {
+    const confirmed = await confirmDialog({ title: "Add supplier record to CSV?", body: "<p>The approved row will be appended once. A timestamped backup will be created first.</p>", confirmLabel: "Approve & Create Record" });
+    if (!confirmed) return;
+    approveButton.disabled = true;
+    try { await api.post(`/api/supplier-actions/${encodeURIComponent(approveButton.dataset.approveSupplierReview)}/approve`); toast("Supplier record created", "ok"); await route(); }
+    catch (error) { approveButton.disabled = false; toast(error.message, "bad"); }
+  });
+  const rejectButton = view.querySelector("[data-reject-supplier-review]");
+  if (rejectButton) rejectButton.addEventListener("click", async () => {
+    await api.post(`/api/supplier-actions/${encodeURIComponent(rejectButton.dataset.rejectSupplierReview)}/status`, { status: "rejected", notes: "Rejected from quotation review workspace" });
+    toast("Quotation rejected", "ok"); await route();
+  });
+  const draftButton = view.querySelector("[data-draft-supplier-review]");
+  if (draftButton) draftButton.addEventListener("click", async () => {
+    draftButton.disabled = true;
+    draftButton.textContent = "Creating email draft…";
+    try {
+      const result = await api.post(`/api/supplier-actions/${encodeURIComponent(draftButton.dataset.draftSupplierReview)}/create-draft`, {});
+      const draft = result.draft || {};
+      toast(draft.recipient
+        ? `Draft ready for ${draft.recipient}${draft.wording_note ? " — " + draft.wording_note : ""}`
+        : "Draft created. No sender address is known, so open it to set one.", "ok");
+      location.hash = "#/drafts";
+    } catch (error) {
+      draftButton.disabled = false;
+      draftButton.textContent = "Review & Send Draft Email";
+      toast(error.message, "bad");
+    }
+  });
+
   watchExistingJob(intakeId);
+}
+
+function supplierIntelligenceBlock(action, databases, intakeId) {
+  if (!action) {
+    return `<section class="panel supplier-intelligence">
+      <span class="supplier-kicker">Agent intelligence</span>
+      <h3>Supplier database not analyzed</h3>
+      <p class="meta">Inspecting this source against connected database descriptions is the next step.</p>
+      <label class="supplier-review-label">Target database
+        <select class="supplier-select" id="supplier-review-database">
+          <option value="">Choose a database</option>
+          ${databases.map((database) => `<option value="${esc(database.id)}">${esc(database.name)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="supplier-card-actions"><button class="supplier-btn supplier-btn-primary" data-process-supplier-review="${esc(intakeId)}">Select database &amp; analyze</button></div>
+    </section>`;
+  }
+
+  const statusLabels = {
+    received: "Received",
+    needs_human_review: "Needs human review",
+    needs_clarification: "Missing information",
+    ready_for_approval: "Ready to create record",
+    record_created: "Record created",
+    rejected: "Rejected",
+  };
+  const routing = Array.isArray(action.routing) ? action.routing : [];
+  const proposed = action.proposed_row && typeof action.proposed_row === "object" ? action.proposed_row : {};
+  const missing = Array.isArray(action.missing_fields) ? action.missing_fields : [];
+  const evidence = action.evidence && typeof action.evidence === "object" ? action.evidence : {};
+  const fieldRows = Object.keys(proposed).map((key) => {
+    const evidenceText = evidence[key];
+    return `<tr class="supplier-field-row"><td><strong>${esc(field(key))}</strong><span>${esc(key)}</span></td><td>${esc(proposed[key])}${evidenceText ? `<span class="supplier-evidence">Evidence: ${esc(evidenceText)}</span>` : ""}</td><td><span class="supplier-status ok">Extracted</span></td></tr>`;
+  }).join("");
+  const missingRows = missing.map((item) => `<tr class="supplier-field-missing"><td><strong>${esc(item.label || field(item.field))}</strong><span>${esc(item.field || "")}</span></td><td>${esc(item.reason || "Missing from source")}</td><td><span class="supplier-status ${item.required === false ? "plain" : "warn"}">${item.required === false ? "Ask the supplier" : "Required"}</span></td></tr>`).join("");
+  const unmatchedRouting = routing.slice(0, 3).map((candidate) => `<li>${esc(candidate.name)}${candidate.reason ? ` — ${esc(candidate.reason)}` : ""}</li>`).join("");
+
+  return `<section class="panel supplier-intelligence">
+    <div class="supplier-action-head">
+      <div><span class="supplier-kicker">Agent intelligence</span><h3>${esc(action.database_name || "Database not confirmed")}</h3></div>
+      <span class="supplier-status ${action.status === "ready_for_approval" ? "ok" : action.status === "needs_clarification" || action.status === "needs_human_review" ? "warn" : "plain"}">${esc(statusLabels[action.status] || action.status)}</span>
+    </div>
+    ${action.database_name ? `<p class="supplier-meta-text">Matched by database name, description, category, aliases and target schema metadata.</p>` : `<p class="supplier-meta-text">No unique database match was confirmed. Select a database and re-analyze.</p>`}
+    ${routing.length ? `<details class="supplier-routing"><summary>Routing candidates</summary><ol>${unmatchedRouting || "<li>No candidate scored the quotation.</li>"}</ol></details>` : ""}
+    <div class="supplier-field-table-wrap">
+      <table class="supplier-field-table">
+        <thead><tr><th>Target field</th><th>Extracted value</th><th>State</th></tr></thead>
+        <tbody>${fieldRows}${missingRows}</tbody>
+      </table>
+    </div>
+    ${missing.length ? `<div class="supplier-missing"><strong>Missing fields</strong><ul>${missing.map((item) => `<li>${esc(item.label || item.field)} — ${esc(item.reason || "Missing from source")}</li>`).join("")}</ul></div>` : ""}
+    <label class="supplier-review-label">Manual database override
+      <select class="supplier-select" id="supplier-review-database">
+        <option value="">Choose a database</option>
+        ${databases.map((database) => `<option value="${esc(database.id)}" ${database.name === action.database_name ? "selected" : ""}>${esc(database.name)}</option>`).join("")}
+      </select>
+    </label>
+    <div class="supplier-card-actions supplier-review-actions">
+      <button class="supplier-btn supplier-btn-neutral" data-process-supplier-review="${esc(intakeId)}">${action.database_id ? "Re-analyze selected database" : "Select database &amp; analyze"}</button>
+      ${action.status === "ready_for_approval" ? `<button class="supplier-btn supplier-btn-primary" data-approve-supplier-review="${esc(action.id)}">Approve &amp; Create Record</button>` : ""}
+      ${action.status !== "record_created" && action.status !== "rejected" ? `<button class="supplier-btn supplier-btn-neutral" data-draft-supplier-review="${esc(action.id)}">Review &amp; Send Draft Email</button>` : ""}
+      ${action.status !== "record_created" && action.status !== "rejected" ? `<button class="supplier-btn supplier-btn-neutral" data-reject-supplier-review="${esc(action.id)}">Reject</button>` : ""}
+    </div>
+  </section>`;
 }
 
 function shipmentCard(docShipment, fullShipment) {
@@ -961,7 +1143,6 @@ function quoteBlock(block, shipment) {
       <div><div class="k">Currency</div><div class="v">${show(q.currency, "not stated")}</div></div>
       <div><div class="k">Base price</div><div class="v">${show(q.base_price)}</div></div>
       <div><div class="k">Known total</div><div class="v">${show(q.total_known_cost, "cannot be totalled yet")}</div></div>
-      <div><div class="k">Comparison</div><div class="v">${show(q.comparison_status, "not comparable yet")}</div></div>
     </div>
     ${
       charges.length
@@ -1097,6 +1278,13 @@ function watchExistingJob(intakeId) {
 
 function readingResultMessage(result) {
   if (!result) return "Processing completed — reloading this page";
+  if (result.supplier_action) {
+    const action = result.supplier_action;
+    if (!action.database_id) return "No unique supplier database matched — select a database and re-analyze";
+    if (action.status === "ready_for_approval") return "Database matched — target-schema extraction is ready for human approval";
+    if (action.status === "needs_clarification") return "Database matched — required fields are missing and need review";
+    return "Database analysis completed — human review is required";
+  }
   if (result.created_quote && result.shipment_status === "needs_review") {
     return "Quote extracted — lane approval is required before review can continue";
   }
@@ -1119,6 +1307,30 @@ function readingResultMessage(result) {
   return "Processing completed with no quote created — check the document details";
 }
 
+function processingToastMessage(result) {
+  const action = result && result.supplier_action;
+  if (action) {
+    if (!action.database_id) {
+      return "No unique supplier database matched — select a database in the review workspace and analyze again.";
+    }
+    if (result.draft) {
+      const missing = (action.missing_fields || []).length;
+      return `Matched ${action.database_name}: ${missing} required field(s) still missing, and a reply draft is waiting for you in Draft review.`;
+    }
+    const statusLabels = {
+      needs_human_review: "the reading needs a person before anything is recorded",
+      needs_clarification: "required database fields are missing",
+      ready_for_approval: "the extracted row is ready for your approval",
+      record_created: "the supplier record is already created",
+      rejected: "this quotation is marked rejected",
+    };
+    return `Matched ${action.database_name}: ${statusLabels[action.status] || action.status}.`;
+  }
+  const base = readingResultMessage(result);
+  const notes = result && Array.isArray(result.notes) ? result.notes.filter(Boolean) : [];
+  return notes.length ? `${base} ${notes[0]}` : base;
+}
+
 function trackJob(job) {
   const slot = document.getElementById("job-slot");
   if (!slot) return;
@@ -1130,7 +1342,7 @@ function trackJob(job) {
   api
     .pollJob(job.id, paint)
     .then((finalJob) => {
-      toast(readingResultMessage(finalJob.result), "ok");
+      toast(processingToastMessage(finalJob.result), "ok");
       state.watched = null;
       return route();
     })
@@ -1141,158 +1353,28 @@ function trackJob(job) {
     });
 }
 
-// -------------------------------------------------------------- review queue
-async function pageQueue() {
-  skeleton("loading queue…");
-  let review;
+async function analyzeQuotation(intakeId, databaseId, button) {
+  const label = button.textContent;
+  const slot = document.getElementById("job-slot");
+  button.disabled = true;
+  button.textContent = "Analyzing quotation…";
   try {
-    review = await loadReview();
-  } catch (exc) {
-    return fail(exc);
-  }
-  const threshold = limits().confidence_threshold;
-  const rows = [];
-  for (const doc of review.documents) {
-    const uncertain =
-      doc.classification === "needs_review" || doc.classification === "pending";
-    const failed =
-      doc.classification === "failed" || doc.processing === "failed";
-    rows.push({
-      kind: "document",
-      id: doc.id,
-      title: fileName(doc.file),
-      reason: doc.reason
-        ? clip(doc.reason, 180)
-        : "This document has not been read yet.",
-      blocking: failed,
-      chips: [classificationChip(doc), processingChip(doc)],
-      lowConfidence:
-        doc.confidence !== null &&
-        doc.confidence !== undefined &&
-        doc.confidence < threshold,
-      uncertain,
-      target: "#/documents/" + doc.id,
-      action: "Open the document",
-    });
-  }
-  for (const shipment of review.shipments) {
-    if (shipment.status === "needs_review") {
-      rows.push({
-        kind: "route",
-        id: shipment.id,
-        title: `New lane: ${shipment.route}`,
-        reason:
-          "The agent read this route from a document. Approving it locks the lane and prepares the carrier questions.",
-        blocking: true,
-        chips: [chip("Needs your approval", "warn")],
-        lowConfidence: false,
-        uncertain: true,
-        target:
-          "#/documents/" +
-          (shipment.quotes[0]
-            ? shipment.quotes[0].intake_item_id
-            : shipment.id),
-        action: "Check the route",
-      });
+    const query = databaseId ? `?database_id=${encodeURIComponent(databaseId)}` : "";
+    const response = await api.post(`/api/supplier-quotations/${encodeURIComponent(intakeId)}/analyze${query}`);
+    if (slot) {
+      trackJob(response.job);
+      button.textContent = label;
+      return;
     }
-    for (const q of shipment.quotes) {
-      const blocking = q.gaps.filter((g) => g.severity === "critical").length;
-      const undecided = q.review_evidence.length;
-      if (q.review_status !== "extracted" && blocking === 0 && undecided === 0)
-        continue;
-      rows.push({
-        kind: "quote",
-        id: q.id,
-        title: `${shipment.route} · ${q.carrier}`,
-        reason:
-          `${plural(q.gaps.length, "missing item")}${blocking ? `, ${blocking} of them block a fair comparison` : ""}` +
-          (undecided
-            ? ` · ${plural(undecided, "extracted value")} not confirmed`
-            : ""),
-        blocking: blocking > 0,
-        chips: [reviewChip(q.review_status)],
-        lowConfidence: q.review_evidence.some((e) => e.status !== "accepted"),
-        uncertain: false,
-        target: "#/documents/" + q.intake_item_id,
-        action: "Review this quote",
-      });
-    }
+    button.textContent = "Reading and matching…";
+    const finalJob = await api.pollJob(response.job.id);
+    toast(processingToastMessage(finalJob.result), "ok");
+    await route();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = label;
+    toast(errorText(error), "bad");
   }
-  const filters = [
-    ["", "Everything"],
-    ["critical", "Blocking comparison"],
-    ["low", "Agent unsure"],
-    ["uncertain", "Needs a decision"],
-    ["ready", "Quotes to review"],
-  ];
-  view.innerHTML = `
-    <div class="row spread">
-      <div class="row tight" id="queue-filters">
-        ${filters
-          .map(
-            (
-              [value, label],
-              i,
-            ) => `<button class="btn small ${i === 0 ? "" : "neutral"}"
-          data-filter="${esc(value)}">${esc(label)}</button>`,
-          )
-          .join("")}
-      </div>
-      <button class="btn neutral" data-act="reload">Refresh</button>
-    </div>
-    <p class="meta" style="margin-top:8px">${plural(rows.length, "item")} awaiting a person. An ambiguous document
-      is never thrown away — the decision and the reason stay on screen.</p>
-    <div class="list" id="queue-list" style="margin-top:10px"></div>`;
-
-  const list = document.getElementById("queue-list");
-  const paint = (filter) => {
-    const subset = rows.filter((r) => {
-      if (filter === "critical") return r.blocking;
-      if (filter === "low") return r.lowConfidence;
-      if (filter === "uncertain") return r.uncertain;
-      if (filter === "ready") return r.kind === "quote";
-      return true;
-    });
-    list.innerHTML = subset.length
-      ? subset
-          .map(
-            (r) => `
-      <div class="panel">
-        <div class="row spread"><strong>${esc(r.title)}</strong><span class="row tight">${r.chips.join(" ")}</span></div>
-        <div class="meta">${esc(r.reason)}</div>
-        <div class="row tight" style="margin-top:8px">
-          <a class="btn small" href="${esc(r.target)}">${esc(r.action)}</a>
-          ${
-            r.kind === "route"
-              ? `<button class="btn small subtle" data-act="shipment-approve" data-id="${esc(r.id)}"
-            data-updated="">Approve lane</button>
-            <button class="btn small destructive" data-act="shipment-reject" data-id="${esc(r.id)}">Reject</button>`
-              : ""
-          }
-          ${
-            r.kind === "document"
-              ? `<button class="btn small neutral" data-act="process" data-id="${esc(r.id)}"
-            data-force="1">Read this document</button>`
-              : ""
-          }
-          ${r.kind === "quote" ? `<button class="btn small subtle" data-act="review-approve" data-id="${esc(r.id)}">Approve review</button>` : ""}
-        </div>
-      </div>`,
-          )
-          .join("")
-      : empty("Nothing matches this filter.");
-  };
-  paint("");
-  document
-    .getElementById("queue-filters")
-    .addEventListener("click", (event) => {
-      const button = event.target.closest("[data-filter]");
-      if (!button) return;
-      for (const node of document.querySelectorAll("#queue-filters .btn"))
-        node.className = "btn small neutral";
-      button.className = "btn small";
-      paint(button.dataset.filter);
-    });
 }
 
 // ---------------------------------------------------------------- quotations
@@ -1304,7 +1386,23 @@ async function pageShipments() {
   } catch (exc) {
     return fail(exc);
   }
+  const pendingDocuments = review.documents.filter((doc) =>
+    doc.processing !== "processed" || doc.classification === "pending" || doc.classification === "needs_review" || doc.processing === "needs_review" || doc.processing === "failed"
+  );
   view.innerHTML = `<div class="row"><button class="btn neutral" data-act="reload">Refresh</button></div>
+    <h2>Review items</h2>
+    <div class="list" style="margin-top:8px">
+      ${pendingDocuments.length ? pendingDocuments.map((doc) => `
+        <div class="panel">
+          <div class="row spread"><strong>${esc(fileName(doc.file))}</strong><span class="row tight">${classificationChip(doc)} ${processingChip(doc)}</span></div>
+          <div class="meta">${esc(clip(doc.reason || "This document is waiting to be processed.", 180))}</div>
+          <div class="row tight" style="margin-top:8px">
+            <a class="btn small neutral" href="#/documents/${esc(doc.id)}">Open document</a>
+            <button class="btn small" data-act="process" data-id="${esc(doc.id)}" data-force="${doc.processing === "processed" ? "1" : "0"}">Process quotation</button>
+          </div>
+        </div>`).join("") : empty("No documents are waiting for review.")}
+    </div>
+    <h2 style="margin-top:18px">Quotation lanes</h2>
     <div class="grid" style="margin-top:12px">
       ${
         review.shipments.length
@@ -1335,7 +1433,6 @@ async function pageShipments() {
           </ul>
           <div class="row tight">
             <a class="btn small" href="#/shipments/${esc(s.id)}">Open</a>
-            <a class="btn small neutral" href="#/comparison/${esc(s.id)}">Compare</a>
           </div>
         </div>`,
               )
@@ -1358,8 +1455,7 @@ async function pageShipment(id) {
   if (!shipment)
     return (view.innerHTML = empty("This lane is not in the database."));
   view.innerHTML = `
-    <div class="row tight"><a class="btn neutral small" href="#/shipments">Back to quotations</a>
-      <a class="btn neutral small" href="#/comparison/${esc(shipment.id)}">Compare</a></div>
+    <div class="row tight"><a class="btn neutral small" href="#/shipments">Back to review &amp; quotations</a></div>
     <div class="panel" style="margin-top:12px">
       <div class="row spread"><h3>${esc(shipment.route)}</h3>
         ${shipment.status === "needs_review" ? chip("Needs approval", "warn") : chip("Lane approved", "ok")}</div>
@@ -1419,110 +1515,6 @@ async function pageShipment(id) {
     }`;
 }
 
-// ---------------------------------------------------------------- comparison
-async function pageComparisonIndex() {
-  skeleton();
-  let rows;
-  try {
-    rows = await api.get("/api/shipments");
-  } catch (exc) {
-    return fail(exc);
-  }
-  if (!rows.length)
-    return (view.innerHTML = empty(
-      "No lanes yet, so there is nothing to compare.",
-    ));
-  view.innerHTML = `
-    <div class="row tight">
-      <select id="cmp" aria-label="Lane to compare">
-        ${rows.map((s) => `<option value="${esc(s.id)}">${esc(s.route)} (${esc(s.quotes)} quote(s))</option>`).join("")}
-      </select>
-      <button class="btn" id="cmp-go">Compare</button>
-    </div>
-    <p class="meta" style="margin-top:8px">Totals come from the deterministic Python comparison service. A quote with a
-      missing figure stays marked incomplete; an unpriced charge is never counted as zero.</p>`;
-  document.getElementById("cmp-go").addEventListener("click", () => {
-    location.hash = "#/comparison/" + document.getElementById("cmp").value;
-  });
-}
-
-async function pageComparison(id) {
-  skeleton();
-  try {
-    await loadReview();
-  } catch (exc) {
-    return fail(exc);
-  }
-  const shipment = findShipment(id);
-  if (!shipment)
-    return (view.innerHTML = empty("This lane is not in the database."));
-  const report = shipment.comparison;
-  if (!report) {
-    view.innerHTML = `<a class="btn neutral small" href="#/comparison">Choose another lane</a>
-      <div class="note warn" style="margin-top:12px">${esc(
-        shipment.comparison_error ||
-          "Nothing to compare yet — at least one quote needs to be imported for this lane.",
-      )}</div>`;
-    return;
-  }
-  view.innerHTML = `
-    <a class="btn neutral small" href="#/comparison">Choose another lane</a>
-    <div class="panel" style="margin-top:12px">
-      <div class="row spread"><h3>${esc(report.route || shipment.route)}</h3>
-        ${chip("Computed by the Python service", "info")}</div>
-      <div class="field-pair">
-        <div><div class="k">Needed scope</div><div class="v">${esc(scope(report.required_scope))}</div></div>
-        <div><div class="k">Target currency</div><div class="v">${esc(report.target_currency)}</div></div>
-        <div><div class="k">Quotes</div><div class="v">${esc(report.rows.length)}</div></div>
-        <div><div class="k">Calculated</div><div class="v">${esc(when(report.generated_at))}</div></div>
-      </div>
-      ${
-        report.recommendation
-          ? `<div class="note">Recommendation: ${esc(report.recommendation)}</div>
-        <p class="evidence">Because: ${report.recommendation_basis.map(esc).join("; ")}</p>`
-          : '<div class="note warn">No recommendation yet: these quotes are not comparable as they stand. Missing values are not guessed.</div>'
-      }
-    </div>
-    <div class="panel" style="margin-top:12px;overflow:auto">
-      <table>
-        <caption>Currencies are only converted when an explicit rate and date are configured.</caption>
-        <thead><tr>
-          <th>Carrier</th><th class="num">Base</th><th class="num">Known extras</th>
-          <th class="num">Known subtotal</th><th>Scope</th><th>Transit</th><th>Valid until</th><th>Status</th><th>Still missing</th>
-        </tr></thead>
-        <tbody>${report.rows
-          .map(
-            (r) => `
-          <tr>
-            <td><span class="name">${esc(r.carrier_name || "carrier not named")}</span>
-              ${r.quote_reference ? `<div class="sub">${esc(r.quote_reference)}</div>` : ""}</td>
-            <td class="num">${r.base_price === null ? '<span class="meta">not stated</span>' : esc(r.base_price)}</td>
-            <td class="num">${r.known_additional_total === null ? '<span class="meta">not stated</span>' : esc(r.known_additional_total)}</td>
-            <td class="num">${
-              r.known_subtotal === null
-                ? '<span class="meta">cannot total yet</span>'
-                : esc(r.known_subtotal) + " " + esc(r.currency || "")
-            }
-              ${r.converted_subtotal !== null ? `<div class="sub">= ${esc(r.converted_subtotal)} ${esc(report.target_currency)}${r.fx_note ? " · " + esc(r.fx_note) : ""}</div>` : ""}</td>
-            <td>${esc(scope(r.delivery_scope))}${r.scope_compatible ? "" : " " + chip("Wrong scope", "bad")}</td>
-            <td>${esc(r.transit_time || "not stated")}</td>
-            <td>${esc(r.valid_until || "not stated")}</td>
-            <td>${r.comparison_status === "comparable" ? chip("Comparable", "ok") : chip("Incomplete", "warn")}</td>
-            <td class="meta">${esc(r.unresolved_critical_gaps.length)} blocking · ${esc(r.unresolved_other_gaps.length)} other
-              ${r.uncertain_charges.length ? `<div class="sub">uncertain: ${r.uncertain_charges.map(esc).join(", ")}</div>` : ""}</td>
-          </tr>`,
-          )
-          .join("")}</tbody>
-      </table>
-    </div>
-    ${report.caveats.length ? `<h2>Read before deciding</h2><ul class="fields">${report.caveats.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}
-    <div class="row tight" style="margin-top:14px">
-      <a class="btn neutral" href="/api/shipments/${esc(report.shipment_id)}/report?format=md" download>Export report (md)</a>
-      <a class="btn neutral" href="/api/shipments/${esc(report.shipment_id)}/report?format=csv" download>Export (csv)</a>
-      ${shipment.quotes.map((q) => `<a class="btn small subtle" href="#/documents/${esc(q.intake_item_id)}">Check ${esc(q.carrier)}</a>`).join("")}
-    </div>`;
-}
-
 // --------------------------------------------------------------------- drafts
 async function pageDrafts() {
   view.className = "supplier-work";
@@ -1542,7 +1534,7 @@ async function pageDrafts() {
     <div class="supplier-header" style="margin-top:28px">
       <div><span class="supplier-kicker">Existing local drafts</span><h2>Document clarification drafts</h2></div>
     </div>
-    <div class="note">These are written for you to read and send yourself. The app never sends anything: approving records your decision, exporting saves a file on this computer.</div>
+    <div class="note">These drafts stay on this computer. Nothing is emailed until you approve the exact text and choose Send yourself, and a supplier reply can only go to the person who sent the quotation.</div>
     <div class="list" style="margin-top:12px">
       ${rows.length ? rows.map(draftCard).join("") : empty("No open local clarification drafts.")}
     </div>`;
@@ -1562,21 +1554,53 @@ async function pageDrafts() {
     try { await api.post(`/api/supplier-email-drafts/${encodeURIComponent(event.currentTarget.dataset.supplierDraftApprove)}/approve`, {}); toast("Exact draft content locked for sending."); await pageDrafts(); } catch (error) { toast(error.message, true); }
   }));
   document.querySelectorAll("[data-supplier-draft-send]").forEach((button) => button.addEventListener("click", async (event) => {
-    const approved = await confirmDialog({ title: "Send this approved Gmail draft?", body: "<p>The exact approved recipient, subject and body will be sent. This action is recorded and cannot be retried as a new send.</p>", confirmLabel: "Type SEND in the next confirmation", danger: true });
-    if (!approved) return;
-    const confirmation = window.prompt('Type SEND to confirm this email');
-    if (confirmation !== "SEND") { toast("Email not sent: confirmation was not SEND.", true); return; }
-    const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
-    try { const result = await api.post(`/api/supplier-email-drafts/${encodeURIComponent(event.currentTarget.dataset.supplierDraftSend)}/send`, { confirmation, idempotency_key: idempotencyKey }); toast(result.status === "sent" ? "Email sent through Gmail." : "Draft send resolved."); await pageDrafts(); } catch (error) { toast(error.message, true); }
+    const draftId = event.currentTarget.dataset.supplierDraftSend;
+    let draft = (await api.get("/api/supplier-email-drafts").catch(() => [])).find((row) => row.id === draftId);
+    if (!draft) { toast("This draft is no longer listed; refresh the page.", "error"); return; }
+    // window.prompt() is not available in this view, so the confirmation is a modal like every other question.
+    const boundTo = draft.recipient_locked || draft.bound_recipient
+      ? ", the sender of the quotation" : "";
+    const confirmation = await askReason({
+      title: "Send this email?",
+      body: `It goes to <strong>${esc(draft.recipient)}</strong>${boundTo}, `
+        + `with the approved text for “${esc(draft.subject)}”. Nothing can be edited after sending.`,
+      label: "Type SEND to confirm",
+      placeholder: "SEND",
+      confirmLabel: "Send now",
+      danger: true,
+    });
+    if (!confirmation) return;
+    if (confirmation.trim().toUpperCase() !== "SEND") {
+      toast("Nothing was sent — the confirmation must be SEND.", "error");
+      return;
+    }
+    button.disabled = true;
+    button.textContent = "Sending…";
+    try {
+      const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+      const result = await api.post(`/api/supplier-email-drafts/${encodeURIComponent(draftId)}/send`,
+        { confirmation: "SEND", idempotency_key: idempotencyKey });
+      toast(result.status === "sent"
+        ? `Sent to ${result.recipient || draft.recipient}${result.idempotent ? " (already sent before)" : ""}.`
+        : "Draft send resolved.", "ok");
+      await pageDrafts();
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Send email";
+      toast(errorText(error), "bad");
+    }
   }));
 }
 
 function supplierDraftCard(draft) {
   const locked = draft.status === "approved" || draft.status === "sent";
+  const recipientFixed = locked || draft.recipient_locked;
+  const statusLabel = SUPPLIER_DRAFT_STATUS[draft.status] || draft.status;
   return `<article class="supplier-action-card supplier-action-card-draft">
-    <div class="supplier-action-head"><div><span class="supplier-kicker">Gmail draft</span><h3>${esc(draft.subject || "Untitled")}</h3></div><span class="supplier-status">${esc(draft.status)}</span></div>
+    <div class="supplier-action-head"><div><span class="supplier-kicker">Gmail draft</span><h3>${esc(draft.subject || "Untitled")}</h3></div><span class="supplier-status">${esc(statusLabel)}</span></div>
     <form class="supplier-form" data-supplier-draft-form="${esc(draft.id)}">
-      <label>Recipient<input name="recipient" value="${esc(draft.recipient)}" ${locked ? "disabled" : ""}></label>
+      <label>Recipient<input name="recipient" value="${esc(draft.recipient)}" ${recipientFixed ? "readonly" : ""}></label>
+      ${draft.recipient_locked ? `<p class="supplier-meta-text">Fixed to the sender of the received quotation email.</p>` : ""}
       <label>CC<input name="cc" value="${esc(draft.cc)}" ${locked ? "disabled" : ""}></label>
       <label>Subject<input name="subject" value="${esc(draft.subject)}" ${locked ? "disabled" : ""}></label>
       <label>Body<textarea name="body" rows="10" ${locked ? "disabled" : ""}>${esc(draft.body)}</textarea></label>
@@ -1616,55 +1640,220 @@ function draftCard(d) {
 // ------------------------------------------------ unified supplier workspace
 async function pageInbox() {
   view.className = "supplier-work";
-  skeleton();
-  let status = { configured: false, accounts: [] };
-  let messages = [];
-  try { status = await api.get("/api/gmail/status"); } catch (error) { /* status unavailable */ }
-  try { messages = await api.get("/api/gmail/inbox"); } catch (error) { /* no synchronized inbox */ }
+  skeleton("loading Operations Inbox…");
+
+  const [status, messages, documents, supplierQuotations] = await Promise.all([
+    api.get("/api/gmail/status").catch(() => ({ configured: false, accounts: [], automatic_status: "stopped" })),
+    api.get("/api/gmail/inbox").catch(() => []),
+    api.get("/api/documents").catch(() => []),
+    api.get("/api/supplier-quotations").catch(() => ({ received: [], actions: [] })),
+  ]);
+
+  const actions = supplierQuotations.actions || [];
+  const actionByIntake = new Map(actions.map((action) => [action.intake_id, action]));
   const connected = status.accounts && status.accounts.some((account) => account.status === "connected");
+
+  function operationsStatus(documentRow, action, message) {
+    if (documentRow && documentRow.classification === "irrelevant") return ["Rejected", "bad"];
+    if (action) {
+      const labels = {
+        received: ["Ready to Process", "info"], needs_human_review: ["Missing Info — Needs Review", "warn"],
+        needs_clarification: ["Missing Info — Needs Review", "warn"], ready_for_approval: ["Ready to Create Record", "ok"],
+        record_created: ["Completed", "ok"], rejected: ["Rejected", "bad"],
+      };
+      return labels[action.status] || [String(action.status).replaceAll("_", " "), "plain"];
+    }
+    if (message) {
+      const labels = {
+        supplier_reply_pending: ["Reply Awaiting Review", "warn"],
+        awaiting_supplier_review: ["Ready to Process", "info"],
+        draft_ready: ["Draft waiting for you", "warn"],
+        needs_clarification: ["Missing Info — Needs Review", "warn"],
+        needs_database: ["Pick a supplier database", "warn"],
+        needs_human_review: ["Missing Info — Needs Review", "warn"],
+        ready_for_approval: ["Ready to Create Record", "ok"],
+        extraction_failed: ["Extraction stopped — needs review", "bad"],
+        processed: ["Completed", "ok"],
+      };
+      return labels[message.processing_status] || ["Ready to Process", "info"];
+    }
+    if (documentRow) {
+      if (documentRow.processing === "processing") return ["Processing", "info"];
+      if (documentRow.processing === "failed" || documentRow.classification === "failed") return ["Missing Info — Needs Review", "warn"];
+      if (documentRow.classification === "needs_review") return ["Missing Info — Needs Review", "warn"];
+      if (documentRow.processing === "pending") return ["Ready to Process", "info"];
+      return ["Ready to Process", "info"];
+    }
+    return ["Ready to Process", "info"];
+  }
+
+  const documentItems = documents.map((row) => {
+    const action = actionByIntake.get(row.id);
+    const [statusLabel, statusKind] = operationsStatus(row, action, null);
+    return {
+      key: "document-" + row.id,
+      channel: "Document",
+      title: row.file,
+      meta: `${fileSize(row.size_bytes)} · ${when(row.created_at)}`,
+      statusLabel, statusKind,
+      databaseName: action && action.database_name,
+      detailHref: `#/documents/${encodeURIComponent(row.id)}`,
+      actionLabel: action ? (action.status === "ready_for_approval" ? "Review record" : "Open workspace") : "Open workspace",
+      processable: false,
+      timestamp: row.created_at || "",
+      intakeId: row.id,
+      action,
+    };
+  });
+
+  const emailItems = messages.map((message) => {
+    const [statusLabel, statusKind] = operationsStatus(null, null, message);
+    const attachmentNames = message.attachment_names || [];
+    const linkedAction = actions.find((action) => action.file && attachmentNames.includes(action.file));
+    const attachment = attachmentNames.length ? attachmentNames.join(", ") : "Email body only";
+    return {
+      key: "email-" + message.id,
+      channel: "Email",
+      title: message.subject || "No subject",
+      meta: `${message.sender || "Unknown sender"} · ${when(message.created_at)} · ${attachment}`,
+      statusLabel, statusKind,
+      databaseName: linkedAction && linkedAction.database_name,
+      detailHref: `#/gmail/${encodeURIComponent(message.id)}`,
+      actionLabel: linkedAction ? "Open message & workspace" : (message.processing_status === "supplier_reply_pending" ? "Review reply" : "Open message"),
+      processable: false,
+      timestamp: message.created_at || "",
+      action: linkedAction || null,
+    };
+  });
+
+  const items = [...documentItems, ...emailItems].sort((a, b) => String(b.meta).localeCompare(String(a.meta)));
+  const waitingCount = items.filter((item) => item.statusKind === "warn" || item.statusKind === "info").length;
+  const readyCount = items.filter((item) => item.statusLabel === "Ready to Create Record").length;
+
   view.innerHTML = `
-    <div class="supplier-header">
-      <div><span class="supplier-kicker">Gmail connection</span><h2>Quotation Inbox</h2><p class="supplier-meta-text">Automatic synchronization: ${status.automatic_status || "stopped"}${status.last_successful_sync_at ? ` · Last sync ${esc(status.last_successful_sync_at)}` : ""}${status.error ? ` · ${esc(status.error)}` : ""}</p></div>
+    <div class="supplier-header operations-header">
+      <div><span class="supplier-kicker">Unified intake</span><h2>Operations Inbox</h2><p class="supplier-meta-text">Email and document quotations in one human-review workflow.</p></div>
       <div class="supplier-card-actions">
-        <button class="supplier-btn supplier-btn-neutral" id="gmail-sync" ${connected ? "" : "disabled"}>Sync inbox</button>
-        <button class="supplier-btn supplier-btn-primary" id="gmail-connect">${connected ? "Manage Gmail" : "Connect Gmail"}</button>
+        <button class="supplier-btn supplier-btn-neutral" id="gmail-sync" ${connected ? "" : "disabled"}>Sync Gmail</button>
+        <button class="supplier-btn supplier-btn-primary" id="operations-import">Import quotation</button>
       </div>
     </div>
-    ${!status.configured ? `
-      <div class="supplier-empty">
-        <span class="supplier-kicker">OAuth setup required</span>
-        <h2>Configure Gmail credentials</h2>
-        <p>Set <code>GOOGLE_OAUTH_CREDENTIALS_PATH</code> to a protected Google OAuth client-secrets file and <code>GOOGLE_OAUTH_TOKEN_PATH</code> to a local token location. No credentials are exposed in this screen.</p>
-      </div>` : connected ? "" : `
-      <div class="supplier-empty">
-        <span class="supplier-kicker">Account required</span>
-        <h2>Connect your Gmail account</h2>
-        <p>Automatic synchronization runs every 30 seconds. Sending is always a separate explicit human action.</p>
-      </div>`}
+
+    <div class="operations-import" id="operations-import-panel" hidden>
+      <div class="operations-import-head"><strong>Import quotation documents</strong><span>Stored and parsed locally</span></div>
+      <div class="drop" id="operations-drop" tabindex="0">
+        <div class="title">Drop quotation files here</div>
+        <div class="meta">PDF, DOCX, XLSX, text, email, supported images and CSV</div>
+        <div class="row" style="justify-content:center;margin-top:12px">
+          <input type="file" id="operations-picker" multiple aria-label="Choose quotation files">
+          <button class="supplier-btn supplier-btn-primary" id="operations-upload" disabled>Upload</button>
+        </div>
+      </div>
+      <div id="operations-upload-result"></div>
+    </div>
+
+    <div class="operations-summary">
+      <div><span>${items.length}</span><small>All items</small></div>
+      <div><span>${waitingCount}</span><small>Needs attention</small></div>
+      <div><span>${readyCount}</span><small>Ready to create</small></div>
+      <div><span>${connected ? "Connected" : "Disconnected"}</span><small>Gmail</small></div>
+    </div>
+
     <div class="supplier-action-group">
-      <div class="supplier-group-head"><h3>Messages</h3><span>${messages.length}</span></div>
-      ${messages.length ? messages.map((message) => `
-        <article class="supplier-action-card">
-          <div class="supplier-action-head">
-            <div><span class="supplier-kicker">${esc(message.classification)}</span><h3>${esc(message.subject || "No subject")}</h3></div>
-            <span class="supplier-status">${esc(message.processing_status)}</span>
+      <div class="supplier-group-head">
+        <h3>Incoming quotations</h3>
+        <span>${items.length}</span>
+      </div>
+      <div class="operations-filters">
+        <input type="search" id="operations-search" placeholder="Search source, sender or status" aria-label="Search Operations Inbox">
+        <select id="operations-filter" aria-label="Filter Operations Inbox">
+          <option value="">All channels</option>
+          <option value="Document">Documents</option>
+          <option value="Email">Email</option>
+        </select>
+      </div>
+      <div id="operations-feed">${items.length ? items.map((item) => `
+        <article class="operations-feed-item" data-channel="${esc(item.channel)}" data-search="${esc(item.title + " " + item.meta + " " + item.statusLabel)}">
+          <div class="operations-feed-main">
+            <span class="supplier-kicker">${esc(item.channel)}</span>
+            <h3>${esc(fileName(item.title))}</h3>
+            <p>${esc(item.meta)}</p>
+            ${item.databaseName ? `<span class="operations-match">Matched database: ${esc(item.databaseName)}</span>` : ""}
           </div>
-          <p><strong>From:</strong> ${esc(message.sender)}</p>
-          <p>${esc(message.body_preview)}</p>
-          <div class="supplier-card-actions"><span class="supplier-meta-text">${message.attachment_count} attachment(s)</span></div>
-        </article>`).join("") : `<div class="supplier-coming"><h2>No synchronized messages</h2><p>No new quotation emails found. Automatic synchronization will continue checking the inbox.</p></div>`}
+          <div class="operations-feed-actions">
+            <span class="supplier-status ${esc(item.statusKind)}">${esc(item.statusLabel)}</span>
+            ${item.detailHref !== "#/inbox" ? `<a class="supplier-btn supplier-btn-neutral" href="${item.detailHref}">${esc(item.actionLabel)}</a>` : `<button class="supplier-btn supplier-btn-neutral" disabled>${esc(item.actionLabel)}</button>`}
+          </div>
+        </article>`).join("") : `<div class="supplier-coming"><h2>No quotations yet</h2><p>Import a document or sync Gmail to add the first item to Operations Inbox.</p></div>`}
+      </div>
     </div>`;
-  document.getElementById("gmail-connect").addEventListener("click", async () => {
-    try {
-      const result = await api.post("/api/gmail/authorize", { redirect_uri: "http://127.0.0.1:8765/api/gmail/oauth/callback" });
-      window.location.assign(result.authorization_url);
-    } catch (error) { toast(error.message, true); }
-  });
+
   document.getElementById("gmail-sync").addEventListener("click", async (event) => {
-    event.currentTarget.disabled = true;
-    try { const result = await api.post("/api/gmail/sync", { limit: 25 }); toast(result.message || `${result.imported} new message(s) synchronized.`); await pageInbox(); }
-    catch (error) { toast(error.message, true); event.currentTarget.disabled = false; }
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Reading mailbox…";
+    try {
+      const response = await api.post("/api/gmail/sync", { limit: 25 });
+      const job = await api.pollJob(response.job.id);
+      const result = job.result || {};
+      toast(result.message || "Gmail synchronized.", "ok");
+      await pageInbox();
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Sync Gmail";
+      toast(errorText(error), "bad");
+    }
   });
+
+  document.getElementById("operations-import").addEventListener("click", () => {
+    const panel = document.getElementById("operations-import-panel");
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) document.getElementById("operations-picker").focus();
+  });
+
+  const picker = document.getElementById("operations-picker");
+  const uploadButton = document.getElementById("operations-upload");
+  const drop = document.getElementById("operations-drop");
+  let staged = [];
+  const stageFiles = (files) => {
+    staged = staged.concat(Array.from(files));
+    uploadButton.disabled = staged.length === 0;
+    uploadButton.textContent = staged.length ? `Upload ${staged.length} file(s)` : "Upload";
+  };
+  picker.addEventListener("change", () => stageFiles(picker.files));
+  ["dragenter", "dragover"].forEach((eventName) => drop.addEventListener(eventName, (event) => { event.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "dragend"].forEach((eventName) => drop.addEventListener(eventName, () => drop.classList.remove("over")));
+  drop.addEventListener("drop", (event) => {
+    event.preventDefault();
+    drop.classList.remove("over");
+    if (event.dataTransfer && event.dataTransfer.files.length) stageFiles(event.dataTransfer.files);
+  });
+  uploadButton.addEventListener("click", async () => {
+    if (!staged.length) return;
+    uploadButton.disabled = true;
+    uploadButton.textContent = "Uploading…";
+    try {
+      const result = await api.upload(staged, "error");
+      const rejected = result.results.filter((entry) => entry.status === "rejected");
+      document.getElementById("operations-upload-result").innerHTML = result.results.map((entry) => `<p class="supplier-meta-text"><strong>${esc(fileName(entry.file))}</strong>: ${esc(entry.status)}${entry.error ? " — " + esc(entry.error) : ""}</p>`).join("");
+      toast(rejected.length ? `${rejected.length} file(s) rejected.` : "Quotation files imported.", rejected.length ? "bad" : "ok");
+      staged = [];
+      picker.value = "";
+      await pageInbox();
+    } catch (error) { uploadButton.disabled = false; uploadButton.textContent = "Upload"; toast(error.message, "bad"); }
+  });
+
+  const applyFeedFilters = () => {
+    const needle = document.getElementById("operations-search").value.trim().toLowerCase();
+    const channel = document.getElementById("operations-filter").value;
+    document.querySelectorAll(".operations-feed-item").forEach((card) => {
+      const matchesChannel = !channel || card.dataset.channel === channel;
+      const matchesSearch = !needle || card.dataset.search.toLowerCase().includes(needle);
+      card.hidden = !(matchesChannel && matchesSearch);
+    });
+  };
+  document.getElementById("operations-search").addEventListener("input", applyFeedFilters);
+  document.getElementById("operations-filter").addEventListener("change", applyFeedFilters);
 }
 
 // ------------------------------------------------ supplier operations
@@ -1680,6 +1869,7 @@ async function pageSupplier(section) {
 
   skeleton();
   const databases = await api.get("/api/supplier-databases").catch(() => null);
+  const gmailStatus = await api.get("/api/gmail/status").catch(() => ({ configured: false, accounts: [], automatic_status: "stopped" }));
   if (databases === null) {
     view.innerHTML = '<div class="supplier-note bad">The supplier database service is not available.</div>';
     return;
@@ -1696,9 +1886,9 @@ async function pageSupplier(section) {
       </div>
       <p>${esc(database.description || "No database description yet.")}</p>
       <dl class="supplier-meta">
-        <div><dt>CSV connection</dt><dd>${esc(database.csv_path || database.csv_filename)}</dd></div>
+        <div><dt>Source connection</dt><dd>${esc(database.source_ref || database.csv_path || database.csv_filename)}</dd></div>
         <div><dt>Records</dt><dd>${esc(database.record_count)}</dd></div>
-        <div><dt>Columns</dt><dd>${esc(database.schema.length)}</dd></div>
+        <div><dt>Schema fields</dt><dd>${esc(database.schema.length)}</dd></div>
       </dl>
       <details class="supplier-schema">
         <summary>View detected schema</summary>
@@ -1707,7 +1897,9 @@ async function pageSupplier(section) {
             <div><strong>${esc(field.label || field.name)}</strong><span>${esc(field.name)}</span><code>${esc(field.type)}</code></div>`).join("")}
         </div>
       </details>
+      <p class="supplier-meta-text">Provider: ${esc(database.provider_type || "csv")} · Last analyzed: ${esc(database.last_analyzed_at ? when(database.last_analyzed_at) : "Not recorded")}</p>
       <div class="supplier-card-actions">
+        <button class="supplier-btn supplier-btn-neutral" data-reanalyze="${esc(database.id)}">Re-analyze Database</button>
         <button class="supplier-btn supplier-btn-neutral" data-disconnect="${esc(database.id)}">Disconnect</button>
       </div>
     </article>`).join("") : `
@@ -1720,16 +1912,21 @@ async function pageSupplier(section) {
   view.innerHTML = `
     <div class="supplier-header">
       <div>
-        <span class="supplier-kicker">CSV supplier databases</span>
-        <h2>Connected databases</h2>
+        <span class="supplier-kicker">Generalized data sources</span>
+        <h2>Data Sources &amp; Integrations</h2>
       </div>
-      <button class="supplier-btn supplier-btn-primary" id="supplier-connect-open">Connect database</button>
+      <button class="supplier-btn supplier-btn-primary" id="supplier-connect-open">Connect data source</button>
     </div>
+    <section class="supplier-action-card" style="margin-bottom:14px">
+      <div class="supplier-action-head"><div><span class="supplier-kicker">Communication channel</span><h3>Gmail</h3></div><span class="supplier-status ${gmailStatus.accounts && gmailStatus.accounts.some((account) => account.status === "connected") ? "ok" : "plain"}">${gmailStatus.accounts && gmailStatus.accounts.some((account) => account.status === "connected") ? "Connected" : "Disconnected"}</span></div>
+      <p>Automatic synchronization: ${esc(gmailStatus.automatic_status || "stopped")}${gmailStatus.last_successful_sync_at ? ` · Last sync ${esc(when(gmailStatus.last_successful_sync_at))}` : ""}</p>
+      <div class="supplier-card-actions"><a class="supplier-btn supplier-btn-neutral" href="#/inbox">Manage in Operations Inbox</a></div>
+    </section>
     <div class="supplier-db-grid">${cards}</div>
 
     <section class="supplier-connect-panel" id="supplier-connect-panel" hidden>
       <div class="supplier-header">
-        <div><span class="supplier-kicker">New connection</span><h2>Connect a CSV supplier database</h2></div>
+        <div><span class="supplier-kicker">New connection</span><h2>Connect a data source</h2></div>
         <button class="supplier-icon-btn" id="supplier-connect-close" aria-label="Close connection form">×</button>
       </div>
       <form id="supplier-connect-form" class="supplier-form">
@@ -1805,6 +2002,23 @@ async function pageSupplier(section) {
     }
   });
 
+  document.querySelectorAll("[data-reanalyze]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      button.textContent = "Re-analyzing…";
+      try {
+        const result = await api.post(`/api/supplier-databases/${encodeURIComponent(button.dataset.reanalyze)}/reanalyze`);
+        const removed = result.database.removed_fields || [];
+        toast(removed.length ? `Database re-analyzed. Removed fields need review: ${removed.join(", ")}` : "Database schema and records re-analyzed.", removed.length ? "bad" : "ok");
+        await route();
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = "Re-analyze Database";
+        toast(error.message, "bad");
+      }
+    });
+  });
+
   document.querySelectorAll("[data-disconnect]").forEach((button) => {
     button.addEventListener("click", async () => {
       const confirmed = await confirmDialog({
@@ -1847,15 +2061,10 @@ async function pageSupplierQuotations() {
     ${!receivedCards && !actionCards ? '<div class="supplier-empty"><h2>No quotations received</h2><p>Connect Gmail and the application will automatically detect supplier quotation emails.</p></div>' : ""}`;
 
   view.querySelectorAll("[data-process-supplier]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      button.disabled = true;
+    button.addEventListener("click", () => {
       const intakeId = button.dataset.processSupplier;
-      const databaseId = view.querySelector(`[data-database-for="${CSS.escape(intakeId)}"]`).value;
-      try {
-        const response = await api.post(`/api/supplier-quotations/${encodeURIComponent(intakeId)}/process${databaseId ? `?database_id=${encodeURIComponent(databaseId)}` : ""}`);
-        toast("Quotation analyzed against supplier database schema", "ok");
-        await pageSupplierQuotations();
-      } catch (error) { button.disabled = false; toast(error.message, "bad"); }
+      const selector = view.querySelector(`[data-database-for="${CSS.escape(intakeId)}"]`);
+      analyzeQuotation(intakeId, selector ? selector.value : "", button);
     });
   });
   bindSupplierActionButtons(view);
@@ -1874,6 +2083,7 @@ function supplierActionCard(action, showOpen) {
     ${missing ? `<div class="supplier-missing"><strong>Missing fields</strong><ul>${missing}</ul></div>` : ""}
     ${rowEntries ? `<dl class="supplier-meta supplier-row-preview">${rowEntries}</dl>` : ""}
     ${showOpen ? `<div class="supplier-card-actions">
+      <a class="supplier-btn supplier-btn-neutral" href="#/documents/${esc(action.intake_id)}">Open document</a>
       ${action.status === "ready_for_approval" ? `<button class="supplier-btn supplier-btn-primary" data-approve-supplier="${esc(action.id)}">Approve and add record</button>` : ""}
       ${action.status === "needs_clarification" || action.status === "needs_human_review" ? `<button class="supplier-btn supplier-btn-neutral" data-review-supplier="${esc(action.id)}">Hold for review</button>` : ""}
       ${action.status !== "record_created" && action.status !== "rejected" ? `<button class="supplier-btn supplier-btn-neutral" data-reject-supplier="${esc(action.id)}">Reject</button>` : ""}
@@ -2020,9 +2230,8 @@ async function pageSettings() {
         <div><div class="k">Database</div><div class="v"><code class="path">${esc(s.database.path)}</code></div></div>
         <div><div class="k">Stored copies</div><div class="v"><code class="path">${esc(s.workspace)}</code></div></div>
       </div>
-      <p class="meta">Schema version ${esc(s.database.schema_version)}. To take a safe copy while the app is running:
-        <code class="path">freight db backup ~/freight-backup.db</code>. Deleting the workspace folder removes the
-        imported files; the database keeps the extracted figures.</p>
+      <p class="meta">Schema version ${esc(s.database.schema_version)}. Supplier database connections and their source CSV files are preserved.</p>
+      <button class="btn destructive" data-act="clear-quotation-data">Clear all quotation documents and review data</button>
     </div>
 
     <h2>Upload rules</h2>
@@ -2043,6 +2252,25 @@ async function pageSettings() {
 const ACTIONS = {
   reload: async () => route(),
 
+  "clear-quotation-data": async (button) => {
+    const confirmed = await confirmDialog({
+      title: "Clear all quotation data?",
+      body: "<p>This removes uploaded and Gmail documents, extracted quotations, review records, drafts, and stored workspace copies. Supplier database connections and source CSV files are preserved.</p>",
+      confirmLabel: "Clear quotation data",
+      danger: true,
+    });
+    if (!confirmed) return;
+    button.disabled = true;
+    try {
+      await api.remove("/api/workspace/quotation-data");
+      toast("Quotation documents and review data cleared", "ok");
+      location.hash = "#/inbox";
+    } catch (error) {
+      button.disabled = false;
+      toast(errorText(error), "bad");
+    }
+  },
+
   process: async (button) =>
     busy("process-" + button.dataset.id, async () => {
       button.disabled = true;
@@ -2053,7 +2281,7 @@ const ACTIONS = {
         trackJob(response.job);
       } else {
         toast(
-          "Reading started — opening the document so you can watch it",
+          "Processing started — opening the quotation workspace",
           "ok",
         );
         location.hash = "#/documents/" + button.dataset.id;
