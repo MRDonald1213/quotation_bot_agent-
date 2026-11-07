@@ -19,6 +19,7 @@ from ..domain.enums import (ClassificationStatus, DraftStatus, GapStatus,
 from ..domain.exceptions import NotFoundError, ValidationFailureError
 from ..domain.models import AuditEvent, FieldEvidence, IntakeItem, Quotation
 from .common import with_session
+from .quotation_naming import name_for_intake, name_for_quotation
 from .shipments import route_label
 
 INTAKE_PREVIEW_CHARS = 700
@@ -27,11 +28,11 @@ OPEN_DRAFT_STATES = {DraftStatus.draft, DraftStatus.approved}
 
 
 def clear_quotation_data(settings: Settings) -> dict[str, int]:
-    """Remove uploaded/imported quotation workflow data while preserving supplier database configuration."""
+    """Clear what was read, but never the Gmail authorisation — an operator must not re-sign in to Google."""
     from ..db.engine import get_session
     from ..db.models import (
         AuditEventRow, CarrierRow, ClarificationDraftRow, FieldEvidenceRow, GapRow,
-        GmailAccountRow, GmailAttachmentRow, GmailMessageRow, GmailSupplierReplyRow, IntakeItemRow,
+        GmailAttachmentRow, GmailMessageRow, GmailSupplierReplyRow, IntakeItemRow,
         QuestionSetRow, QuotationRegisterRow, QuotationRow, QuotationVersionRow,
         ShipmentRow, SupplierEmailDraftRow, SupplierQuotationActionRow, SupplierReplyRow,
     )
@@ -39,7 +40,7 @@ def clear_quotation_data(settings: Settings) -> dict[str, int]:
     deleted: dict[str, int] = {}
     models = (
         SupplierEmailDraftRow, GmailSupplierReplyRow, QuotationRegisterRow,
-        SupplierQuotationActionRow, GmailAttachmentRow, GmailMessageRow, GmailAccountRow,
+        SupplierQuotationActionRow, GmailAttachmentRow, GmailMessageRow,
         ClarificationDraftRow, QuestionSetRow, SupplierReplyRow, QuotationVersionRow,
         FieldEvidenceRow, GapRow, QuotationRow, IntakeItemRow, ShipmentRow,
         CarrierRow, AuditEventRow,
@@ -144,12 +145,12 @@ def build_review(settings: Settings) -> dict[str, Any]:
         # audit rows name an entity id; the page names the thing a person uploaded or approved
         names: dict[str, str] = {}
         for item in intakes:
-            names[f"intake_item:{item.id}"] = item.original_filename
+            names[f"intake_item:{item.id}"] = name_for_intake(repos.session, str(item.id))
         for shipment in shipments:
             names[f"shipment:{shipment.id}"] = shipment_label(shipment)
         for quote in quotations:
             names[f"quotation:{quote.id}"] = (
-                f"{carriers.get(quote.carrier_id) or quote.quote_reference or 'quote'} v{quote.version}")
+                f"{name_for_quotation(repos.session, str(quote.id))} v{quote.version}")
 
         documents = []
         for item in intakes:
@@ -157,6 +158,7 @@ def build_review(settings: Settings) -> dict[str, Any]:
                     ClassificationStatus.pending, ClassificationStatus.needs_review):
                 documents.append({
                     "id": str(item.id),
+                    "name": names[f"intake_item:{item.id}"],
                     "file": item.original_filename,
                     "source": str(item.source_type),
                     "sender": item.sender,
@@ -188,6 +190,7 @@ def build_review(settings: Settings) -> dict[str, Any]:
                             if e.validation_status != ValidationStatus.accepted]
                 quotes.append({
                     "id": str(quote.id),
+                    "name": name_for_quotation(repos.session, str(quote.id)),
                     "carrier": carriers.get(quote.carrier_id) or (quote.quote_reference or "unknown carrier"),
                     "quote_reference": quote.quote_reference,
                     "version": quote.version,
@@ -246,6 +249,13 @@ def build_review(settings: Settings) -> dict[str, Any]:
                     "id": str(d.id), "subject": d.subject, "body": d.body,
                     "recipient": d.recipient, "status": str(d.status),
                     "quotation_id": str(d.quotation_id),
+                    "quotation_name": name_for_quotation(repos.session, str(d.quotation_id)),
+                    "missing_fields": [
+                        {"field": g.field_name, "label": g.field_name.replace("_", " "),
+                         "question": g.question_text, "severity": str(g.severity)}
+                        for g in gaps
+                        if str(g.quotation_id) == str(d.quotation_id) and g.question_text
+                    ],
                 } for d in drafts],
                 "replies": [{
                     "id": str(r.id), "quotation_id": str(r.quotation_id),
@@ -340,7 +350,7 @@ def preview_import(settings: Settings, quotation_id: str) -> dict[str, Any]:
                          else ["Approve the review first — importing only commits an approved extraction"])
                         + ([f"{len(critical)} item(s) still missing that block a fair price comparison"]
                            if critical else [])
-                        + ([f"{len(unreviewed)} extracted value(s) not yet confirmed or currently flagged for review"]
+                        + ([f"{len(unreviewed)} extracted value(s) the checks left unverified"]
                            if unreviewed else []),
         }
 

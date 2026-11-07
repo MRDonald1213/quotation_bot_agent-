@@ -50,13 +50,6 @@
     return request(path, { method: "DELETE", headers: { Accept: "application/json" } });
   }
 
-  function upload(files, onDuplicate) {
-    const form = new FormData();
-    for (const file of files) form.append("files", file);
-    form.append("on_duplicate", onDuplicate || "error");
-    return request("/api/documents", { method: "POST", body: form });
-  }
-
   // One verb for every console action so the backend stays the authority.
   function action(kind, payload) {
     return post("/api/action", Object.assign({ action: kind }, payload || {}));
@@ -123,5 +116,5 @@
     });
   }
 
-  global.api = { ApiError, get, post, remove, upload, multipart, action, downloadBlob, pollJob };
+  global.api = { ApiError, get, post, remove, multipart, action, downloadBlob, pollJob };
 })(window);

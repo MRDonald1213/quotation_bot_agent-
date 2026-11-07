@@ -168,6 +168,13 @@ class JobRunner:
             raise ValidationFailureError(f"unknown job: {job_id}")
         return job
 
+    def latest_for(self, subject_id: str) -> Job | None:
+        """The newest run for one subject, live or finished."""
+        with self._lock:
+            self._expire_stale_locked(_now())
+            jobs = [j for j in self._jobs.values() if j.subject_id == subject_id]
+        return max(jobs, key=lambda j: j.created_at) if jobs else None
+
     def recent(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._lock:
             self._expire_stale_locked(_now())

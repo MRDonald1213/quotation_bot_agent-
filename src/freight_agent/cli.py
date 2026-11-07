@@ -13,7 +13,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 shipment_app = typer.Typer(help="Shipment context for quotation workflows.", no_args_is_help=True)
-intake_app = typer.Typer(help="Import and process intake documents.", no_args_is_help=True)
+intake_app = typer.Typer(help="Process and inspect quotation intake items.", no_args_is_help=True)
 quote_app = typer.Typer(help="Inspect quotations and version history.", no_args_is_help=True)
 questions_app = typer.Typer(help="Generate shipment-wide clarification questions and drafts.",
                             no_args_is_help=True)
@@ -64,7 +64,6 @@ shipment_app.command(name="close")(shipment.close)
 shipment_app.command(name="review")(shipment.review)
 shipment_app.command(name="edit")(shipment.edit)
 shipment_app.command(name="approve")(shipment.approve)
-intake_app.command(name="add")(intake.add)
 intake_app.command(name="classify")(intake.classify_)
 intake_app.command(name="process")(intake.process)
 intake_app.command(name="list")(intake.list_)

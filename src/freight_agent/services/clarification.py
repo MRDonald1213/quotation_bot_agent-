@@ -23,31 +23,17 @@ from ..domain.models import (
     GapItem, QuestionSet, Quotation, Shipment,
 )
 from .common import with_session
-from .gap_analysis import COMPARISON_SCHEMA, detect_gaps_deterministic, readiness
+from .gap_analysis import (
+    ASKABLE_FIELDS, ASKABLE_QUESTIONS, COMPARISON_SCHEMA, canonical_field,
+    detect_gaps_deterministic, readiness,
+)
 from .shipments import route_label
 from .validation import snippet_grounded
 
-_MATERIAL_FIELDS = {
-    "currency", "base_price", "charges", "delivery_scope", "valid_until", "transit_days",
-    "insurance_included", "customs_included", "origin", "destination",
-    "included_services", "excluded_services",
-}
+_MATERIAL_FIELDS = ASKABLE_FIELDS
 _SEVERITIES = {field: severity for field, severity, _ in COMPARISON_SCHEMA}
 _RANK = {GapSeverity.critical: 0, GapSeverity.important: 1, GapSeverity.informational: 2}
-_TEMPLATES = {
-    "currency": "Which currency is this price in?",
-    "base_price": "What is the base freight price, and what does it include?",
-    "charges": "For each extra charge not included in the base price, what is the amount and currency?",
-    "delivery_scope": "Does this price cover delivery to the final address, or only to the port?",
-    "valid_until": "Until what date (YYYY-MM-DD) is this quotation valid?",
-    "transit_days": "What is the expected transit time in days, minimum and maximum?",
-    "insurance_included": "Is cargo insurance included? If not, what does it cost?",
-    "customs_included": "Are customs clearance and handling included in this price?",
-    "origin": "Which origin does this price cover?",
-    "destination": "Which destination does this price cover?",
-    "included_services": "Which services are included in the quoted price?",
-    "excluded_services": "Which services are excluded, and what do they cost separately?",
-}
+_TEMPLATES = ASKABLE_QUESTIONS
 
 
 def _now() -> datetime:
@@ -55,11 +41,7 @@ def _now() -> datetime:
 
 
 def _field(name: str) -> str:
-    if name in {"transit_days_min", "transit_days_max"}:
-        return "transit_days"
-    if name == "known_additional_charges" or re.match(r"^(?:charges|known_additional_charges)[:.\[]", name):
-        return "charges"
-    return name
+    return canonical_field(name)
 
 
 def _key(gap: Gap | GapItem) -> tuple[str, GapType, str]:
@@ -90,7 +72,7 @@ def _analysis(repos: Repos, shipment: Shipment, quote: Quotation
         candidates.append(GapItem(
             field_name=field, gap_type=GapType.ambiguous,
             severity=_SEVERITIES.get(field, GapSeverity.important),
-            description=f"{field} has evidence requiring human review; the extracted value is not confirmed.",
+            description=f"{field} could not be grounded in the source, so the value needs the supplier's answer.",
         ))
 
     def still_open(gap: Gap) -> bool:

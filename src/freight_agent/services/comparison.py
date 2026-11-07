@@ -19,42 +19,16 @@ from ..domain.models import (
 from ..db.repositories import Repos
 from .common import with_session
 from .gap_analysis import detect_gaps_deterministic
-
-
-def _fx_table(settings: Settings) -> dict[str, dict]:
-    try:
-        data = json.loads(settings.fx_rates_json or "{}")
-    except json.JSONDecodeError as exc:
-        raise ValidationFailureError(f"FX_RATES_JSON is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValidationFailureError("FX_RATES_JSON must be a JSON object of 'FROM->TO' rate entries")
-    table: dict[str, dict] = {}
-    for pair, spec in data.items():
-        rate = spec.get("rate") if isinstance(spec, dict) else spec
-        as_of = spec.get("as_of") if isinstance(spec, dict) else None
-        if rate is None:
-            raise ValidationFailureError(f"FX entry {pair!r} has no rate")
-        table[pair] = {"rate": Decimal(str(rate)), "as_of": as_of}
-    return table
+from . import money
 
 
 def _convert(subtotal: Decimal | None, currency: str | None, target: str,
-             fx: dict[str, dict]) -> tuple[Decimal | None, str | None]:
-    """Return (amount-in-target, note). Never invents a rate: a missing FX entry
+             settings: Settings) -> tuple[Decimal | None, str | None]:
+    """Return (amount-in-target, note). Never invents a rate: an unresolvable pair
     leaves the quote unrankable rather than silently summed."""
     if subtotal is None or currency is None:
         return None, None
-    if currency == target:
-        return subtotal, None
-    entry = fx.get(f"{currency}->{target}")
-    if entry is None:
-        return None, (f"{currency} subtotal {subtotal} not converted to {target}; "
-                      "no explicit FX rate configured")
-    converted = (subtotal * entry["rate"]).quantize(Decimal("0.01"))
-    note = f"converted from {currency} {subtotal} at configured rate {entry['rate']}"
-    if entry.get("as_of"):
-        note += f" (as of {entry['as_of']})"
-    return converted, note
+    return money.convert(subtotal, currency, target, settings)
 
 
 def _known_breakdown(quote: Quotation) -> tuple[Decimal | None, list[str]]:
@@ -92,9 +66,10 @@ def _transit(quote: Quotation) -> str:
 
 
 def _row_for(repos: Repos, shipment: Shipment, quote: Quotation,
-             fx: dict[str, dict], carrier_name: str | None) -> ComparisonRow:
+             settings: Settings, carrier_name: str | None) -> ComparisonRow:
     subtotal, uncertain = _known_breakdown(quote)
-    converted, fx_note = _convert(subtotal, quote.currency, shipment.target_currency, fx)
+    converted, fx_note = _convert(subtotal, quote.currency, shipment.target_currency, settings)
+    usd_subtotal, usd_note = _convert(subtotal, quote.currency, "USD", settings)
 
     quote_gaps = [g for g in repos.list_gaps(str(shipment.id)) if g.quotation_id == quote.id]
     if not quote_gaps:
@@ -134,6 +109,7 @@ def _row_for(repos: Repos, shipment: Shipment, quote: Quotation,
         known_additional_total=(None if subtotal is None or quote.base_price is None
                                 else subtotal - quote.base_price),
         known_subtotal=subtotal, converted_subtotal=converted, fx_note=fx_note,
+        usd_subtotal=usd_subtotal, usd_note=usd_note,
         uncertain_charges=uncertain, included_services=quote.included_services,
         excluded_services=quote.excluded_services, delivery_scope=str(quote.delivery_scope or "unknown"),
         transit_time=_transit(quote), valid_until=quote.valid_until, comparison_status=status,
@@ -146,14 +122,13 @@ def _row_for(repos: Repos, shipment: Shipment, quote: Quotation,
 
 def build_comparison(settings: Settings, id_or_reference: str) -> ComparisonReport:
     """Workflow C: deterministic cross-carrier comparison. No LLM, no invented totals."""
-    fx = _fx_table(settings)
     with with_session(settings) as repos:
         shipment = repos.get_shipment(id_or_reference)
         quotes = repos.list_quotations(str(shipment.id))
         rows: list[ComparisonRow] = []
         for q in quotes:
             carrier = repos.get_carrier(str(q.carrier_id)) if q.carrier_id else None
-            rows.append(_row_for(repos, shipment, q, fx, carrier.name if carrier else None))
+            rows.append(_row_for(repos, shipment, q, settings, carrier.name if carrier else None))
         return _assemble(shipment, rows)
 
 
@@ -188,14 +163,20 @@ def _assemble(shipment: Shipment, rows: list[ComparisonRow]) -> ComparisonReport
         ranked = sorted(eligible, key=lambda r: r.converted_subtotal)  # type: ignore[arg-type]
         best = ranked[0]
         carrier = best.carrier_name or best.quote_reference or str(best.quotation_id)[:8]
+        usd_part = (f" — USD {best.usd_subtotal}" if best.usd_subtotal is not None
+                    and str(shipment.target_currency).upper() != "USD" else "")
         report.recommendation = (
             f"Lowest known total in {shipment.target_currency}: {carrier} at "
-            f"{best.converted_subtotal} (base {best.base_price} {best.currency})."
+            f"{best.converted_subtotal}{usd_part} (base {best.base_price} {best.currency})."
         )
         report.recommendation_basis = [
             "Ranked by known subtotal (base + confirmed additional charges), not base price alone.",
             f"Only quotes that are comparable, scope-compatible, and convertible to {shipment.target_currency} were ranked.",
         ]
+        if any(r.usd_note for r in rows):
+            report.recommendation_basis.append(
+                f"USD figures use the local reference rate table (as of {money.RATES_AS_OF}); "
+                "set FX_RATES_JSON in .env to override a pair.")
         if best.fx_note:
             report.recommendation_basis.append(f"Winner uses configured FX: {best.fx_note}")
         if best.unresolved_other_gaps:
@@ -236,7 +217,7 @@ def render_report(report: ComparisonReport, fmt: str) -> str:
     if fmt not in ("csv", "md", "table"):
         raise ValidationFailureError(f"unknown format {fmt!r}; choose from {', '.join(REPORT_FORMATS)}")
     headers = ["carrier", "status", "currency", "base_price", "known_extras", "known_subtotal",
-               f"in_{report.target_currency}", "scope", "transit", "valid_until",
+               f"in_{report.target_currency}", "in_USD", "scope", "transit", "valid_until",
                "critical_gaps", "uncertain_charges"]
     body = []
     for r in report.rows:
@@ -246,6 +227,7 @@ def render_report(report: ComparisonReport, fmt: str) -> str:
             "" if r.known_additional_total is None else str(r.known_additional_total),
             "" if r.known_subtotal is None else str(r.known_subtotal),
             "" if r.converted_subtotal is None else str(r.converted_subtotal),
+            "" if r.usd_subtotal is None else str(r.usd_subtotal),
             r.delivery_scope, r.transit_time,
             "" if r.valid_until is None else r.valid_until.isoformat(),
             "; ".join(r.unresolved_critical_gaps), "; ".join(r.uncertain_charges),

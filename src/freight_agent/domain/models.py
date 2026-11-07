@@ -295,6 +295,11 @@ class SupplierDraftWordings(DomainModel):
     body: str = Field(min_length=20, max_length=4000)
 
 
+class ChatReply(DomainModel):
+    """Conversational wording of findings the Python layer already computed; never trusted raw."""
+    reply: str = Field(min_length=10, max_length=1200)
+
+
 class ProcessingSummary(DomainModel):
     intake_item_id: UUID
     shipment_id: UUID | None = None
@@ -319,6 +324,8 @@ class ComparisonRow(DomainModel):
     known_subtotal: Decimal | None = None
     converted_subtotal: Decimal | None = None
     fx_note: str | None = None
+    usd_subtotal: Decimal | None = None
+    usd_note: str | None = None
     uncertain_charges: list[str] = Field(default_factory=list)
     included_services: list[str] = Field(default_factory=list)
     excluded_services: list[str] = Field(default_factory=list)

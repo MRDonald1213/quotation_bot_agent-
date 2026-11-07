@@ -238,6 +238,8 @@ nav a.supplier-nav.active:hover { background:#111; color:#fff; }
 .supplier-action-head h3 { margin:3px 0 0; }
 .supplier-action-card p { color:#555; }
 .supplier-missing { border-left:3px solid #111; background:#f4f4f4; padding:10px 12px; font-size:13px; }
+.supplier-draft-missing { margin-top:12px; }
+.supplier-draft-missing > .supplier-kicker { display:block; margin-bottom:6px; }
 .supplier-missing ul { margin:5px 0 0; padding-left:18px; }
 .supplier-row-preview { grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); }
 .supplier-card-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; flex-wrap:wrap; }
@@ -255,6 +257,8 @@ nav a.supplier-nav.active:hover { background:#111; color:#fff; }
 .supplier-citations { margin-top:8px; color:#666; font-size:12px; }
 .supplier-citations span { text-transform:uppercase; font-weight:800; letter-spacing:.08em; }
 .supplier-citations ul { margin:4px 0 0; padding-left:18px; }
+.supplier-chat-prompts { display:flex; flex-wrap:wrap; gap:8px; padding:10px; border-top:1px solid var(--supplier-line); background:#fff; }
+.supplier-chat-prompts button { font-size:13px; }
 .supplier-chat-form { border-top:1px solid var(--supplier-line); display:flex; gap:8px; padding:10px; background:#fff; }
 .supplier-chat-form input { flex:1; min-width:0; border:1px solid var(--supplier-line); border-radius:3px; padding:9px 10px; font:inherit; }
 

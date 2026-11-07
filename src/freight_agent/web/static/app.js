@@ -37,19 +37,19 @@ const PAGES = {
       "Unified email, document and supplier-workflow intake with explicit human review actions.",
   },
   documents: {
-    title: "Documents",
+    title: "Quotation workspace",
     guide:
-      "Drop quotation files in, run the reading step, then open a document to check it.",
-  },
-  shipments: {
-    title: "Review & Quotations",
-    guide:
-      "Documents awaiting review and quotation lanes are shown on the same screen.",
+      "What the agent read from this quotation, the evidence, what is still missing, and your review and import actions.",
   },
   drafts: {
     title: "Drafts",
     guide:
-      "Questions for the carrier, written by the agent. Nothing leaves this computer until you approve the exact text and send it yourself.",
+      "One card per quotation: who the question goes to, the email it answers, what is still missing, and the text itself. Nothing leaves this computer until you approve the exact wording and press Send.",
+  },
+  gmail: {
+    title: "Email workspace",
+    guide:
+      "The email, what the agent read from it, the supplier it matched, what is still open, and the question it drafted — all in one place, processed in the background.",
   },
   settings: {
     title: "System",
@@ -153,6 +153,12 @@ function fileName(value) {
   return name.length > 46 ? name.slice(0, 24) + "…" + name.slice(-16) : name;
 }
 
+// Quotations are titled "Supplier — route"; the filename is only the fallback for unread rows.
+function quoteLabel(row) {
+  const label = row && (row.name || row.quotation_name);
+  return clip(label || fileName(row && row.file) || "Quotation", 64);
+}
+
 const REVIEW_CHIPS = {
   extracted: ["Awaiting your review", "pending"],
   approved: ["Approved — ready to import", "info"],
@@ -202,7 +208,7 @@ function processingChip(row) {
 
 const SEVERITY = {
   critical: ["Blocks comparison", "critical"],
-  important: ["Should confirm", "warn"],
+  important: ["Affects the offer", "warn"],
   informational: ["Good to know", "plain"],
 };
 
@@ -237,13 +243,23 @@ function fileSize(bytes) {
   return (bytes / 1048576).toFixed(1) + " MB";
 }
 
+function utc(value) {
+  const text = String(value);
+  return new Date(/Z|[+-]\d{2}:?\d{2}$/.test(text) ? text : text + "Z");
+}
+
 function when(value) {
-  return value ? String(value).replace("T", " ").slice(0, 16) : "";
+  if (!value) return "";
+  const date = utc(value);
+  if (Number.isNaN(date.getTime())) return String(value).replace("T", " ").slice(0, 16);
+  return date.toLocaleString(undefined, {
+    day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+  });
 }
 
 function ago(value) {
   if (!value) return "";
-  const seconds = (Date.now() - new Date(value).getTime()) / 1000;
+  const seconds = (Date.now() - utc(value).getTime()) / 1000;
   if (!(seconds >= 0)) return when(value);
   if (seconds < 60) return "just now";
   if (seconds < 3600) return Math.floor(seconds / 60) + " min ago";
@@ -359,16 +375,6 @@ function fail(exc) {
     <p><button class="btn neutral" data-act="reload">Try again</button></p>`;
 }
 
-function limits() {
-  return (
-    (state.status && state.status.limits) || {
-      max_file_size_mb: 25,
-      supported_extensions: [],
-      confidence_threshold: 0.8,
-    }
-  );
-}
-
 function jobLine(job) {
   if (!job) return "";
   if (job.status === "succeeded")
@@ -454,10 +460,9 @@ async function route() {
   pageGuide.textContent = meta.guide;
   await refreshStatus();
   if (page === "") return pageDashboard();
-  if (page === "documents") return id ? pageReview(id) : pageDocuments();
+  if (page === "documents") return id ? pageReview(id) : pageInbox();
   if (page === "gmail") return id ? pageGmail(id) : pageInbox();
-  if (page === "queue" || page === "comparison") return pageShipments();
-  if (page === "shipments") return id ? pageShipment(id) : pageShipments();
+  if (page === "shipments" || page === "queue" || page === "comparison") { location.hash = "#/inbox"; return; }
   if (page === "drafts") return pageDrafts();
   if (page === "settings") return pageSettings();
   if (page === "inbox") return pageInbox();
@@ -502,25 +507,25 @@ async function pageDashboard() {
     attention.push([
       plural(c.proposals, "new route", "s"),
       "awaiting your approval or correction",
-      "#/shipments",
+      "#/inbox",
     ]);
   if (c.awaiting_review)
     attention.push([
       plural(c.awaiting_review, "extracted quote"),
       "awaiting your review",
-      "#/shipments",
+      "#/inbox",
     ]);
   if (c.ready_to_import)
     attention.push([
       plural(c.ready_to_import, "approved quote"),
       "ready to import into the database",
-      "#/shipments",
+      "#/inbox",
     ]);
   if (c.gaps)
     attention.push([
       plural(c.gaps, "item", "s"),
       "still missing from the quotes the agent read",
-      "#/shipments",
+      "#/inbox",
     ]);
   if (c.drafts)
     attention.push([
@@ -532,13 +537,13 @@ async function pageDashboard() {
     attention.push([
       plural(failed, "document"),
       "could not be read — open it to see why",
-      "#/documents",
+      "#/inbox",
     ]);
   if (live.length)
     attention.push([
       plural(live.length, "document"),
       "being read right now",
-      "#/documents",
+      "#/inbox",
     ]);
 
   const ollamaNote = !state.status
@@ -552,11 +557,11 @@ async function pageDashboard() {
   view.innerHTML = `
     <section class="hero rise">
       <h2>Carrier quotes, read and checked — so you compare prices, not PDFs.</h2>
-      <p>Upload or open a quotation. The agent reads it on this computer, matches it to a supplier database,
+      <p>Open a quotation email. The agent reads it on this computer, matches it to a supplier database,
          extracts fields against that database schema, and waits for an explicit human decision before
          creating or updating a supplier record.</p>
       <div class="steps">
-        <div class="step rise-2"><i>1</i><b>Upload</b><span>Documents and email messages enter the inbox.</span></div>
+        <div class="step rise-2"><i>1</i><b>Receive</b><span>Quotation emails enter the Operations Inbox.</span></div>
         <div class="step rise-2"><i>2</i><b>Process</b><span>The agent matches a database and extracts the schema fields.</span></div>
         <div class="step rise-3"><i>3</i><b>Review</b><span>Review extracted data and approve or correct the record.</span></div>
       </div>
@@ -575,7 +580,7 @@ async function pageDashboard() {
             )
             .join("")}</div>`
         : empty(
-            "Nothing waits for a decision right now. New uploads appear here automatically.",
+            "Nothing waits for a decision right now. New quotation emails appear here automatically.",
           )
     }
 
@@ -585,7 +590,7 @@ async function pageDashboard() {
       ${plural(c.documents, "document")} awaiting a decision ·
       ${plural(c.imported, "quote")} in the database · ${plural(c.ready_to_import, "quote")} approved and waiting to import</p>
 
-    <h2>Recent documents</h2>
+    <h2>Recent quotations</h2>
     ${
       data.recent.length
         ? `<div class="panel"><table>
@@ -594,7 +599,7 @@ async function pageDashboard() {
         .map(
           (d) => `
         <tr>
-          <td><a class="name" href="${esc(d.target)}">${esc(fileName(d.file))}</a>
+          <td><a class="name" href="${esc(d.target)}">${esc(quoteLabel(d))}</a>
             <div class="sub">${esc(ago(d.created_at))}</div></td>
           <td>${classificationChip(d)} ${processingChip(d)}
             ${d.reason ? `<div class="sub">${esc(clip(d.reason, 110))}</div>` : ""}</td>
@@ -607,7 +612,7 @@ async function pageDashboard() {
         )
         .join("")}</tbody></table></div>`
         : empty(
-            "No documents yet. Upload a quotation on the Documents page to start.",
+            "No quotations yet. Connect Gmail and sync to start.",
           )
     }
 
@@ -626,207 +631,165 @@ async function pageDashboard() {
     }
 
     <div class="row" style="margin-top:20px">
-      <a class="btn big" href="#/documents">Upload documents</a>
-      <a class="btn neutral big" href="#/shipments">Review &amp; quotations</a>
+      <a class="btn big" href="#/inbox">Open Operations Inbox</a>
       <button class="btn neutral big" data-act="reload">Refresh</button>
     </div>`;
 }
 
-// ------------------------------------------------------------------ documents
-async function pageDocuments() {
-  skeleton();
-  let rows;
-  try {
-    rows = await api.get("/api/documents");
-  } catch (exc) {
-    return fail(exc);
-  }
-  const allowed = limits().supported_extensions;
-  view.innerHTML = `
-    <div class="drop" id="drop" tabindex="0">
-      <div class="title">Drop quotation files here</div>
-      <div class="meta">or choose files below · parsed, hashed and stored on this machine only</div>
-      <div class="row" style="justify-content:center;margin-top:12px">
-        <input type="file" id="picker" multiple style="border:0;padding:0" aria-label="Choose files to upload">
-        <button class="btn" id="upload-btn" disabled>Upload</button>
-      </div>
-      <div class="meta">${esc(allowed.join(" "))} · up to ${esc(limits().max_file_size_mb)} MB each</div>
-    </div>
-    <div id="upload-result" class="list" style="margin-top:12px"></div>
-    <div class="row spread" style="margin-top:20px">
-      <div class="row tight">
-        <input type="search" id="q" placeholder="Search file name or reason" aria-label="Search documents">
-        <select id="f-status" aria-label="Filter by status">
-          <option value="">All statuses</option>
-          <option value="needs_review">Needs review</option>
-          <option value="pending">Not processed</option>
-          <option value="processed">Read and extracted</option>
-          <option value="failed">Failed</option>
-          <option value="relevant">Freight quote</option>
-          <option value="irrelevant">Not a quote</option>
-        </select>
-        <select id="f-kind" aria-label="Filter by file type">
-          <option value="">All types</option>
-          ${allowed.map((ext) => `<option value="${esc(ext)}">${esc(ext)}</option>`).join("")}
-        </select>
-      </div>
-      <button class="btn neutral" data-act="reload">Refresh</button>
-    </div>
-    <div id="doc-table" style="margin-top:12px">${documentTable(rows)}</div>`;
-
-  const drop = document.getElementById("drop");
-  const picker = document.getElementById("picker");
-  const uploadBtn = document.getElementById("upload-btn");
-  let staged = [];
-  const renderStaged = (clear) => {
-    if (clear) staged = [];
-    uploadBtn.disabled = staged.length === 0;
-    uploadBtn.textContent = staged.length
-      ? `Upload ${staged.length} file(s)`
-      : "Upload";
-  };
-  const stage = (files) => {
-    staged = staged.concat(Array.from(files));
-    renderStaged();
-  };
-  picker.addEventListener("change", () => stage(picker.files));
-  ["dragenter", "dragover"].forEach((evt) =>
-    drop.addEventListener(evt, (event) => {
-      event.preventDefault();
-      drop.classList.add("over");
-    }),
-  );
-  ["dragleave", "dragend"].forEach((evt) =>
-    drop.addEventListener(evt, () => drop.classList.remove("over")),
-  );
-  drop.addEventListener("drop", (event) => {
-    event.preventDefault();
-    drop.classList.remove("over");
-    if (event.dataTransfer && event.dataTransfer.files.length)
-      stage(event.dataTransfer.files);
-  });
-  uploadBtn.addEventListener("click", () => runUpload(staged, renderStaged));
-
-  const tableHost = document.getElementById("doc-table");
-  const apply = () => {
-    const needle = document.getElementById("q").value.trim().toLowerCase();
-    const status = document.getElementById("f-status").value;
-    const kind = document.getElementById("f-kind").value;
-    tableHost.innerHTML = documentTable(
-      rows.filter((r) => {
-        if (status && r.processing !== status && r.classification !== status)
-          return false;
-        if (kind && !r.file.toLowerCase().endsWith(kind)) return false;
-        if (
-          needle &&
-          !(
-            r.file.toLowerCase().includes(needle) ||
-            (r.reason || "").toLowerCase().includes(needle)
-          )
-        )
-          return false;
-        return true;
-      }),
-    );
-  };
-  ["q", "f-status", "f-kind"].forEach((id) =>
-    document.getElementById(id).addEventListener("input", apply),
-  );
-}
-
-function documentTable(rows) {
-  if (!rows.length) {
-    return empty(
-      "No documents yet. Upload one above — it is parsed and hash-checked on this machine.",
-    );
-  }
-  return `<div class="panel"><table>
-    <thead><tr><th>Document</th><th class="num">Size</th><th>What the agent decided</th><th>Reading</th><th>Lane</th><th></th></tr></thead>
-    <tbody>${rows
-      .map(
-        (r) => `
-      <tr>
-        <td><a class="name" href="#/documents/${esc(r.id)}">${esc(fileName(r.file))}</a>
-          ${r.reason ? `<div class="sub">${esc(clip(r.reason, 110))}</div>` : ""}</td>
-        <td class="num meta">${esc(fileSize(r.size_bytes))}<div class="sub">${esc(ago(r.created_at))}</div></td>
-        <td>${classificationChip(r)}${
-          r.confidence !== null && r.confidence !== undefined
-            ? ` <span class="meta">${esc(Math.round(r.confidence * 100))}% sure</span>`
-            : ""
-        }</td>
-        <td>${processingChip(r)}</td>
-        <td class="meta">${r.shipment_label ? `<a href="#/shipments/${esc(r.shipment_id)}">${esc(r.shipment_label)}</a>` : "—"}</td>
-        <td class="row tight">
-          <a class="btn neutral small" href="#/documents/${esc(r.id)}">Open</a>
-          <button class="btn small" data-act="process" data-id="${esc(r.id)}"
-            data-force="${r.processing === "processed" ? "1" : "0"}"
-            >${r.processing === "processed" ? "Process quotation again" : "Process quotation"}</button>
-          ${r.classification !== "irrelevant" ? `<button class="btn small destructive" data-act="ignore" data-id="${esc(r.id)}" data-file="${esc(r.file)}">Not a quote</button>` : `<span class="chip plain">Retained as not a quote</span>`}
-        </td>
-      </tr>`,
-      )
-      .join("")}</tbody></table></div>`;
-}
-
-async function runUpload(files, renderStaged) {
-  if (!files.length) return;
-  const host = document.getElementById("upload-result");
-  const button = document.getElementById("upload-btn");
-  await busy("upload", async () => {
-    button.disabled = true;
-    button.textContent = "Uploading…";
-    host.innerHTML = `<p class="skeleton">Uploading ${files.length} file(s) — parsing and hashing happen on this machine.</p>`;
-    const result = await api.upload(files, "error");
-    host.innerHTML = `<div class="panel"><table>
-      <thead><tr><th>File</th><th>Result</th><th></th></tr></thead>
-      <tbody>${result.results
-        .map(
-          (entry) => `
-        <tr>
-          <td class="name">${esc(fileName(entry.file))}</td>
-          <td>${chip(
-            entry.status === "registered"
-              ? "Stored"
-              : entry.status === "duplicate"
-                ? "Already imported"
-                : "Rejected",
-            entry.status === "registered"
-              ? "ok"
-              : entry.status === "duplicate"
-                ? "warn"
-                : "bad",
-          )}
-            <div class="sub">${esc(clip(entry.error || entry.message || "", 140))}</div></td>
-          <td class="row tight">
-            ${
-              entry.intake_id && entry.status !== "duplicate"
-                ? `<a class="btn small neutral" href="#/documents/${esc(entry.intake_id)}">Open</a>
-                 <button class="btn small" data-act="process" data-id="${esc(entry.intake_id)}" data-force="0">Process quotation</button>`
-                : ""
-            }
-            ${
-              entry.status === "duplicate" && entry.intake_id
-                ? `<button class="btn small neutral" data-act="skip" data-id="${esc(entry.intake_id)}">Keep the existing copy</button>
-                 <button class="btn small subtle" data-act="process" data-id="${esc(entry.intake_id)}" data-force="1">Process again anyway</button>`
-                : ""
-            }
-          </td>
-        </tr>`,
-        )
-        .join("")}</tbody></table></div>`;
-    const ok = result.results.filter((r) => r.status === "registered").length;
-    toast(
-      ok
-        ? `${ok} file(s) stored locally`
-        : "nothing was stored — see the result above",
-      ok ? "ok" : "error",
-    );
-    renderStaged(true);
-  });
-  renderStaged(true);
-}
-
 // ---------------------------------------------------------- Gmail message workspace
+const GMAIL_MESSAGE_STATUS = {
+  pending: ["Queued for the background reader", "pending"],
+  queued: ["Queued for the background reader", "pending"],
+  analyzing: ["Being read now", "info"],
+  received: ["Queued for the background reader", "pending"],
+  processed: ["Completed", "ok"],
+  draft_ready: ["Question ready for you to send", "warn"],
+  reply_merged: ["Answer merged into the quotation", "ok"],
+  reply_failed: ["Answer could not be merged", "bad"],
+  reply_needs_linking: ["Answer not matched to a quotation", "warn"],
+  supplier_reply_pending: ["Waiting for the supplier", "warn"],
+  needs_clarification: ["Missing Info — Needs Review", "warn"],
+  needs_human_review: ["Missing Info — Needs Review", "warn"],
+  needs_database: ["Pick a supplier record", "warn"],
+  ready_for_approval: ["Ready to Create Record", "ok"],
+  extraction_failed: ["Reading stopped — needs review", "bad"],
+  ignored: ["Not a quotation", "plain"],
+  not_a_quotation: ["Not a quotation", "plain"],
+};
+
+const ACTION_STATUS = {
+  received: ["Queued for the background reader", "pending"],
+  needs_clarification: ["Missing Info — Needs Review", "warn"],
+  needs_human_review: ["Missing Info — Needs Review", "warn"],
+  ready_for_approval: ["Ready to Create Record", "ok"],
+  record_created: ["Completed", "ok"],
+  rejected: ["Rejected", "bad"],
+};
+
+function gmailStatusTuple(status) {
+  return GMAIL_MESSAGE_STATUS[String(status || "")] || ["Waiting to be read", "pending"];
+}
+
+function gmailStatusChip(status) {
+  const [label, kind] = gmailStatusTuple(status);
+  return chip(label, kind);
+}
+
+function actionStatusChip(status) {
+  const [label, kind] = ACTION_STATUS[String(status || "")]
+    || [String(status || "unknown").replaceAll("_", " "), "plain"];
+  return chip(label, kind);
+}
+
+function moneyPair(money) {
+  if (!money) return null;
+  if (money.original_display && money.display) return `${money.original_display} → ${money.display}`;
+  if (money.display) return money.display;
+  if (money.original_display) return `${money.original_display} (no USD rate for ${money.currency})`;
+  return null;
+}
+
+function gmailStatusSentence(message, analysis, draft) {
+  const queue = message.queue || null;
+  if (message.processing_status === "analyzing") {
+    return "The agent is reading this email now — the offer, the supplier it belongs to, the open points and a question for the supplier if one is needed. This page refreshes on its own when the reading finishes.";
+  }
+  if (queue) {
+    return `Waiting its turn in the background reader: ${queue.ahead === 0 ? "it is next" : `${queue.ahead} email(s) ahead of it`}, ${queue.in_queue} in the queue. Nothing to press — the reading starts on its own, oldest email first.`;
+  }
+  if (message.job) {
+    return "The agent is working through this email now: it reads the offer, matches the supplier, lists the open points and prepares a question only if the supplier has to answer them.";
+  }
+  if (message.processing_status === "supplier_reply_pending") {
+    return "Our question is with the supplier. When the answer arrives it is merged into this quotation, re-analysed and re-compared automatically; you only send the next draft if one is still needed.";
+  }
+  if (message.processing_status === "reply_needs_linking") {
+    return "This answer did not name or thread the quotation it belongs to, so nothing has been merged yet. Pick that quotation below: the answer is added as a new version, then the gaps are recomputed and another question drafted only if a point is still open.";
+  }
+  if (draft && draft.status === "sent") {
+    return "The answer was sent to the supplier from this workspace. Their reply will update the quotation on its own.";
+  }
+  if (analysis && analysis.status === "ready_for_approval") {
+    return "Read when it arrived. Nothing the supplier needs to answer is missing, so no question was drafted.";
+  }
+  if (analysis) {
+    return "Read when it arrived. Everything the agent understood, the supplier it matched, and what is still open are below.";
+  }
+  return "Read when it arrived; this is what the agent understood.";
+}
+
+function openPointList(items, kind) {
+  if (!items.length) return "";
+  return `<ul class="fields" style="margin-top:8px">${items.map((item) => `<li>
+      <div class="row spread"><strong>${esc(item.label || field(item.field))}</strong>${
+        kind === "ask" ? chip("Ask the supplier", "warn") : chip("Our team fills in", "plain")}</div>
+      <div class="evidence">${esc(item.reason || "Not stated in the quotation.")}</div>
+    </li>`).join("")}</ul>`;
+}
+
+const COMPARISON_CHIPS = {
+  comparable: ["Comparable", "ok"],
+  incomplete: ["Incomplete", "warn"],
+  expired: ["Expired", "bad"],
+  needs_review: ["Needs review", "pending"],
+};
+
+function comparisonChip(status) {
+  const [label, kind] = COMPARISON_CHIPS[String(status || "")] || [field(status), "plain"];
+  return chip(label, kind);
+}
+
+// Read-only lane comparison for an email quotation: deterministic backend figures, never frontend arithmetic.
+function laneComparisonPanel(shipment, currentQuotationId) {
+  if (!shipment) return "";
+  const quotes = Array.isArray(shipment.quotes) ? shipment.quotes : [];
+  if (!quotes.length) return "";
+  const comparison = shipment.comparison || null;
+  const reportBase = "/api/shipments/" + encodeURIComponent(shipment.id) + "/report";
+  const basis = comparison && Array.isArray(comparison.recommendation_basis) ? comparison.recommendation_basis : [];
+  const caveats = comparison && Array.isArray(comparison.caveats) ? comparison.caveats : [];
+  return `<section class="panel">
+    <div class="row spread">
+      <div><span class="supplier-kicker">Lane comparison</span><h3>${esc(shipment.label || shipment.route || shipment.reference || "This lane")}</h3></div>
+      ${chip(plural(quotes.length, "quotation"), "plain")}
+    </div>
+    <div class="sub meta">${esc(shipment.route || "route not stated")}${shipment.target_currency ? " · compared in " + esc(shipment.target_currency) : ""}</div>
+    ${comparison && comparison.recommendation ? `<div class="evidence" style="margin-top:8px"><strong>Recommendation:</strong> ${esc(comparison.recommendation)}${
+      basis.length ? `<ul style="margin:6px 0 0">${basis.map((line) => `<li>${esc(line)}</li>`).join("")}</ul>` : ""}</div>` : ""}
+    ${caveats.length ? `<p class="meta" style="margin-top:6px">${caveats.map((line) => esc(line)).join(" ")}</p>` : ""}
+    ${shipment.comparison_error ? `<p class="meta" style="margin-top:6px">The comparison could not be computed: ${esc(shipment.comparison_error)}</p>` : ""}
+    <ul class="fields" style="margin-top:10px">
+      ${quotes.map((q) => {
+        const isThis = String(q.id) === String(currentQuotationId);
+        const gapCount = Array.isArray(q.gaps) ? q.gaps.length : 0;
+        return `<li>
+          <div class="row spread">
+            <div class="row tight"><strong>${esc(q.name || q.carrier || "Quotation")}</strong>${isThis ? chip("This email", "info") : ""}</div>
+            ${comparisonChip(q.comparison_status)}
+          </div>
+          <div class="meta">${esc(q.carrier || "unknown carrier")}${q.version ? " · v" + esc(q.version) : ""}</div>
+          <div class="field-pair" style="margin-top:6px">
+            <div><div class="k">Base price</div><div class="v">${show(q.base_price, "not stated")}${q.base_price && q.currency ? " " + esc(q.currency) : ""}</div></div>
+            <div><div class="k">Known total</div><div class="v">${show(q.total_known_cost, "cannot be totalled yet")}${q.total_known_cost && q.currency ? " " + esc(q.currency) : ""}</div></div>
+          </div>
+          <div class="row tight" style="margin-top:6px">
+            ${reviewChip(q.review_status)}
+            ${gapCount ? chip(plural(gapCount, "open point"), "warn") : chip("No open points", "ok")}
+            ${q.intake_item_id ? `<a class="btn small neutral" href="#/documents/${encodeURIComponent(q.intake_item_id)}">Open workspace</a>` : ""}
+          </div>
+        </li>`;
+      }).join("")}
+    </ul>
+    <div class="row tight" style="margin-top:12px">
+      <span class="meta">Download comparison:</span>
+      <a class="btn small neutral" href="${reportBase}?format=md" download>Markdown</a>
+      <a class="btn small neutral" href="${reportBase}?format=csv" download>CSV</a>
+      <a class="btn small neutral" href="${reportBase}?format=json" download>JSON</a>
+    </div>
+    <p class="evidence">Prices and the recommendation are computed deterministically on this computer; the agent never totals them. A charge with no stated price stays unknown.</p>
+  </section>`;
+}
+
 async function pageGmail(messageId) {
   skeleton("loading Gmail message…");
   let message;
@@ -836,51 +799,196 @@ async function pageGmail(messageId) {
     return fail(exc);
   }
 
+  let draft = null;
+  if (message.draft) {
+    try {
+      draft = await api.get("/api/supplier-email-drafts/" + encodeURIComponent(message.draft.id));
+    } catch (exc) {
+      draft = message.draft;
+    }
+  }
+
   const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  const analysis = message.analysis || null;
+  const quote = message.quotation || null;
+  const missing = analysis && Array.isArray(analysis.missing_fields) ? analysis.missing_fields : [];
+  const asked = analysis && Array.isArray(analysis.questions) ? analysis.questions : null;
+  const askable = asked || missing.filter((item) => item.ask_supplier !== false);
+  const internal = missing.filter((item) => item.ask_supplier === false);
+
+  let lane = null;
+  const laneQuotationId = message.quotation_id || (quote && quote.id) || null;
+  if (laneQuotationId) {
+    try {
+      const review = await api.get("/api/review");
+      lane = ((review && review.shipments) || []).find((s) =>
+        (s.quotes || []).some((q) => String(q.id) === String(laneQuotationId))) || null;
+    } catch (exc) {
+      lane = null;
+    }
+  }
+  const yesNo = (value) => (value === null || value === undefined ? null : value ? "yes" : "no");
+  const fact = (key, value) => `<li>
+      <div class="row spread"><strong>${esc(field(key))}</strong>${
+        value === null || value === undefined || value === ""
+          ? chip("Not stated", "pending") : chip("From this email", "ok")}</div>
+      <div>${show(value, "the supplier did not state this")}</div>
+    </li>`;
+
   view.innerHTML = `
     <div class="row spread">
       <div class="row tight"><a class="btn neutral small" href="#/inbox">Back to Operations Inbox</a></div>
       <div class="row tight" id="job-slot"></div>
     </div>
+
     <div class="split" style="margin-top:14px">
-      <section class="panel">
-        <span class="supplier-kicker">Gmail source</span>
-        <h3>${esc(message.subject || "No subject")}</h3>
-        <p class="meta">From ${esc(message.sender || "Unknown sender")}${message.sent_at ? " · " + esc(when(message.sent_at)) : ""}</p>
-        <div class="row tight" style="margin:12px 0">
-          ${message.intake_id ? `<a class="btn neutral" href="#/documents/${esc(message.intake_id)}">Open document workspace</a>` : ""}
-          <button class="btn" id="gmail-process-quotation">Process quotation</button>
-        </div>
-        <p class="meta">The email text and supported attachments are passed together to the quotation analysis workflow.</p>
-        <pre class="text" style="margin-top:8px">${esc(message.body_text || "No email body text")}</pre>
-      </section>
       <section class="list">
+        <section class="panel">
+          <div class="row spread">
+            <div><span class="supplier-kicker">Automatic processing</span><h3>${esc(quoteLabel(message))}</h3></div>
+            ${gmailStatusChip(message.processing_status)}
+          </div>
+          <div class="sub meta">${esc(clip(message.subject || "No subject", 90))}${message.sent_at ? " · " + esc(when(message.sent_at)) : ""}</div>
+          <p class="meta" style="margin-top:8px">${esc(gmailStatusSentence(message, analysis, draft))}</p>
+          ${message.processing_status === "reply_needs_linking" ? '<div class="meta" id="gmail-reply-link" style="margin-top:10px">looking for the quotation this answer belongs to…</div>' : ""}
+        </section>
+
+        ${quote ? `<section class="panel">
+          <div class="row spread">
+            <div><span class="supplier-kicker">What the agent understood</span><h3>${esc(quoteLabel(quote))}</h3></div>
+            ${reviewChip(quote.review_status)}
+          </div>
+          <div class="sub meta">Version ${esc(quote.version)}${quote.quote_reference ? " · quote " + esc(quote.quote_reference) : ""}</div>
+          <div class="field-pair">
+            <div><div class="k">Supplier</div><div class="v">${show(quote.supplier, "not matched yet")}</div></div>
+            <div><div class="k">Route</div><div class="v">${show(quote.origin || quote.destination
+              ? place(quote.origin) + " → " + place(quote.destination) : null, "route not stated")}</div></div>
+            <div><div class="k">Base price</div><div class="v">${show(moneyPair(quote.base_usd), "not stated")}</div></div>
+            <div><div class="k">Known total</div><div class="v">${show(moneyPair(quote.total_usd), "cannot be totalled yet")}</div></div>
+          </div>
+          <ul class="fields" style="margin-top:10px">
+            ${fact("origin", quote.origin ? place(quote.origin) : null)}
+            ${fact("destination", quote.destination ? place(quote.destination) : null)}
+            ${fact("transit_days", quote.transit_days_min === null || quote.transit_days_min === undefined
+              ? null : quote.transit_days_min + "–" + quote.transit_days_max + " days")}
+            ${fact("valid_until", quote.valid_until)}
+            ${fact("delivery_scope", quote.delivery_scope ? scope(quote.delivery_scope) : null)}
+            ${fact("insurance_included", yesNo(quote.insurance_included))}
+            ${fact("customs_included", yesNo(quote.customs_included))}
+            ${fact("currency", quote.currency)}
+          </ul>
+          <p class="evidence">Prices show the amount the supplier wrote, then the USD figure used for comparison. The original is kept for traceability.</p>
+        </section>` : `<section class="panel">
+          <span class="supplier-kicker">What the agent understood</span>
+          <h3>${message.job ? "Reading the offer now"
+            : message.classification === "SUPPLIER_QUOTATION_REPLY"
+              ? "This answer has not been merged into a quotation yet"
+              : "No quotation could be read from this email"}</h3>
+          <p class="meta">${message.job
+            ? "The facts, the supplier match and any open points appear here as soon as the background run finishes."
+            : message.classification === "SUPPLIER_QUOTATION_REPLY"
+              ? "The quotation this reply answers keeps its own version history; link the answer above and it becomes the next version."
+              : "The email was classified, but nothing in it became a comparable offer. The original text on the right shows why."}</p>
+        </section>`}
+
+        ${laneComparisonPanel(lane, laneQuotationId)}
+
+        ${analysis ? `<section class="panel">
+          <span class="supplier-kicker">Supplier record</span>
+          <div class="row spread"><h3>${esc(analysis.database_name || "No supplier record matched")}</h3>${actionStatusChip(analysis.status)}</div>
+          <p class="meta">${esc(clip(analysis.notes || "", 220))}</p>
+          <h4>${askable.length ? "Open points only the supplier can answer" : "Nothing the supplier has to answer"}</h4>
+          ${askable.length ? openPointList(askable, "ask")
+            : `<p class="meta">The offer already states the comparison details, so the supplier is not asked to repeat them.</p>`}
+          ${internal.length ? `<h4 style="margin-top:14px">Internal fields</h4>
+            <p class="meta">${internal.length} field(s) of our own supplier record are still empty. They are completed by our team, never asked of the supplier.</p>
+            ${openPointList(internal, "internal")}` : ""}
+        </section>` : ""}
+
+        <section class="panel">
+          <span class="supplier-kicker">Clarification email</span>
+          <h3>${draft ? clip(draft.subject || "Draft", 80) : askable.length ? "No question drafted yet" : "No question needed"}</h3>
+          ${draft ? `<p class="meta">Goes to ${esc(draft.recipient)} — the sender of this email, and to nobody else. Review the text, approve it, and send it yourself.</p>
+            <div class="supplier-action-group" style="margin-top:10px">${supplierDraftCard(draft)}</div>`
+            : `<p class="meta">${askable.length
+              ? "The background run will attach the draft here as soon as it is written."
+              : "The agent only writes to a supplier when a detail the comparison needs is genuinely missing."}</p>`}
+          ${message.intake_id ? `<div class="row tight" style="margin-top:12px"><a class="btn neutral small" href="#/documents/${esc(message.intake_id)}">Open document workspace</a></div>` : ""}
+        </section>
+      </section>
+
+      <section class="list">
+        <div class="panel">
+          <span class="supplier-kicker">Original email</span>
+          <h3>${esc(message.sender || "Unknown sender")}</h3>
+          <div class="sub meta">${esc(clip(message.subject || "No subject", 90))}${message.sent_at ? " · " + esc(when(message.sent_at)) : ""}</div>
+          <pre class="text" style="max-height:340px;margin-top:8px">${esc(message.body_text || "No email body text")}</pre>
+        </div>
         <div class="panel">
           <span class="supplier-kicker">Attachments</span>
           <h3>${attachments.length ? attachments.length + " attachment(s)" : "No attachments"}</h3>
-          ${attachments.length ? `<ul>${attachments.map((attachment) => `<li>${esc(attachment.filename)} <span class="meta">${esc(fileSize(attachment.size_bytes))}</span></li>`).join("")}</ul>` : '<p class="meta">The email body is stored as an intake quotation.</p>'}
+          ${attachments.length ? `<ul>${attachments.map((attachment) => `<li>${esc(attachment.filename)} <span class="meta">${esc(fileSize(attachment.size_bytes))}</span></li>`).join("")}</ul>`
+            : '<p class="meta">The agent read the email text itself as the quotation.</p>'}
         </div>
-        ${message.intake_id ? `<div class="panel"><span class="supplier-kicker">Quotation intake</span><h3>Quotation created</h3><p class="meta">Opening this message has created or found the linked intake document. “Process quotation” reads it as a freight quote; the supplier database match and the missing-field list are on the document workspace.</p></div>` : '<div class="empty">No quotation intake could be created from this message.</div>'}
       </section>
     </div>`;
 
-  const processButton = document.getElementById("gmail-process-quotation");
-  if (processButton) processButton.addEventListener("click", async () => {
-    processButton.disabled = true;
-    try {
-      const ensured = await api.post("/api/gmail/messages/" + encodeURIComponent(messageId) + "/ensure-quotation");
-      if (!ensured.intake_id) {
-        toast("This Gmail message is not classified as a quotation", "error");
-        processButton.disabled = false;
+  if (message.job) trackJob(message.job);
+  bindSupplierDraftActions(() => pageGmail(messageId));
+
+  if (message.queue || message.processing_status === "analyzing") {
+    const statusBefore = message.processing_status;
+    const wait = message.processing_status === "analyzing" ? 5000 : 8000;
+    const timer = setInterval(async () => {
+      if (document.hidden || location.hash !== "#/gmail/" + messageId) {
+        clearInterval(timer);
         return;
       }
-      const response = await api.post("/api/documents/" + encodeURIComponent(ensured.intake_id) + "/process?force=true");
-      trackJob(response.job);
-    } catch (exc) {
-      processButton.disabled = false;
-      toast(errorText(exc), "error");
+      let fresh;
+      try {
+        fresh = await api.get("/api/gmail/messages/" + encodeURIComponent(messageId));
+      } catch (exc) {
+        return;
+      }
+      if (fresh.processing_status !== statusBefore) {
+        clearInterval(timer);
+        pageGmail(messageId);
+      }
+    }, wait);
+  }
+
+  const linkHost = document.getElementById("gmail-reply-link");
+  if (linkHost) {
+    let review = null;
+    try { review = await api.get("/api/review"); } catch (exc) { review = null; }
+    const options = ((review && review.shipments) || []).flatMap((shipment) => (shipment.quotes || []).map((q) => ({
+      id: q.id,
+      name: q.name || (place(q.origin) + " → " + place(q.destination)),
+      version: q.version,
+    })));
+    if (!options.length) {
+      linkHost.innerHTML = "No stored quotation exists yet, so there is nothing to merge this answer into. The quotation it replies to must be read first.";
+    } else {
+      linkHost.innerHTML = `<div class="row tight">
+          <select class="supplier-select" id="gmail-reply-target" aria-label="Quotation this answer belongs to">${options.map((option) =>
+            `<option value="${esc(option.id)}">${esc(clip(option.name, 58))} · v${esc(option.version)}</option>`).join("")}</select>
+          <button class="btn small" id="gmail-reply-merge">Merge this answer</button>
+        </div>
+        <p class="meta" style="margin-top:6px">Only needed when the email does not name or thread the quotation: the answer is added as a new version, the gaps are recomputed and another question is drafted only if a point is still open.</p>`;
+      const merge = document.getElementById("gmail-reply-merge");
+      if (merge) merge.addEventListener("click", async () => {
+        merge.disabled = true;
+        try {
+          const response = await api.post(`/api/gmail/messages/${encodeURIComponent(messageId)}/process-reply`,
+            { quotation_id: document.getElementById("gmail-reply-target").value });
+          trackJob(response.job);
+        } catch (exc) {
+          merge.disabled = false;
+          toast(errorText(exc), "error");
+        }
+      });
     }
-  });
+  }
 }
 
 // ---------------------------------------------------------- review workspace
@@ -912,14 +1020,14 @@ async function pageReview(intakeId) {
   view.innerHTML = `
     <div class="row spread">
       <div class="row tight">
-        <a class="btn neutral small" href="#/documents">Back to documents</a>
-        <a class="btn neutral small" href="#/shipments">Review &amp; quotations</a>
+        <a class="btn neutral small" href="#/inbox">Back to Operations Inbox</a>
       </div>
       <div class="row tight" id="job-slot"></div>
     </div>
     <div class="split" style="margin-top:14px">
       <section class="panel">
-        <h3>${esc(fileName(doc.file))}</h3>
+        <h3>${esc(quoteLabel(doc))}</h3>
+        <div class="sub meta" style="margin:-6px 0 10px">${esc(fileName(doc.file))}</div>
         <div class="field-pair">
           <div><div class="k">Received</div><div class="v">${esc(when(doc.created_at))}</div></div>
           <div><div class="k">Size</div><div class="v">${esc(fileSize(doc.size_bytes))}</div></div>
@@ -949,7 +1057,7 @@ async function pageReview(intakeId) {
         }
         ${
           hasQuote
-            ? quotations.map((block) => quoteBlock(block, shipment)).join("")
+            ? quotations.map((block) => quoteBlock(block)).join("")
             : '<div class="empty">Nothing has been extracted from this document yet.</div>'
         }
       </section>
@@ -1037,10 +1145,10 @@ function supplierIntelligenceBlock(action, databases, intakeId) {
 
   return `<section class="panel supplier-intelligence">
     <div class="supplier-action-head">
-      <div><span class="supplier-kicker">Agent intelligence</span><h3>${esc(action.database_name || "Database not confirmed")}</h3></div>
+      <div><span class="supplier-kicker">Agent intelligence</span><h3>${esc(action.database_name || "No supplier record matched")}</h3></div>
       <span class="supplier-status ${action.status === "ready_for_approval" ? "ok" : action.status === "needs_clarification" || action.status === "needs_human_review" ? "warn" : "plain"}">${esc(statusLabels[action.status] || action.status)}</span>
     </div>
-    ${action.database_name ? `<p class="supplier-meta-text">Matched by database name, description, category, aliases and target schema metadata.</p>` : `<p class="supplier-meta-text">No unique database match was confirmed. Select a database and re-analyze.</p>`}
+    ${action.database_name ? `<p class="supplier-meta-text">Matched by database name, description, category, aliases and target schema metadata.</p>` : `<p class="supplier-meta-text">No supplier record matched uniquely. Pick the record and run the reading again.</p>`}
     ${routing.length ? `<details class="supplier-routing"><summary>Routing candidates</summary><ol>${unmatchedRouting || "<li>No candidate scored the quotation.</li>"}</ol></details>` : ""}
     <div class="supplier-field-table-wrap">
       <table class="supplier-field-table">
@@ -1117,7 +1225,7 @@ function shipmentCard(docShipment, fullShipment) {
   </section>`;
 }
 
-function quoteBlock(block, shipment) {
+function quoteBlock(block) {
   const q = block.quote;
   const gaps = block.gaps || [];
   const evidence = block.evidence || [];
@@ -1133,10 +1241,9 @@ function quoteBlock(block, shipment) {
       }</div>
       <div>${show(value)}</div>
     </li>`;
-  const carrier = q.carrier || "carrier not named";
   return `<section class="panel">
     <div class="row spread">
-      <h3>${esc(carrier)}${q.quote_reference ? " · " + esc(q.quote_reference) : ""} <span class="meta">version ${esc(q.version)}</span></h3>
+      <h3>${esc(quoteLabel(q))}${q.quote_reference ? " · " + esc(q.quote_reference) : ""} <span class="meta">version ${esc(q.version)}</span></h3>
       ${reviewChip(q.review_status)}
     </div>
     <div class="field-pair">
@@ -1183,33 +1290,19 @@ function quoteBlock(block, shipment) {
     </ul>
     ${
       evidence.length
-        ? `<h4>Evidence (${evidence.length})</h4><ul class="fields">
+        ? `<h4>Where each value came from (${evidence.length})</h4><ul class="fields">
       ${evidence
         .map(
           (e) => `
         <li>
           <div class="row spread">
             <strong>${esc(field(e.field_name))}</strong>
-            ${
-              e.validation_status === "needs_review"
-                ? chip("Not confirmed", "warn")
-                : e.validation_status === "rejected"
-                  ? chip("Sent back", "bad")
-                  : e.validation_status === "accepted"
-                    ? chip("Confirmed", "ok")
-                    : chip("New", "plain")
-            }
+            ${e.snippet ? "" : chip("No matching line in the document", "warn")}
           </div>
           <div>Read as: <strong>${esc(e.value_as_extracted)}</strong></div>
           <div class="evidence">${esc(fileName(e.source_filename))}${e.page_or_sheet ? " · " + esc(e.page_or_sheet) : ""}
             ${e.confidence !== null && e.confidence !== undefined ? " · " + esc(Math.round(e.confidence * 100)) + "% sure" : ""}
-            ${e.snippet ? " — <q>" + esc(e.snippet) + "</q>" : " — <em>no matching line found in the document</em>"}</div>
-          <div class="row tight" style="margin-top:6px">
-            <button class="btn small" data-act="evidence" data-id="${esc(e.id)}" data-accept="1"
-              data-quoted="${esc(field(e.field_name))}">Confirm this value</button>
-            <button class="btn small destructive" data-act="evidence" data-id="${esc(e.id)}" data-accept="0"
-              data-quoted="${esc(field(e.field_name))}">Flag for review</button>
-          </div>
+            ${e.snippet ? " — <q>" + esc(e.snippet) + "</q>" : ""}</div>
         </li>`,
         )
         .join("")}</ul>`
@@ -1260,7 +1353,6 @@ function quoteBlock(block, shipment) {
           ? `<p class="meta">Approved ${esc(when(q.reviewed_at))}. Importing is a separate, deliberate step.</p>`
           : ""
     }
-    ${shipment ? `<p style="margin-top:10px"><a class="btn small neutral" href="#/shipments/${esc(shipment.id)}">Open this lane and its comparison</a></p>` : ""}
   </section>`;
 }
 
@@ -1377,144 +1469,6 @@ async function analyzeQuotation(intakeId, databaseId, button) {
   }
 }
 
-// ---------------------------------------------------------------- quotations
-async function pageShipments() {
-  skeleton();
-  let review;
-  try {
-    review = await loadReview();
-  } catch (exc) {
-    return fail(exc);
-  }
-  const pendingDocuments = review.documents.filter((doc) =>
-    doc.processing !== "processed" || doc.classification === "pending" || doc.classification === "needs_review" || doc.processing === "needs_review" || doc.processing === "failed"
-  );
-  view.innerHTML = `<div class="row"><button class="btn neutral" data-act="reload">Refresh</button></div>
-    <h2>Review items</h2>
-    <div class="list" style="margin-top:8px">
-      ${pendingDocuments.length ? pendingDocuments.map((doc) => `
-        <div class="panel">
-          <div class="row spread"><strong>${esc(fileName(doc.file))}</strong><span class="row tight">${classificationChip(doc)} ${processingChip(doc)}</span></div>
-          <div class="meta">${esc(clip(doc.reason || "This document is waiting to be processed.", 180))}</div>
-          <div class="row tight" style="margin-top:8px">
-            <a class="btn small neutral" href="#/documents/${esc(doc.id)}">Open document</a>
-            <button class="btn small" data-act="process" data-id="${esc(doc.id)}" data-force="${doc.processing === "processed" ? "1" : "0"}">Process quotation</button>
-          </div>
-        </div>`).join("") : empty("No documents are waiting for review.")}
-    </div>
-    <h2 style="margin-top:18px">Quotation lanes</h2>
-    <div class="grid" style="margin-top:12px">
-      ${
-        review.shipments.length
-          ? review.shipments
-              .map(
-                (s) => `
-        <div class="panel">
-          <div class="row spread"><h3>${esc(s.route)}</h3>
-            ${s.status === "needs_review" ? chip("Needs approval", "warn") : chip("Lane approved", "ok")}</div>
-          <div class="meta">${esc(labelOf(s))} · ${esc(scope(s.required_delivery_scope))} · target ${esc(s.target_currency)}</div>
-          <div class="field-pair">
-            <div><div class="k">Quotes</div><div class="v">${esc(s.quotes.length)}</div></div>
-            <div><div class="k">Missing</div><div class="v">${esc(s.open_gaps)}</div></div>
-            <div><div class="k">Drafts</div><div class="v">${esc(s.drafts.length)}</div></div>
-          </div>
-          <ul class="fields">
-            ${s.quotes
-              .map(
-                (
-                  q,
-                ) => `<li><strong>${esc(q.carrier)}</strong> ${reviewChip(q.review_status)}
-              <div class="evidence">${esc(q.base_price === null ? "no base price stated" : q.base_price + " " + (q.currency || ""))}
-                · known total ${esc(q.total_known_cost === null ? "not available" : q.total_known_cost)}
-                · ${plural(q.gaps.length, "missing item")}
-                · <a href="#/documents/${esc(q.intake_item_id)}">source document</a></div></li>`,
-              )
-              .join("")}
-          </ul>
-          <div class="row tight">
-            <a class="btn small" href="#/shipments/${esc(s.id)}">Open</a>
-          </div>
-        </div>`,
-              )
-              .join("")
-          : empty(
-              "No lanes yet — reading a quotation creates or matches one automatically.",
-            )
-      }
-    </div>`;
-}
-
-async function pageShipment(id) {
-  skeleton();
-  try {
-    await loadReview();
-  } catch (exc) {
-    return fail(exc);
-  }
-  const shipment = findShipment(id);
-  if (!shipment)
-    return (view.innerHTML = empty("This lane is not in the database."));
-  view.innerHTML = `
-    <div class="row tight"><a class="btn neutral small" href="#/shipments">Back to review &amp; quotations</a></div>
-    <div class="panel" style="margin-top:12px">
-      <div class="row spread"><h3>${esc(shipment.route)}</h3>
-        ${shipment.status === "needs_review" ? chip("Needs approval", "warn") : chip("Lane approved", "ok")}</div>
-      <div class="field-pair">
-        <div><div class="k">Reference</div><div class="v">${esc(labelOf(shipment))}</div></div>
-        <div><div class="k">Cargo</div><div class="v">${show(shipment.cargo, "not stated")}</div></div>
-        <div><div class="k">Weight</div><div class="v">${show(shipment.weight_kg, "not stated")} <span class="v soft">kg</span></div></div>
-        <div><div class="k">Volume</div><div class="v">${show(shipment.volume_m3, "not stated")} <span class="v soft">m³</span></div></div>
-        <div><div class="k">Needed scope</div><div class="v">${esc(scope(shipment.required_delivery_scope))}</div></div>
-        <div><div class="k">Target currency</div><div class="v">${esc(shipment.target_currency)}</div></div>
-        <div><div class="k">Approved</div><div class="v">${show(when(shipment.approved_at), "not yet")}</div></div>
-      </div>
-      <p class="meta">Full addresses as stated: ${esc(clip(shipment.origin || "?", 120))} → ${esc(clip(shipment.destination || "?", 120))}</p>
-      <div class="row tight">
-        <a class="btn small neutral" href="/api/shipments/${esc(shipment.id)}/report?format=md" download>Download report (md)</a>
-        <a class="btn small neutral" href="/api/shipments/${esc(shipment.id)}/report?format=csv" download>CSV</a>
-        <a class="btn small neutral" href="/api/shipments/${esc(shipment.id)}/report?format=json" download>JSON</a>
-      </div>
-    </div>
-    <h2>Quotes (${shipment.quotes.length})</h2>
-    <div class="list">
-      ${shipment.quotes
-        .map(
-          (q) => `
-        <div class="panel">
-          <div class="row spread"><h3>${esc(q.carrier)}${q.quote_reference ? " · " + esc(q.quote_reference) : ""}
-            <span class="meta">version ${esc(q.version)}</span></h3>${reviewChip(q.review_status)}</div>
-          <div class="field-pair">
-            <div><div class="k">Base</div><div class="v">${show(q.base_price)} ${esc(q.currency || "")}</div></div>
-            <div><div class="k">Known total</div><div class="v">${show(q.total_known_cost, "not available")}</div></div>
-            <div><div class="k">Valid until</div><div class="v">${show(q.valid_until, "not stated")}</div></div>
-            <div><div class="k">Scope</div><div class="v">${q.delivery_scope ? esc(scope(q.delivery_scope)) : "not stated"}</div></div>
-          </div>
-          <p class="evidence">${plural(q.gaps.length, "missing item")} · ${plural(q.review_evidence.length, "value")} not confirmed ·
-            ${q.imported_at ? "in the database since " + esc(when(q.imported_at)) : "not imported yet"}</p>
-          ${q.review_notes ? `<div class="note">${esc(q.review_notes)}</div>` : ""}
-          <div class="row tight" style="margin-top:8px">
-            <a class="btn small" href="#/documents/${esc(q.intake_item_id)}">Open the document</a>
-            <button class="btn small subtle" data-act="review-import" data-id="${esc(q.id)}"
-              ${q.review_status !== "approved" ? "disabled" : ""}>Import to database</button>
-          </div>
-        </div>`,
-        )
-        .join("")}
-    </div>
-    ${shipment.drafts.length ? `<h2>Questions for the carrier</h2><div class="list">${shipment.drafts.map(draftCard).join("")}</div>` : ""}
-    ${
-      shipment.replies.length
-        ? `<h2>Carrier replies</h2><ul class="fields">${shipment.replies
-            .map(
-              (r) => `
-      <li>${esc(when(r.created_at))} <span class="meta">reply ${esc(r.association.replace("_", " "))} to this lane</span>
-        <button class="btn small neutral" data-act="reply-process" data-id="${esc(r.id)}">Apply this reply again</button></li>`,
-            )
-            .join("")}</ul>`
-        : ""
-    }`;
-}
-
 // --------------------------------------------------------------------- drafts
 async function pageDrafts() {
   view.className = "supplier-work";
@@ -1523,14 +1477,24 @@ async function pageDrafts() {
   let supplierDrafts = [];
   try { rows = await api.get("/api/drafts"); } catch (exc) { return fail(exc); }
   try { supplierDrafts = await api.get("/api/supplier-email-drafts"); } catch (exc) { supplierDrafts = []; }
+  const waiting = supplierDrafts.filter((draft) => draft.status !== "sent");
+  const sentAlready = supplierDrafts.filter((draft) => draft.status === "sent");
   view.innerHTML = `
     <div class="supplier-header">
-      <div><span class="supplier-kicker">Human review required</span><h2>Supplier draft review</h2></div>
+      <div>
+        <span class="supplier-kicker">Human review required</span>
+        <h2>Clarification drafts</h2>
+        <p class="supplier-meta-text">One card per quotation: the supplier it goes to, the email it answers, the offer as it stands now, the points still missing, and the question drafted for them.</p>
+      </div>
       <button class="supplier-btn supplier-btn-neutral" type="button" data-supplier-drafts-refresh>Refresh</button>
     </div>
-    <div class="supplier-action-group">
-      ${supplierDrafts.length ? supplierDrafts.map(supplierDraftCard).join("") : `<div class="supplier-empty"><span class="supplier-kicker">No Gmail drafts</span><h2>Nothing is waiting for email review</h2><p>Clarification drafts will appear here after supplier quotation analysis or mailbox processing.</p></div>`}
-    </div>
+    ${waiting.length ? `<div class="supplier-action-group">${waiting.map(supplierDraftCard).join("")}</div>`
+      : `<div class="supplier-empty"><span class="supplier-kicker">Nothing to review</span><h2>No email is waiting for approval</h2><p>A card appears here only when a supplier genuinely has information to add. Read quotations are handled in the background.</p></div>`}
+    ${sentAlready.length ? `<div class="supplier-header" style="margin-top:28px">
+        <div><span class="supplier-kicker">Waiting for the supplier</span><h2>Already sent</h2>
+        <p class="supplier-meta-text">Each reply is merged into its quotation and re-analysed automatically; a further question appears here only if a material point is still open.</p></div>
+      </div>
+      <div class="supplier-action-group" style="margin-top:12px">${sentAlready.map(supplierDraftCard).join("")}</div>` : ""}
     <div class="supplier-header" style="margin-top:28px">
       <div><span class="supplier-kicker">Existing local drafts</span><h2>Document clarification drafts</h2></div>
     </div>
@@ -1540,6 +1504,10 @@ async function pageDrafts() {
     </div>`;
 
   document.querySelectorAll("[data-supplier-drafts-refresh]").forEach((button) => button.addEventListener("click", pageDrafts));
+  bindSupplierDraftActions(pageDrafts);
+}
+
+function bindSupplierDraftActions(onRefresh) {
   document.querySelectorAll("[data-supplier-draft-save]").forEach((button) => button.addEventListener("click", async (event) => {
     const draftId = event.currentTarget.dataset.supplierDraftSave;
     const form = document.querySelector(`[data-supplier-draft-form="${CSS.escape(draftId)}"]`);
@@ -1547,11 +1515,11 @@ async function pageDrafts() {
     const payload = { recipient: form.elements.recipient.value, cc: form.elements.cc.value, subject: form.elements.subject.value, body: form.elements.body.value };
     try {
       const response = await fetch(`/api/supplier-email-drafts/${encodeURIComponent(draftId)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-      const result = await response.json(); if (!response.ok) throw new Error(result.error || "Could not save draft"); toast("Draft saved."); await pageDrafts();
-    } catch (error) { toast(error.message, true); }
+      const result = await response.json(); if (!response.ok) throw new Error(result.error || "Could not save draft"); toast("Draft saved."); await onRefresh();
+    } catch (error) { toast(errorText(error), "error"); }
   }));
   document.querySelectorAll("[data-supplier-draft-approve]").forEach((button) => button.addEventListener("click", async (event) => {
-    try { await api.post(`/api/supplier-email-drafts/${encodeURIComponent(event.currentTarget.dataset.supplierDraftApprove)}/approve`, {}); toast("Exact draft content locked for sending."); await pageDrafts(); } catch (error) { toast(error.message, true); }
+    try { await api.post(`/api/supplier-email-drafts/${encodeURIComponent(event.currentTarget.dataset.supplierDraftApprove)}/approve`, {}); toast("Exact draft content locked for sending."); await onRefresh(); } catch (error) { toast(errorText(error), "error"); }
   }));
   document.querySelectorAll("[data-supplier-draft-send]").forEach((button) => button.addEventListener("click", async (event) => {
     const draftId = event.currentTarget.dataset.supplierDraftSend;
@@ -1583,7 +1551,7 @@ async function pageDrafts() {
       toast(result.status === "sent"
         ? `Sent to ${result.recipient || draft.recipient}${result.idempotent ? " (already sent before)" : ""}.`
         : "Draft send resolved.", "ok");
-      await pageDrafts();
+      await onRefresh();
     } catch (error) {
       button.disabled = false;
       button.textContent = "Send email";
@@ -1596,8 +1564,27 @@ function supplierDraftCard(draft) {
   const locked = draft.status === "approved" || draft.status === "sent";
   const recipientFixed = locked || draft.recipient_locked;
   const statusLabel = SUPPLIER_DRAFT_STATUS[draft.status] || draft.status;
+  const quote = draft.quotation || null;
+  const missing = draft.missing_fields || [];
+  const facts = quote ? [
+    quote.origin || quote.destination ? place(quote.origin) + " → " + place(quote.destination) : null,
+    moneyPair(quote.total_usd) || moneyPair(quote.base_usd),
+    quote.transit_days_min === null || quote.transit_days_min === undefined
+      ? null : quote.transit_days_min + "–" + quote.transit_days_max + " days",
+    quote.valid_until ? "valid until " + quote.valid_until : null,
+  ].filter(Boolean) : [];
   return `<article class="supplier-action-card supplier-action-card-draft">
-    <div class="supplier-action-head"><div><span class="supplier-kicker">Gmail draft</span><h3>${esc(draft.subject || "Untitled")}</h3></div><span class="supplier-status">${esc(statusLabel)}</span></div>
+    <div class="supplier-action-head">
+      <div>
+        <span class="supplier-kicker">${draft.supplier ? "Question for " + esc(draft.supplier) : "Clarification draft"}</span>
+        <h3>${esc(quoteLabel(draft))}</h3>
+        ${draft.email_subject ? `<p class="supplier-meta-text">Answers the email “${esc(clip(draft.email_subject, 70))}”${
+          draft.email_sent_at ? " · " + esc(when(draft.email_sent_at)) : ""}</p>` : ""}
+      </div>
+      <span class="supplier-status">${esc(statusLabel)}</span>
+    </div>
+    ${facts.length ? `<p class="supplier-meta-text">${facts.map(esc).join(" · ")}</p>` : ""}
+    ${missing.length ? `<div class="supplier-draft-missing"><span class="supplier-kicker">Only these points are asked</span>${openPointList(missing, "ask")}</div>` : ""}
     <form class="supplier-form" data-supplier-draft-form="${esc(draft.id)}">
       <label>Recipient<input name="recipient" value="${esc(draft.recipient)}" ${recipientFixed ? "readonly" : ""}></label>
       ${draft.recipient_locked ? `<p class="supplier-meta-text">Fixed to the sender of the received quotation email.</p>` : ""}
@@ -1608,6 +1595,8 @@ function supplierDraftCard(draft) {
         ${draft.status === "draft" ? `<button type="button" class="supplier-btn supplier-btn-neutral" data-supplier-draft-save="${esc(draft.id)}">Save changes</button><button type="button" class="supplier-btn supplier-btn-primary" data-supplier-draft-approve="${esc(draft.id)}">Approve exact content</button>` : ""}
         ${draft.status === "approved" ? `<button type="button" class="supplier-btn supplier-btn-primary" data-supplier-draft-send="${esc(draft.id)}">Send email</button>` : ""}
         ${draft.status === "sent" ? `<span class="supplier-meta-text">Sent: ${esc(draft.sent_message_id || "confirmed")}</span>` : ""}
+        ${draft.message_id ? `<a class="supplier-btn supplier-btn-neutral" href="#/gmail/${encodeURIComponent(draft.message_id)}">Open the original email</a>` : ""}
+        ${draft.intake_id ? `<a class="supplier-btn supplier-btn-neutral" href="#/documents/${encodeURIComponent(draft.intake_id)}">Open document</a>` : ""}
       </div>
     </form>
   </article>`;
@@ -1615,7 +1604,7 @@ function supplierDraftCard(draft) {
 
 function draftCard(d) {
   return `<div class="panel">
-    <div class="row spread"><strong>${esc(d.subject)}</strong>
+    <div class="row spread"><strong>${esc(quoteLabel(d))}</strong>
       ${
         d.status === "draft"
           ? chip("Awaiting your approval", "pending")
@@ -1626,6 +1615,7 @@ function draftCard(d) {
               : chip(String(d.status).replace("_", " "), "plain")
       }</div>
     <div class="meta">${esc(d.shipment_reference || "")}${d.recipient ? " · to " + esc(d.recipient) : ""}</div>
+    <div class="sub meta">${esc(clip(d.subject, 90))}</div>
     <pre class="text" style="max-height:240px;margin-top:8px">${esc(d.body)}</pre>
     <div class="row tight" style="margin-top:10px">
       <input type="text" id="rec-${esc(d.id)}" placeholder="carrier@example.com (only needed for .eml)"
@@ -1642,80 +1632,25 @@ async function pageInbox() {
   view.className = "supplier-work";
   skeleton("loading Operations Inbox…");
 
-  const [status, messages, documents, supplierQuotations] = await Promise.all([
+  const [status, messages, supplierQuotations] = await Promise.all([
     api.get("/api/gmail/status").catch(() => ({ configured: false, accounts: [], automatic_status: "stopped" })),
     api.get("/api/gmail/inbox").catch(() => []),
-    api.get("/api/documents").catch(() => []),
     api.get("/api/supplier-quotations").catch(() => ({ received: [], actions: [] })),
   ]);
 
   const actions = supplierQuotations.actions || [];
-  const actionByIntake = new Map(actions.map((action) => [action.intake_id, action]));
   const connected = status.accounts && status.accounts.some((account) => account.status === "connected");
 
-  function operationsStatus(documentRow, action, message) {
-    if (documentRow && documentRow.classification === "irrelevant") return ["Rejected", "bad"];
-    if (action) {
-      const labels = {
-        received: ["Ready to Process", "info"], needs_human_review: ["Missing Info — Needs Review", "warn"],
-        needs_clarification: ["Missing Info — Needs Review", "warn"], ready_for_approval: ["Ready to Create Record", "ok"],
-        record_created: ["Completed", "ok"], rejected: ["Rejected", "bad"],
-      };
-      return labels[action.status] || [String(action.status).replaceAll("_", " "), "plain"];
-    }
-    if (message) {
-      const labels = {
-        supplier_reply_pending: ["Reply Awaiting Review", "warn"],
-        awaiting_supplier_review: ["Ready to Process", "info"],
-        draft_ready: ["Draft waiting for you", "warn"],
-        needs_clarification: ["Missing Info — Needs Review", "warn"],
-        needs_database: ["Pick a supplier database", "warn"],
-        needs_human_review: ["Missing Info — Needs Review", "warn"],
-        ready_for_approval: ["Ready to Create Record", "ok"],
-        extraction_failed: ["Extraction stopped — needs review", "bad"],
-        processed: ["Completed", "ok"],
-      };
-      return labels[message.processing_status] || ["Ready to Process", "info"];
-    }
-    if (documentRow) {
-      if (documentRow.processing === "processing") return ["Processing", "info"];
-      if (documentRow.processing === "failed" || documentRow.classification === "failed") return ["Missing Info — Needs Review", "warn"];
-      if (documentRow.classification === "needs_review") return ["Missing Info — Needs Review", "warn"];
-      if (documentRow.processing === "pending") return ["Ready to Process", "info"];
-      return ["Ready to Process", "info"];
-    }
-    return ["Ready to Process", "info"];
-  }
-
-  const documentItems = documents.map((row) => {
-    const action = actionByIntake.get(row.id);
-    const [statusLabel, statusKind] = operationsStatus(row, action, null);
-    return {
-      key: "document-" + row.id,
-      channel: "Document",
-      title: row.file,
-      meta: `${fileSize(row.size_bytes)} · ${when(row.created_at)}`,
-      statusLabel, statusKind,
-      databaseName: action && action.database_name,
-      detailHref: `#/documents/${encodeURIComponent(row.id)}`,
-      actionLabel: action ? (action.status === "ready_for_approval" ? "Review record" : "Open workspace") : "Open workspace",
-      processable: false,
-      timestamp: row.created_at || "",
-      intakeId: row.id,
-      action,
-    };
-  });
-
   const emailItems = messages.map((message) => {
-    const [statusLabel, statusKind] = operationsStatus(null, null, message);
+    const [statusLabel, statusKind] = gmailStatusTuple(message.processing_status);
     const attachmentNames = message.attachment_names || [];
     const linkedAction = actions.find((action) => action.file && attachmentNames.includes(action.file));
     const attachment = attachmentNames.length ? attachmentNames.join(", ") : "Email body only";
     return {
       key: "email-" + message.id,
       channel: "Email",
-      title: message.subject || "No subject",
-      meta: `${message.sender || "Unknown sender"} · ${when(message.created_at)} · ${attachment}`,
+      title: clip(message.name || message.subject || "No subject", 64),
+      meta: `${message.sender || "Unknown sender"} · ${when(message.sent_at || message.created_at)} · ${attachment}`,
       statusLabel, statusKind,
       databaseName: linkedAction && linkedAction.database_name,
       detailHref: `#/gmail/${encodeURIComponent(message.id)}`,
@@ -1723,41 +1658,39 @@ async function pageInbox() {
       processable: false,
       timestamp: message.created_at || "",
       action: linkedAction || null,
+      mailId: message.id,
+      state: message.processing_status,
     };
   });
 
-  const items = [...documentItems, ...emailItems].sort((a, b) => String(b.meta).localeCompare(String(a.meta)));
+  const items = emailItems.sort((a, b) => String(b.meta).localeCompare(String(a.meta)));
   const waitingCount = items.filter((item) => item.statusKind === "warn" || item.statusKind === "info").length;
   const readyCount = items.filter((item) => item.statusLabel === "Ready to Create Record").length;
 
+  const queue = status.queue || null;
+  const readingNow = queue && (queue.reading || 0) > 0;
+
   view.innerHTML = `
     <div class="supplier-header operations-header">
-      <div><span class="supplier-kicker">Unified intake</span><h2>Operations Inbox</h2><p class="supplier-meta-text">Email and document quotations in one human-review workflow.</p></div>
+      <div><span class="supplier-kicker">Unified intake</span><h2>Operations Inbox</h2><p class="supplier-meta-text">Quotation emails in one human-review workflow.</p></div>
       <div class="supplier-card-actions">
-        <button class="supplier-btn supplier-btn-neutral" id="gmail-sync" ${connected ? "" : "disabled"}>Sync Gmail</button>
-        <button class="supplier-btn supplier-btn-primary" id="operations-import">Import quotation</button>
+        ${connected ? '<button class="supplier-btn supplier-btn-neutral" id="gmail-sync">Sync Gmail</button>'
+          : status.stored_authorisation ? '<button class="supplier-btn supplier-btn-primary" id="gmail-reconnect">Reconnect Gmail</button>'
+            : '<button class="supplier-btn supplier-btn-primary" id="gmail-connect">Connect Gmail</button>'}
       </div>
-    </div>
-
-    <div class="operations-import" id="operations-import-panel" hidden>
-      <div class="operations-import-head"><strong>Import quotation documents</strong><span>Stored and parsed locally</span></div>
-      <div class="drop" id="operations-drop" tabindex="0">
-        <div class="title">Drop quotation files here</div>
-        <div class="meta">PDF, DOCX, XLSX, text, email, supported images and CSV</div>
-        <div class="row" style="justify-content:center;margin-top:12px">
-          <input type="file" id="operations-picker" multiple aria-label="Choose quotation files">
-          <button class="supplier-btn supplier-btn-primary" id="operations-upload" disabled>Upload</button>
-        </div>
-      </div>
-      <div id="operations-upload-result"></div>
     </div>
 
     <div class="operations-summary">
       <div><span>${items.length}</span><small>All items</small></div>
       <div><span>${waitingCount}</span><small>Needs attention</small></div>
       <div><span>${readyCount}</span><small>Ready to create</small></div>
+      <div><span>${queue ? queue.queued : 0}</span><small>Waiting to be read</small></div>
       <div><span>${connected ? "Connected" : "Disconnected"}</span><small>Gmail</small></div>
     </div>
+
+    ${queue && (queue.queued || queue.reading) ? `<p class="meta" style="margin:0 0 12px">${
+      readingNow ? "The background reader is on one email; the local model handles them one at a time, oldest first."
+        : `${plural(queue.queued, "email")} queued. The reader starts on the oldest without any button.`}</p>` : ""}
 
     <div class="supplier-action-group">
       <div class="supplier-group-head">
@@ -1766,14 +1699,10 @@ async function pageInbox() {
       </div>
       <div class="operations-filters">
         <input type="search" id="operations-search" placeholder="Search source, sender or status" aria-label="Search Operations Inbox">
-        <select id="operations-filter" aria-label="Filter Operations Inbox">
-          <option value="">All channels</option>
-          <option value="Document">Documents</option>
-          <option value="Email">Email</option>
-        </select>
       </div>
       <div id="operations-feed">${items.length ? items.map((item) => `
-        <article class="operations-feed-item" data-channel="${esc(item.channel)}" data-search="${esc(item.title + " " + item.meta + " " + item.statusLabel)}">
+        <article class="operations-feed-item" data-channel="${esc(item.channel)}" data-search="${esc(item.title + " " + item.meta + " " + item.statusLabel)}"${
+          item.mailId ? ` data-mail-id="${esc(item.mailId)}" data-state="${esc(item.state)}"` : ""}>
           <div class="operations-feed-main">
             <span class="supplier-kicker">${esc(item.channel)}</span>
             <h3>${esc(fileName(item.title))}</h3>
@@ -1784,11 +1713,12 @@ async function pageInbox() {
             <span class="supplier-status ${esc(item.statusKind)}">${esc(item.statusLabel)}</span>
             ${item.detailHref !== "#/inbox" ? `<a class="supplier-btn supplier-btn-neutral" href="${item.detailHref}">${esc(item.actionLabel)}</a>` : `<button class="supplier-btn supplier-btn-neutral" disabled>${esc(item.actionLabel)}</button>`}
           </div>
-        </article>`).join("") : `<div class="supplier-coming"><h2>No quotations yet</h2><p>Import a document or sync Gmail to add the first item to Operations Inbox.</p></div>`}
+        </article>`).join("") : `<div class="supplier-coming"><h2>No quotations yet</h2><p>Sync Gmail to add the first quotation email to Operations Inbox.</p></div>`}
       </div>
     </div>`;
 
-  document.getElementById("gmail-sync").addEventListener("click", async (event) => {
+  const syncButton = document.getElementById("gmail-sync");
+  if (syncButton) syncButton.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     button.disabled = true;
     button.textContent = "Reading mailbox…";
@@ -1805,55 +1735,62 @@ async function pageInbox() {
     }
   });
 
-  document.getElementById("operations-import").addEventListener("click", () => {
-    const panel = document.getElementById("operations-import-panel");
-    panel.hidden = !panel.hidden;
-    if (!panel.hidden) document.getElementById("operations-picker").focus();
+  const reconnectButton = document.getElementById("gmail-reconnect");
+  if (reconnectButton) reconnectButton.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Reconnecting…";
+    try {
+      const result = await api.post("/api/gmail/reconnect", {});
+      toast(`Gmail connected again as ${result.email}.`, "ok");
+      await pageInbox();
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Reconnect Gmail";
+      toast(errorText(error), "bad");
+    }
   });
 
-  const picker = document.getElementById("operations-picker");
-  const uploadButton = document.getElementById("operations-upload");
-  const drop = document.getElementById("operations-drop");
-  let staged = [];
-  const stageFiles = (files) => {
-    staged = staged.concat(Array.from(files));
-    uploadButton.disabled = staged.length === 0;
-    uploadButton.textContent = staged.length ? `Upload ${staged.length} file(s)` : "Upload";
-  };
-  picker.addEventListener("change", () => stageFiles(picker.files));
-  ["dragenter", "dragover"].forEach((eventName) => drop.addEventListener(eventName, (event) => { event.preventDefault(); drop.classList.add("over"); }));
-  ["dragleave", "dragend"].forEach((eventName) => drop.addEventListener(eventName, () => drop.classList.remove("over")));
-  drop.addEventListener("drop", (event) => {
-    event.preventDefault();
-    drop.classList.remove("over");
-    if (event.dataTransfer && event.dataTransfer.files.length) stageFiles(event.dataTransfer.files);
-  });
-  uploadButton.addEventListener("click", async () => {
-    if (!staged.length) return;
-    uploadButton.disabled = true;
-    uploadButton.textContent = "Uploading…";
+  const connectButton = document.getElementById("gmail-connect");
+  if (connectButton) connectButton.addEventListener("click", async () => {
     try {
-      const result = await api.upload(staged, "error");
-      const rejected = result.results.filter((entry) => entry.status === "rejected");
-      document.getElementById("operations-upload-result").innerHTML = result.results.map((entry) => `<p class="supplier-meta-text"><strong>${esc(fileName(entry.file))}</strong>: ${esc(entry.status)}${entry.error ? " — " + esc(entry.error) : ""}</p>`).join("");
-      toast(rejected.length ? `${rejected.length} file(s) rejected.` : "Quotation files imported.", rejected.length ? "bad" : "ok");
-      staged = [];
-      picker.value = "";
-      await pageInbox();
-    } catch (error) { uploadButton.disabled = false; uploadButton.textContent = "Upload"; toast(error.message, "bad"); }
+      const result = await api.post("/api/gmail/authorize", {});
+      window.location.href = result.authorization_url;
+    } catch (error) {
+      toast(errorText(error), "bad");
+    }
   });
 
   const applyFeedFilters = () => {
     const needle = document.getElementById("operations-search").value.trim().toLowerCase();
-    const channel = document.getElementById("operations-filter").value;
     document.querySelectorAll(".operations-feed-item").forEach((card) => {
-      const matchesChannel = !channel || card.dataset.channel === channel;
-      const matchesSearch = !needle || card.dataset.search.toLowerCase().includes(needle);
-      card.hidden = !(matchesChannel && matchesSearch);
+      card.hidden = !(!needle || card.dataset.search.toLowerCase().includes(needle));
     });
   };
   document.getElementById("operations-search").addEventListener("input", applyFeedFilters);
-  document.getElementById("operations-filter").addEventListener("change", applyFeedFilters);
+
+  if (queue && (queue.queued || queue.reading)) {
+    const refresh = setInterval(async () => {
+      if (document.hidden || location.hash !== "#/inbox") {
+        clearInterval(refresh);
+        return;
+      }
+      let freshMail, freshStatus;
+      try {
+        freshStatus = await api.get("/api/gmail/status");
+        freshMail = await api.get("/api/gmail/inbox");
+      } catch (exc) {
+        return;
+      }
+      const byId = new Map(freshMail.map((mail) => [mail.id, mail.processing_status]));
+      const changed = document.querySelectorAll(".operations-feed-item[data-mail-id]")
+        .some((card) => byId.get(card.dataset.mailId) !== card.dataset.state);
+      if (changed || ((freshStatus.queue || {}).queued || 0) !== queue.queued) {
+        clearInterval(refresh);
+        pageInbox();
+      }
+    }, 6000);
+  }
 }
 
 // ------------------------------------------------ supplier operations
@@ -2050,7 +1987,7 @@ async function pageSupplierQuotations() {
   const options = databases.map((database) => `<option value="${esc(database.id)}">${esc(database.name)}</option>`).join("");
   const receivedCards = payload.received.map((item) => `
     <article class="supplier-action-card">
-      <div class="supplier-action-head"><div><span class="supplier-kicker">Received quotation</span><h3>${esc(fileName(item.file))}</h3></div><span class="supplier-status">Received</span></div>
+      <div class="supplier-action-head"><div><span class="supplier-kicker">Received quotation</span><h3>${esc(quoteLabel(item))}</h3></div><span class="supplier-status">Received</span></div>
       <p class="supplier-meta-text">Waiting for database routing and schema analysis.</p>
       <div class="supplier-card-actions"><select class="supplier-select" data-database-for="${esc(item.intake_id)}"><option value="">Auto-route</option>${options}</select><button class="supplier-btn supplier-btn-primary" data-process-supplier="${esc(item.intake_id)}">Analyze quotation</button></div>
     </article>`).join("");
@@ -2078,7 +2015,7 @@ function supplierActionCard(action, showOpen) {
   const missing = action.missing_fields.map((item) => `<li>${esc(item.label || item.field)} — ${esc(item.reason)}</li>`).join("");
   const rowEntries = Object.entries(action.proposed_row).map(([key, value]) => `<div><dt>${esc(field(key))}</dt><dd>${esc(value)}</dd></div>`).join("");
   return `<article class="supplier-action-card">
-    <div class="supplier-action-head"><div><span class="supplier-kicker">${esc(action.database_name || "Database not confirmed")}</span><h3>${esc(fileName(action.file) || "Quotation")}</h3></div><span class="supplier-status">${esc(statusLabels[action.status] || action.status)}</span></div>
+    <div class="supplier-action-head"><div><span class="supplier-kicker">${esc(action.database_name || "No supplier record matched")}</span><h3>${esc(quoteLabel(action))}</h3></div><span class="supplier-status">${esc(statusLabels[action.status] || action.status)}</span></div>
     <p>${esc(action.notes || "")}</p>
     ${missing ? `<div class="supplier-missing"><strong>Missing fields</strong><ul>${missing}</ul></div>` : ""}
     ${rowEntries ? `<dl class="supplier-meta supplier-row-preview">${rowEntries}</dl>` : ""}
@@ -2136,24 +2073,20 @@ async function pageSupplierAgent() {
   const history = await api.get("/api/supplier-agent/history?limit=30").catch(() => []);
   const databases = await api.get("/api/supplier-databases").catch(() => []);
   view.innerHTML = `
-    <div class="supplier-header"><div><span class="supplier-kicker">Read-only database assistant</span><h2>Supplier Agent</h2></div>
+    <div class="supplier-header"><div><span class="supplier-kicker">Read-only quotation assistant</span><h2>Supplier Agent</h2>
+      <p class="supplier-meta-text">Ask which quotation wins on price, speed or validity. It reads the quotations and supplier records you already have — it never sends anything.</p></div>
       <select class="supplier-select" id="supplier-chat-database"><option value="">All connected databases</option>${databases.map((database) => `<option value="${esc(database.id)}">${esc(database.name)}</option>`).join("")}</select>
     </div>
     <div class="supplier-chat">
       <div id="supplier-chat-messages" class="supplier-chat-messages">${history.map((item) => supplierChatBubble(item.question, item.answer, item.citations)).join("")}</div>
-      <form id="supplier-chat-form" class="supplier-chat-form"><input id="supplier-chat-input" aria-label="Ask the supplier database agent" placeholder="Ask about suppliers, prices, dates, or units…" autocomplete="off"><button class="supplier-btn supplier-btn-primary" type="submit">Ask</button></form>
+      <div class="supplier-chat-prompts">${CHAT_PROMPTS.map((prompt) => `<button class="supplier-btn supplier-btn-neutral" type="button" data-chat-prompt="${esc(prompt)}">${esc(prompt)}</button>`).join("")}</div>
+      <form id="supplier-chat-form" class="supplier-chat-form"><input id="supplier-chat-input" aria-label="Ask the supplier database agent" placeholder="Which quotation is the best option?" autocomplete="off"><button class="supplier-btn supplier-btn-primary" type="submit">Ask</button></form>
     </div>`;
   const messages = document.getElementById("supplier-chat-messages");
-  document.getElementById("supplier-chat-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const input = document.getElementById("supplier-chat-input");
-    const question = input.value.trim();
-    if (!question) return;
-    input.value = "";
+  const ask = async (question, databaseId) => {
     messages.insertAdjacentHTML("beforeend", `<div class="supplier-chat-bubble user">${esc(question)}</div><div class="supplier-chat-bubble agent">Thinking…</div>`);
     messages.scrollTop = messages.scrollHeight;
     try {
-      const databaseId = document.getElementById("supplier-chat-database").value;
       const result = await api.post("/api/supplier-agent/chat", {question, database_id: databaseId || null});
       messages.lastElementChild.remove();
       messages.insertAdjacentHTML("beforeend", supplierChatBubble(result.question, result.answer, result.citations));
@@ -2161,11 +2094,35 @@ async function pageSupplierAgent() {
     } catch (error) {
       messages.lastElementChild.textContent = error.message;
     }
+  };
+  document.getElementById("supplier-chat-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = document.getElementById("supplier-chat-input");
+    const question = input.value.trim();
+    if (!question) return;
+    input.value = "";
+    ask(question, document.getElementById("supplier-chat-database").value);
   });
+  view.querySelectorAll("[data-chat-prompt]").forEach((button) => button.addEventListener("click", () =>
+    ask(button.dataset.chatPrompt, document.getElementById("supplier-chat-database").value)));
+}
+
+const CHAT_PROMPTS = [
+  "Which quotation is the best option?",
+  "Which supplier offers the lowest price?",
+  "Which supplier offers the fastest delivery?",
+  "Which quotation has the longest validity period?",
+];
+
+function citationLine(citation) {
+  if (citation.kind === "quotation") {
+    return `<li><strong>${esc(citation.name)}</strong> — ${esc(citation.reason)}</li>`;
+  }
+  return `<li><strong>${esc(citation.database_name)}</strong> — CSV row ${esc(citation.csv_row)}: ${esc(citation.reason)}</li>`;
 }
 
 function supplierChatBubble(question, answer, citations) {
-  const sources = (citations || []).slice(0, 5).map((citation) => `<li><strong>${esc(citation.database_name)}</strong> — CSV row ${esc(citation.csv_row)}</li>`).join("");
+  const sources = (citations || []).slice(0, 5).map(citationLine).join("");
   return `<div class="supplier-chat-bubble user">${esc(question)}</div><div class="supplier-chat-bubble agent"><p>${esc(answer)}</p>${sources ? `<div class="supplier-citations"><span>Sources</span><ul>${sources}</ul></div>` : ""}</div>`;
 }
 
@@ -2255,7 +2212,7 @@ const ACTIONS = {
   "clear-quotation-data": async (button) => {
     const confirmed = await confirmDialog({
       title: "Clear all quotation data?",
-      body: "<p>This removes uploaded and Gmail documents, extracted quotations, review records, drafts, and stored workspace copies. Supplier database connections and source CSV files are preserved.</p>",
+      body: "<p>This removes uploaded and Gmail documents, extracted quotations, review records, drafts, and stored workspace copies. Your Gmail account stays connected and keeps receiving new mail — only what has already been read is cleared. Supplier database connections and source CSV files are preserved.</p>",
       confirmLabel: "Clear quotation data",
       danger: true,
     });
@@ -2286,31 +2243,6 @@ const ACTIONS = {
         );
         location.hash = "#/documents/" + button.dataset.id;
       }
-    }),
-
-  skip: async (button) => {
-    button.textContent = "Keeping the existing copy";
-    button.disabled = true;
-  },
-
-  ignore: async (button) =>
-    busy("ignore-" + button.dataset.id, async () => {
-      const reason = await askReason({
-        title: "Mark this document as not a quote?",
-        body: `<p><strong>${esc(fileName(button.dataset.file))}</strong> will stay in the database with your note,
-             so the decision is traceable. Nothing is deleted.</p>`,
-        label: "Why is this not a freight quote?",
-        placeholder: "e.g. carrier newsletter, no prices offered",
-        confirmLabel: "Mark as not a quote",
-        danger: true,
-      });
-      if (!reason) return;
-      const r = await api.action("intake.ignore", {
-        id: button.dataset.id,
-        reason,
-      });
-      toast(r.message, "ok");
-      await route();
     }),
 
   "shipment-save": async (button) =>
@@ -2384,20 +2316,6 @@ const ACTIONS = {
         reason,
       });
       toast(r.message, "ok");
-      await route();
-    }),
-
-  evidence: async (button) =>
-    busy("evidence-" + button.dataset.id, async () => {
-      const accept = button.dataset.accept === "1";
-      const r = await api.post(
-        `/api/evidence/${encodeURIComponent(button.dataset.id)}/decide`,
-        { accept },
-      );
-      toast(
-        `${button.dataset.quoted}: ${r.validation_status === "accepted" ? "confirmed" : "flagged for review"}`,
-        "ok",
-      );
       await route();
     }),
 
@@ -2500,12 +2418,6 @@ const ACTIONS = {
       toast("Saved on this computer — nothing was sent", "ok");
     }),
 
-  "reply-process": async (button) =>
-    busy("reply-" + button.dataset.id, async () => {
-      const r = await api.action("reply.process", { id: button.dataset.id });
-      toast(r.message, "ok");
-      await route();
-    }),
 };
 
 document.addEventListener("click", (event) => {

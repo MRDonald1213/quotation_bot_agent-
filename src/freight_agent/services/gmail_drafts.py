@@ -61,10 +61,93 @@ def _address(value: str | None) -> str:
     return (address or "").strip().lower()
 
 
+def _draft_context(session, settings: Settings, drafts: list[SupplierEmailDraftRow]) -> dict[str, dict]:
+    """A draft is reviewed beside the quotation it answers: the human title, the supplier record it
+    matched, the email it came from, the offer as it now stands, and the points still open. The page
+    must not have to chase those links itself."""
+    from ..db.models import (IntakeItemRow, QuotationRow, SupplierDatabaseRow,
+                             SupplierQuotationActionRow)
+    from .gmail_sync import _message_quotation_view
+    from .quotation_naming import name_for_intake
+
+    empty = {"name": None, "intake_id": None, "message_id": None, "supplier": None,
+             "email_subject": None, "email_sent_at": None, "quotation": None, "missing_fields": []}
+    action_ids = {d.supplier_action_id for d in drafts if d.supplier_action_id}
+    if not action_ids:
+        return {d.id: {**empty, "name": d.subject} for d in drafts}
+    actions = {row.id: row for row in
+               session.query(SupplierQuotationActionRow).filter(
+                   SupplierQuotationActionRow.id.in_(action_ids)).all()}
+    intake_ids = {a.intake_id for a in actions.values() if a.intake_id}
+    intakes = {row.id: row for row in session.query(IntakeItemRow).filter(
+        IntakeItemRow.id.in_(intake_ids)).all()} if intake_ids else {}
+    message_ids = {i.gmail_message_id for i in intakes.values() if i.gmail_message_id}
+    from ..db.models import GmailMessageRow
+    messages = {row.id: row for row in session.query(GmailMessageRow).filter(
+        GmailMessageRow.id.in_(message_ids)).all()} if message_ids else {}
+    database_ids = {a.database_id for a in actions.values() if a.database_id}
+    databases = {row.id: row for row in session.query(SupplierDatabaseRow).filter(
+        SupplierDatabaseRow.id.in_(database_ids)).all()} if database_ids else {}
+    quotes: dict[str, object] = {}
+    if intake_ids:
+        for quote in session.query(QuotationRow).filter(QuotationRow.intake_item_id.in_(intake_ids)).all():
+            best = quotes.get(quote.intake_item_id)
+            if best is None or int(quote.version or 0) >= int(best.version or 0):
+                quotes[quote.intake_item_id] = quote
+
+    context: dict[str, dict] = {}
+    for draft in drafts:
+        action = actions.get(draft.supplier_action_id or "")
+        if action is None:
+            context[draft.id] = {**empty, "name": draft.subject}
+            continue
+        intake = intakes.get(action.intake_id)
+        message = messages.get(intake.gmail_message_id) if intake and intake.gmail_message_id else None
+        database = databases.get(action.database_id) if action.database_id else None
+        quote = quotes.get(action.intake_id) if action.intake_id else None
+        offer = _message_quotation_view(session, settings, quote)
+        try:
+            missing = json.loads(action.missing_fields_json or "[]")
+        except (TypeError, ValueError):
+            missing = []
+        from .supplier_workflow import _open_questions
+        try:
+            questions = _open_questions(session, {"intake_id": action.intake_id, "missing_fields": missing})
+        except Exception:  # noqa: BLE001 — the card still shows the text when a re-read fails
+            questions = []
+        try:
+            proposed = json.loads(action.proposed_row_json or "{}")
+        except (TypeError, ValueError):
+            proposed = {}
+        # The draft goes to whoever the offer came from: matched record, the name read from the offer, or the sender.
+        from .quotation_naming import sender_label
+        supplier = ((offer or {}).get("supplier") or proposed.get("Supplier_Name")
+                    or sender_label(message.sender if message else (intake.sender if intake else None))
+                    or (database.name if database else None))
+        context[draft.id] = {
+            "name": name_for_intake(session, action.intake_id) if action.intake_id else draft.subject,
+            "intake_id": action.intake_id,
+            "message_id": message.id if message else None,
+            "supplier": supplier,
+            "email_subject": message.subject if message else None,
+            "email_sent_at": message.sent_at if message else None,
+            "quotation": offer,
+            "missing_fields": [{"field": item.get("field"),
+                                "label": item.get("label") or str(item.get("field") or "").replace("_", " "),
+                                "reason": item.get("reason", "")}
+                               for item in questions],
+        }
+    return context
+
+
 def list_drafts(settings: Settings) -> list[dict]:
     with get_session(settings) as session:
         rows = session.query(SupplierEmailDraftRow).order_by(SupplierEmailDraftRow.updated_at.desc()).all()
-    return [{"id": row.id, "recipient": row.recipient, "bound_recipient": row.bound_recipient,
+        context = _draft_context(session, settings, list(rows))
+    return [{**context.get(row.id, {"name": row.subject}),
+             "id": row.id,
+             "name": context.get(row.id, {}).get("name") or row.subject,
+             "recipient": row.recipient, "bound_recipient": row.bound_recipient,
              "recipient_locked": bool(row.bound_recipient), "cc": row.cc, "subject": row.subject,
              "body": row.body, "status": row.status, "gmail_draft_id": row.gmail_draft_id,
              "gmail_thread_id": row.gmail_thread_id, "supplier_action_id": row.supplier_action_id,
@@ -102,7 +185,9 @@ def get_draft(settings: Settings, draft_id: str) -> dict:
         draft = session.get(SupplierEmailDraftRow, draft_id)
         if draft is None:
             raise NotFoundError("Email draft not found")
-        return {"id": draft.id, "recipient": draft.recipient, "bound_recipient": draft.bound_recipient,
+        label = _draft_context(session, settings, [draft]).get(draft.id, {}).get("name")
+        return {"id": draft.id, "name": label or draft.subject,
+                "recipient": draft.recipient, "bound_recipient": draft.bound_recipient,
                 "recipient_locked": bool(draft.bound_recipient), "cc": draft.cc, "subject": draft.subject,
                 "body": draft.body, "status": draft.status, "gmail_draft_id": draft.gmail_draft_id,
                 "gmail_thread_id": draft.gmail_thread_id, "supplier_action_id": draft.supplier_action_id,
@@ -157,6 +242,18 @@ def upsert_action_draft(settings: Settings, *, supplier_action_id: str, recipien
     return create_draft(settings, recipient=recipient, cc=cc, subject=subject, body=body,
                         gmail_account_id=gmail_account_id, gmail_thread_id=gmail_thread_id,
                         supplier_action_id=supplier_action_id, bound_recipient=bound_recipient)
+
+
+def draft_for_action(settings: Settings, supplier_action_id: str) -> dict | None:
+    """The draft this analysis produced, newest first — read-only view for the message page."""
+    with get_session(settings) as session:
+        row = (session.query(SupplierEmailDraftRow)
+               .filter(SupplierEmailDraftRow.supplier_action_id == supplier_action_id)
+               .order_by(SupplierEmailDraftRow.updated_at.desc()).first())
+        if row is None:
+            return None
+        draft_id = row.id
+    return get_draft(settings, draft_id)
 
 
 def approve_draft(settings: Settings, draft_id: str) -> dict:

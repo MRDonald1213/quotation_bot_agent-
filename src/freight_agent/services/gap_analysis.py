@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date
 
 from ..config import Settings
@@ -31,16 +32,47 @@ COMPARISON_SCHEMA: list[tuple[str, GapSeverity, str]] = [
     ("quote_reference", GapSeverity.informational, "A quote reference helps both sides track the offer."),
 ]
 
-_QUESTION_TEMPLATES = {
+# Only these fields belong in a supplier email: they describe the offer itself. Internal
+# master-data columns (ratings, compliance, payment terms) are never asked of a supplier.
+ASKABLE_FIELDS: frozenset[str] = frozenset({
+    "currency", "base_price", "charges", "delivery_scope", "valid_until", "transit_days",
+    "insurance_included", "customs_included", "origin", "destination",
+    "included_services", "excluded_services",
+})
+
+ASKABLE_QUESTIONS: dict[str, str] = {
     "currency": "Which currency is this price in?",
     "base_price": "What is the base freight price, and what does it include?",
+    "charges": "For each extra charge not included in the base price, what is the amount and currency?",
     "delivery_scope": "Does this price cover delivery to the final address, or only to the port?",
     "valid_until": "Until what date (YYYY-MM-DD) is this quotation valid?",
     "transit_days": "What is the expected transit time in days, minimum and maximum?",
     "insurance_included": "Is cargo insurance included? If not, what does it cost?",
     "customs_included": "Are customs clearance and handling included in this price?",
+    "origin": "Which origin does this price cover?",
+    "destination": "Which destination does this price cover?",
+    "included_services": "Which services are included in the quoted price?",
+    "excluded_services": "Which services are excluded, and what do they cost separately?",
     "quote_reference": "What reference number should we quote when we accept this offer?",
 }
+
+
+def askable_question(field_name: str) -> str:
+    """Plain business-English question for a supplier-answerable field."""
+    return ASKABLE_QUESTIONS.get(
+        field_name, f"Could you confirm the {field_name.replace('_', ' ')} for this quotation?")
+
+
+_TRANSIT_FIELDS = {"transit_days_min", "transit_days_max", "transit_days"}
+
+
+def canonical_field(name: str) -> str:
+    """Collapse the storage names of one comparison field onto its schema name."""
+    if name in _TRANSIT_FIELDS:
+        return "transit_days"
+    if name == "known_additional_charges" or re.match(r"^(?:charges|known_additional_charges)[:.\[]", name):
+        return "charges"
+    return name
 
 
 def detect_gaps_deterministic(shipment: Shipment, quote: Quotation) -> list[GapItem]:
@@ -114,9 +146,7 @@ def template_questions(shipment: Shipment, quote: Quotation, gaps: list[GapItem]
         questions.append(ClarificationQuestion(
             field_name=gap.field_name,
             why_it_matters=gap.description,
-            question_text=_QUESTION_TEMPLATES.get(
-                gap.field_name,
-                f"Could you confirm the {gap.field_name.replace('_', ' ')} for this quotation?"),
+            question_text=askable_question(gap.field_name),
             priority=gap.severity,
             source_context=evidence_snippets.get(gap.field_name, "not found"),
             target_carrier_id=carrier.id if carrier else None,

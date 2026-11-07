@@ -51,15 +51,18 @@ def _upload_limit(settings: Settings) -> int:
 def _document_rows(settings: Settings) -> list[dict[str, Any]]:
     """Every intake, newest first, with the labels a person reads rather than ids."""
     from ..services.common import with_session
+    from ..services.quotation_naming import name_for_intake
 
     with with_session(settings) as repos:
         items = list(reversed(repos.list_intakes(None, None)))
         lanes = {str(s.id): s for s in repos.list_shipments()}
+        names = {str(item.id): name_for_intake(repos.session, str(item.id)) for item in items}
     rows = []
     for item in items:
         lane = lanes.get(str(item.shipment_id)) if item.shipment_id else None
         rows.append({
-            "id": str(item.id), "file": item.original_filename, "source": str(item.source_type),
+            "id": str(item.id), "name": names.get(str(item.id), "Quotation"),
+            "file": item.original_filename, "source": str(item.source_type),
             "size_bytes": item.file_size_bytes, "sha256": item.content_sha256[:16],
             "classification": str(item.classification_status), "confidence": item.classification_confidence,
             "processing": str(item.processing_status), "shipment_id": str(item.shipment_id) if item.shipment_id else None,
@@ -118,7 +121,11 @@ def create_app(settings: Settings) -> FastAPI:
             origin = request.headers.get("origin") or request.headers.get("referer") or ""
             if origin and not any(host in origin for host in ("127.0.0.1", "localhost", "[::1]")):
                 return JSONResponse(status_code=403, content={"ok": False, "error": "cross-origin request refused"})
-        return await call_next(request)
+        response = await call_next(request)
+        if request.url.path.startswith("/api/") or request.url.path.startswith("/static/"):
+            # A cached copy would show the old pipeline state, or old UI after the app updates itself.
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     def runner() -> JobRunner:
         return app.state.runner
@@ -283,7 +290,8 @@ def create_app(settings: Settings) -> FastAPI:
         for document in _document_rows(settings):
             if document["id"] in action_by_intake:
                 continue
-            unprocessed.append({"id": None, "intake_id": document["id"], "file": document["file"],
+            unprocessed.append({"id": None, "intake_id": document["id"], "name": document["name"],
+                                "file": document["file"],
                                 "database_id": None, "database_name": None, "status": "received",
                                 "routing": [], "proposed_row": {}, "missing_fields": [], "evidence": {},
                                 "notes": "Received quotation is waiting for supplier database routing and analysis.",
@@ -376,54 +384,10 @@ def create_app(settings: Settings) -> FastAPI:
             rows = [r for r in rows if needle in r["file"].lower() or needle in (r["reason"] or "").lower()]
         return rows
 
-    @app.post("/api/documents", status_code=201)
-    async def upload(request: Request) -> dict[str, Any]:
-        from ..services import intake as intake_service
-
-        form = await request.form()
-        files = [value for key, value in form.multi_items() if key == "files" and hasattr(value, "read")]
-        on_duplicate = str(form.get("on_duplicate") or "error")
-        if not files:
-            raise ValidationFailureError("no files received")
-        limit = _upload_limit(settings)
-        results = []
-        for upload in files:
-            payload = await upload.read(limit + 1)
-            name = Path(upload.filename or "document").name or "document"
-            entry: dict[str, Any] = {"file": name, "size_bytes": len(payload)}
-            if len(payload) > limit:
-                entry.update({"status": "rejected",
-                              "error": f"larger than the configured limit of {limit // 1024 // 1024} MB"})
-                results.append(entry)
-                continue
-            if Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
-                entry.update({"status": "rejected",
-                              "error": f"unsupported type {Path(name).suffix!r}; allowed: "
-                                       f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"})
-                results.append(entry)
-                continue
-            # the browser filename is kept so provenance and evidence cite the real document
-            with tempfile.TemporaryDirectory(prefix="freight-upload-") as staging:
-                temp_path = Path(staging) / name
-                temp_path.write_bytes(payload)
-                try:
-                    item, skipped = intake_service.register_intake(settings, None, temp_path,
-                                                                  on_duplicate=on_duplicate)
-                    entry.update({"status": "duplicate" if skipped else "registered",
-                                  "intake_id": str(item.id),
-                                  "message": ("already imported as " + str(item.id))[:200] if skipped
-                                  else "stored and parsed locally; run processing to extract"})
-                except DuplicateIntakeError as exc:
-                    entry.update({"status": "duplicate", "intake_id": exc.existing_intake_id,
-                                  "error": str(exc), "options": ["skip", "reprocess"]})
-                except FreightAgentError as exc:
-                    entry.update({"status": "rejected", "error": str(exc)})
-            results.append(entry)
-        return {"ok": True, "results": results}
-
     @app.get("/api/documents/{intake_id}")
     def document_detail(intake_id: str) -> dict[str, Any]:
         from ..services.common import with_session
+        from ..services.quotation_naming import name_for_intake, name_for_quotation
 
         with with_session(settings) as repos:
             item = repos.get_intake(intake_id)
@@ -432,7 +396,8 @@ def create_app(settings: Settings) -> FastAPI:
             shipment = repos.get_shipment(str(item.shipment_id)) if item.shipment_id else None
             carriers = {c.id: c.name for c in repos.list_carriers()}
             payload = {
-                "id": str(item.id), "file": item.original_filename, "source": str(item.source_type),
+                "id": str(item.id), "name": name_for_intake(repos.session, str(item.id)),
+                "file": item.original_filename, "source": str(item.source_type),
                 "sender": item.sender, "subject": item.subject, "sha256": item.content_sha256,
                 "size_bytes": item.file_size_bytes, "chars": len(item.raw_text),
                 "classification": str(item.classification_status), "confidence": item.classification_confidence,
@@ -454,6 +419,7 @@ def create_app(settings: Settings) -> FastAPI:
                         if g.quotation_id is None or str(g.quotation_id) == str(quote.id)]
                 dump = quote.model_dump(mode="json")
                 dump["carrier"] = carriers.get(quote.carrier_id) or (quote.quote_reference or "carrier not named")
+                dump["name"] = name_for_quotation(repos.session, str(quote.id))
                 payload["quotations"].append({
                     "quote": dump,
                     "evidence": [e.model_dump(mode="json") for e in evidence],
@@ -578,6 +544,12 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.gmail_sync import gmail_status
         return gmail_status(settings)
 
+    @app.post("/api/gmail/reconnect")
+    def gmail_reconnect_route() -> dict[str, Any]:
+        """Re-attach the stored authorisation so a cleared workspace never forces a Google sign-in again."""
+        from ..services.gmail_sync import gmail_reconnect
+        return {"ok": True, **gmail_reconnect(settings)}
+
     @app.post("/api/gmail/authorize")
     def gmail_authorize(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         from ..services.gmail_sync import gmail_authorization_url
@@ -631,11 +603,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/gmail/sync", status_code=200)
     def gmail_sync(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-        """Synchronize in a job: reading the mailbox now also analyzes each new quotation."""
+        """Synchronize in a job: receive the mailbox now; the background reader then works through it."""
         from ..services.gmail_sync import gmail_sync as sync_mailbox
 
         def work(job) -> dict[str, Any]:
-            job.progress = "reading the mailbox and analyzing new quotations…"
+            job.progress = "receiving new mail…"
             return sync_mailbox(settings, int(body.get("limit") or 25))
 
         return {"ok": True, "job": runner().submit("gmail-sync", "gmail", work,
@@ -646,10 +618,61 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.gmail_sync import gmail_inbox
         return gmail_inbox(settings, limit)
 
+    def _analyze_gmail_message(message_row_id: str) -> dict[str, Any]:
+        """Analyze mail that arrived before automatic processing existed, in the background."""
+        from ..services.gmail_sync import (analyze_inbound_quotation, ensure_message_quotation,
+                                           process_inbound_reply)
+
+        def work(job) -> dict[str, Any]:
+            job.progress = "reading this quotation…"
+            from ..services.gmail_sync import gmail_message_detail
+            detail = gmail_message_detail(settings, message_row_id)
+            if detail["classification"] == "SUPPLIER_QUOTATION_REPLY":
+                return {"status": process_inbound_reply(settings, message_row_id)}
+            intake_id = ensure_message_quotation(settings, message_row_id)
+            if intake_id is None:
+                return {"status": "not_a_quotation"}
+            return {"intake_id": intake_id,
+                    "status": analyze_inbound_quotation(settings, message_row_id, intake_id)}
+
+        return runner().submit("gmail-message-analysis", message_row_id, work,
+                               max_seconds=_processing_budget_seconds(settings) * 2).as_dict()
+
     @app.get("/api/gmail/messages/{message_row_id}")
     def gmail_message_detail(message_row_id: str) -> dict[str, Any]:
-        from ..services.gmail_sync import gmail_message_detail
-        return gmail_message_detail(settings, message_row_id)
+        from ..services.gmail_sync import QUEUE_STATUSES, gmail_message_detail as read_message
+
+        detail = read_message(settings, message_row_id)
+        if detail["intake_id"] is None and detail["classification"] in {
+                "NEW_QUOTATION", "SUPPLIER_QUOTATION_REPLY", "UNCERTAIN"}:
+            # The background reader owns queued and reading mail; opening it must not start a second read.
+            if detail["processing_status"] not in {*QUEUE_STATUSES, "analyzing"}:
+                run = runner().latest_for(message_row_id)
+                if run is None:
+                    detail["job"] = _analyze_gmail_message(message_row_id)
+                    detail["processing_status"] = "analyzing"
+                elif run.active:
+                    detail["job"] = run.as_dict()
+                    detail["processing_status"] = "analyzing"
+        return detail
+
+    @app.post("/api/gmail/messages/{message_row_id}/analyze")
+    def gmail_message_analyze(message_row_id: str) -> dict[str, Any]:
+        return {"ok": True, "job": _analyze_gmail_message(message_row_id)}
+
+    @app.post("/api/gmail/messages/{message_row_id}/process-reply")
+    def gmail_reply_process(message_row_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """Merge a reply the mailbox could not link by itself, then re-analyze the quotation."""
+        from ..services.gmail_sync import process_inbound_reply
+
+        quotation_id = body.get("quotation_id")
+
+        def work(job) -> dict[str, Any]:
+            job.progress = "reading the supplier answer and updating the quotation…"
+            return {"status": process_inbound_reply(settings, message_row_id, quotation_id)}
+
+        return {"ok": True, "job": runner().submit("gmail-reply-analysis", message_row_id, work,
+                                                   max_seconds=_processing_budget_seconds(settings) * 3).as_dict()}
 
     @app.post("/api/gmail/messages/{message_row_id}/ensure-quotation")
     def gmail_message_ensure_quotation(message_row_id: str) -> dict[str, Any]:
