@@ -17,6 +17,9 @@ class Settings(BaseSettings):
         env_file=str(PROJECT_ROOT / ".env"), env_file_encoding="utf-8", extra="ignore"
     )
 
+    demo_login_enabled: bool = Field(default=True, validation_alias="DEMO_LOGIN_ENABLED")
+    gmail_background_enabled: bool = Field(default=True, validation_alias="GMAIL_BACKGROUND_ENABLED")
+
     ollama_base_url: str = Field(
         default="http://localhost:11434/v1",
         validation_alias="OLLAMA_BASE_URL",

@@ -13,7 +13,7 @@ from ..agents import prompts
 from ..agents.model import make_agent
 from ..config import Settings
 from ..domain.enums import (
-    AssociationMethod, ClassificationStatus, ComparisonStatus, DeliveryScope,
+    AssociationMethod, ClassificationStatus, ComparisonStatus, DeliveryScope, ReviewStatus,
     GapSeverity, GapStatus, GapType, ProcessingStatus, SourceType, ValidationStatus,
 )
 from ..domain.exceptions import (
@@ -156,7 +156,11 @@ def process_supplier_reply(settings: Settings, reply_id: str, dry_run: bool = Fa
 
 def _extract_reply(settings: Settings, item: IntakeItem, quote: Quotation) -> QuoteExtraction:
     agent = make_agent(settings, QuoteExtraction, prompts.REPLY_SYSTEM, "reply_extractor")
-    context = json.dumps({"existing_charge_labels": [c.label for c in quote.known_additional_charges]})
+    with with_session(settings) as repos:
+        sets = [q for q in repos.list_question_sets(str(quote.shipment_id)) if q.quotation_id == quote.id]
+    context = json.dumps({"existing_charge_labels": [c.label for c in quote.known_additional_charges],
+                          "quotation": quote.model_dump(mode="json"),
+                          "outstanding_questions": sets[-1].model_dump(mode="json") if sets else None})
     prompt = prompts.wrap_untrusted(item.original_filename, truncate_for_llm(item.raw_text, settings), "supplier_reply")
     prompt += "\n" + prompts.wrap_untrusted("charge_labels.json", context, "quote_context")
     prompt += "\nExtract the ReplyExtraction now. Only explicit reply facts; absent fields stay null."
@@ -205,6 +209,12 @@ def _merge_reply(quote: Quotation, extraction: QuoteExtraction, item: IntakeItem
     for field in supplied:
         value = getattr(cleaned, field)
         ev = by_field.get(field)
+        # Grounding proves the reply said this, not that it may replace an accepted fact.
+        current_value = getattr(quote.details, field, None) if field in type(quote.details).model_fields else getattr(quote, field, None)
+        if (field not in {"carrier_name", "included_services", "excluded_services"}
+                and current_value is not None and value is not None
+                and (str(current_value).strip().casefold() != str(value).strip().casefold() if isinstance(current_value, str) and isinstance(value, str) else current_value != value)):
+            review.add(field)
         if field == "carrier_name" and carrier_name and value and value.strip().casefold() != carrier_name.strip().casefold():
             review.add(field)
         if field in review or not ev or value is None:
@@ -218,12 +228,21 @@ def _merge_reply(quote: Quotation, extraction: QuoteExtraction, item: IntakeItem
         if field == "delivery_scope":
             value = DeliveryScope(value)
         if field in {"included_services", "excluded_services"}:
+            opposite = "excluded_services" if field == "included_services" else "included_services"
+            if {s.casefold().strip() for s in value} & {s.casefold().strip() for s in getattr(quote, opposite)}:
+                review.add(field)
+                save_evidence(field, json.dumps(value), ev.snippet, ev.page_or_sheet, ev.confidence,
+                              status=ValidationStatus.needs_review)
+                continue
             current = getattr(merged, field)
             value = list(dict.fromkeys(current + value))
             opposite = "excluded_services" if field == "included_services" else "included_services"
             stated = {s.casefold().strip() for s in getattr(cleaned, field)}
             setattr(merged, opposite, [s for s in getattr(merged, opposite) if s.casefold().strip() not in stated])
-        setattr(merged, field, value)
+        if field in type(merged.details).model_fields:
+            setattr(merged.details, field, value)
+        elif field in type(merged).model_fields:
+            setattr(merged, field, value)
         save_evidence(field, value, ev.snippet, ev.page_or_sheet, ev.confidence)
 
     charges = list(merged.known_additional_charges)
@@ -240,7 +259,14 @@ def _merge_reply(quote: Quotation, extraction: QuoteExtraction, item: IntakeItem
             continue
         if indices:
             old = charges[indices[0]]
-            changes = {key: value for key, value in charge.model_dump().items() if value is not None and key != "label"}
+            changes = {key: value for key, value in charge.model_dump().items()
+                       if value is not None and key not in {"label", "evidence_snippet"}}
+            if any(getattr(old, key) is not None and getattr(old, key) != value
+                   for key, value in changes.items()):
+                review.add(field)
+                save_evidence(field, charge.model_dump_json(), charge.evidence_snippet,
+                              status=ValidationStatus.needs_review)
+                continue
             charges[indices[0]] = old.model_copy(update=changes)
         else:
             charges.append(charge)
@@ -256,13 +282,13 @@ def _merge_reply(quote: Quotation, extraction: QuoteExtraction, item: IntakeItem
     overlaps = {s.casefold().strip() for s in cleaned.included_services} & {s.casefold().strip() for s in cleaned.excluded_services}
     if overlaps:
         review.update({"included_services", "excluded_services"})
-    merged.total_known_cost, _ = compute_total_known_cost(merged.base_price, merged.currency, charges)
-    unresolved = {e.field_name for e in evidence if e.validation_status != ValidationStatus.accepted}
+    merged.total_known_cost, _ = compute_total_known_cost(merged.base_price, merged.currency, charges, merged.details.pricing_unit)
+    unresolved = {e.field_name for e in evidence if e.validation_status == ValidationStatus.needs_review}
     unresolved.update(review)
-    if quote.comparison_status == ComparisonStatus.needs_review and not any(
-            e.validation_status != ValidationStatus.accepted for e in old_evidence):
-        unresolved.add("extraction_review")
     merged.comparison_status = ComparisonStatus.needs_review if unresolved else ComparisonStatus.comparable
+    merged.review_status = ReviewStatus.extracted
+    merged.reviewed_at = None
+    merged.imported_at = None
     merged.version += 1
     merged.updated_at = datetime.now(timezone.utc).replace(microsecond=0)
     merged.processed_at = merged.updated_at
@@ -277,6 +303,8 @@ def _process_reply(settings: Settings, reply: SupplierReply, item: IntakeItem,
                    dry_run: bool = False) -> Quotation:
     with with_session(settings) as repos:
         quote = repos.get_quotation(str(reply.quotation_id))
+        if quote.disposition:
+            raise ValidationFailureError("Archived quotations cannot accept new replies")
         shipment = repos.get_shipment(str(reply.shipment_id))
         old_evidence = repos.evidence_for_quotation(str(quote.id))
         carrier = repos.get_carrier(str(quote.carrier_id)) if quote.carrier_id else None

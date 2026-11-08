@@ -114,3 +114,35 @@ __all__ = ["app", "main"]
 
 def main() -> None:
     app()
+
+quote_app.command(name="archive")(quote.archive)
+quote_app.command(name="approve")(quote.approve)
+quote_app.command(name="import")(quote.import_)
+quote_app.command(name="ask")(quote.ask)
+quote_app.command(name="answer")(quote.answer)
+quote_app.command(name="resolve")(quote.resolve)
+
+
+proposal_app = typer.Typer(help="Schema-directed destination proposals.")
+app.add_typer(proposal_app, name="proposal")
+
+
+@proposal_app.command("process")
+def proposal_process(intake_id: str):
+    from .services.destination_proposals import process
+    from .cli_commands.common import settings_or_exit, console
+    console.print_json(data=process(settings_or_exit(), intake_id))
+
+
+@proposal_app.command("list")
+def proposal_list():
+    from .services.destination_proposals import list_proposals
+    from .cli_commands.common import settings_or_exit, console
+    console.print_json(data=list_proposals(settings_or_exit()))
+
+
+@proposal_app.command("decide")
+def proposal_decide(proposal_id: str, operation: str):
+    from .services.destination_proposals import decide
+    from .cli_commands.common import settings_or_exit, console
+    console.print_json(data=decide(settings_or_exit(), proposal_id, operation))

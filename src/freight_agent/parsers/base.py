@@ -8,7 +8,7 @@ from ..domain.exceptions import DocumentParsingError
 MAX_PAGES = 50
 MAX_SHEETS = 20
 
-SUPPORTED_EXTENSIONS = {".txt", ".eml", ".pdf", ".xlsx", ".docx", ".csv"}
+SUPPORTED_EXTENSIONS = {".txt", ".eml", ".pdf", ".xlsx", ".xls", ".docx", ".doc", ".csv", ".odt", ".rtf", ".pages"}
 
 
 @dataclass
@@ -22,7 +22,7 @@ class ParseResult:
 
 
 def parse_file(path: Path) -> ParseResult:
-    """Dispatch on extension. Content is untrusted data; macros/scripts/links are never executed."""
+    """Dispatch supported formats. Parsers extract text only; embedded scripts/macros are not run by the app."""
     ext = path.suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
         raise DocumentParsingError(
@@ -45,7 +45,13 @@ def parse_file(path: Path) -> ParseResult:
     if ext == ".docx":
         from .docx_parser import parse_docx
         return parse_docx(path)
-    if ext == ".xlsx":
-        from .xlsx_parser import parse_xlsx
-        return parse_xlsx(path)
+    if ext in {".xlsx", ".xls"}:
+        if ext == ".xlsx":
+            from .xlsx_parser import parse_xlsx
+            return parse_xlsx(path)
+        from .office_parser import parse_office
+        return parse_office(path)
+    if ext in {".doc", ".odt", ".rtf", ".pages"}:
+        from .office_parser import parse_office
+        return parse_office(path)
     raise DocumentParsingError(f"unhandled extension {ext!r}")  # pragma: no cover

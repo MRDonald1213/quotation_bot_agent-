@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
 
 
 def utcnow_iso() -> str:
@@ -91,6 +91,10 @@ class IntakeItemRow(Base):
 
 
 class QuotationRow(Base):
+    details_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    disposition: Mapped[str | None] = mapped_column(String(24))
+    disposition_reason: Mapped[str | None] = mapped_column(Text)
+    archived_at: Mapped[str | None] = mapped_column(String(32))
     __tablename__ = "quotations"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     shipment_id: Mapped[str] = mapped_column(ForeignKey("shipments.id"), index=True)
@@ -252,6 +256,7 @@ class GmailAccountRow(Base):
     status: Mapped[str] = mapped_column(String(24), default="disconnected", index=True)
     history_id: Mapped[str | None] = mapped_column(String(64))
     last_synced_at: Mapped[str | None] = mapped_column(String(32))
+    sync_after_at: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[str] = mapped_column(String(32))
     updated_at: Mapped[str] = mapped_column(String(32))
 
@@ -287,6 +292,8 @@ class GmailAttachmentRow(Base):
 
 
 class SupplierEmailDraftRow(Base):
+    quotation_id: Mapped[str | None] = mapped_column(String(36))
+    clarification_turn_id: Mapped[str | None] = mapped_column(String(36))
     __tablename__ = "supplier_email_drafts"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     quotation_register_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("quotation_register.id"), index=True)
@@ -382,3 +389,50 @@ class QuotationVersionRow(Base):
 
 
 Index("ix_intake_sha", IntakeItemRow.content_sha256)
+
+
+class SourceDocumentRow(Base):
+    __tablename__ = "source_documents"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    intake_item_id: Mapped[str] = mapped_column(ForeignKey("intake_items.id"), index=True)
+    filename: Mapped[str] = mapped_column(Text)
+    source_kind: Mapped[str] = mapped_column(String(24))
+    text: Mapped[str] = mapped_column(Text)
+    location: Mapped[str | None] = mapped_column(Text)
+    parse_error: Mapped[str | None] = mapped_column(Text)
+
+
+class ClarificationTurnRow(Base):
+    __tablename__ = "clarification_turns"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    quotation_id: Mapped[str] = mapped_column(ForeignKey("quotations.id"), index=True)
+    quotation_version: Mapped[int] = mapped_column(Integer)
+    questions_json: Mapped[str] = mapped_column(Text)
+    reply_text: Mapped[str | None] = mapped_column(Text)
+    result_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32))
+
+
+class DestinationImportRow(Base):
+    __tablename__ = "destination_imports"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    quotation_id: Mapped[str] = mapped_column(ForeignKey("quotations.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(24))
+    details_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32))
+
+
+class DestinationProposalRow(Base):
+    __tablename__ = "destination_proposals"
+    __table_args__ = (UniqueConstraint("intake_id", "database_id", "revision_key", name="uq_destination_source"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    intake_id: Mapped[str] = mapped_column(ForeignKey("intake_items.id"), index=True)
+    database_id: Mapped[str] = mapped_column(ForeignKey("supplier_databases.id"), index=True)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    schema_json: Mapped[str] = mapped_column(Text)
+    revision_key: Mapped[str] = mapped_column(String(64))
+    source_hash: Mapped[str] = mapped_column(String(64))
+    result_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))

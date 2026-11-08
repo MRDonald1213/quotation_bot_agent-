@@ -28,6 +28,8 @@ def _convert(subtotal: Decimal | None, currency: str | None, target: str,
     leaves the quote unrankable rather than silently summed."""
     if subtotal is None or currency is None:
         return None, None
+    if currency.upper() != target.upper() and f"{currency.upper()}->{target.upper()}" not in money.configured_rates(settings):
+        return None, "No explicit configured FX rate"
     return money.convert(subtotal, currency, target, settings)
 
 
@@ -49,6 +51,9 @@ def _known_breakdown(quote: Quotation) -> tuple[Decimal | None, list[str]]:
             continue
         if ch.currency is None or ch.currency != quote.currency:
             uncertain.append(f"{ch.label} (currency {ch.currency or '?'} ≠ {quote.currency})")
+            continue
+        if (ch.pricing_unit and quote.details.pricing_unit and ch.pricing_unit != quote.details.pricing_unit) or (quote.details.pricing_unit not in {None, "shipment"} and not ch.pricing_unit):
+            uncertain.append(f"{ch.label} (pricing basis incompatible or unknown)")
             continue
         subtotal += ch.amount
     return subtotal, uncertain
@@ -103,7 +108,25 @@ def _row_for(repos: Repos, shipment: Shipment, quote: Quotation,
         for e in repos.evidence_for_quotation(str(quote.id))
     ]
 
+    from .workspace import readiness
+    missing, conflicts, blocking_gaps = readiness(repos, quote)
+    exclusions = []
+    if quote.disposition or quote.review_status != "imported":
+        exclusions.append("Quotation is not active/imported")
+    if missing or conflicts or blocking_gaps or status != ComparisonStatus.comparable:
+        exclusions.append("Missing, expired or unresolved information")
+    if not scope_compatible or uncertain:
+        exclusions.append("Scope or charges are not comparable")
+    if not quote.details.pricing_unit:
+        exclusions.append("Pricing unit is unknown")
+    if converted is None:
+        exclusions.append(fx_note or "No comparable total or explicit FX rate")
+    if ((quote.origin or "").strip().casefold() != shipment.origin.strip().casefold()
+            or (quote.destination or "").strip().casefold() != shipment.destination.strip().casefold()):
+        exclusions.append("Quotation route differs from selected shipment")
+
     return ComparisonRow(
+        pricing_unit=quote.details.pricing_unit, transit_days=quote.transit_days_max, exclusions=exclusions,
         quotation_id=quote.id, carrier_name=carrier_name, quote_reference=quote.quote_reference,
         currency=quote.currency, base_price=quote.base_price,
         known_additional_total=(None if subtotal is None or quote.base_price is None
@@ -120,7 +143,7 @@ def _row_for(repos: Repos, shipment: Shipment, quote: Quotation,
     )
 
 
-def build_comparison(settings: Settings, id_or_reference: str) -> ComparisonReport:
+def build_comparison(settings: Settings, id_or_reference: str, pricing_unit: str | None = None) -> ComparisonReport:
     """Workflow C: deterministic cross-carrier comparison. No LLM, no invented totals."""
     with with_session(settings) as repos:
         shipment = repos.get_shipment(id_or_reference)
@@ -129,6 +152,12 @@ def build_comparison(settings: Settings, id_or_reference: str) -> ComparisonRepo
         for q in quotes:
             carrier = repos.get_carrier(str(q.carrier_id)) if q.carrier_id else None
             rows.append(_row_for(repos, shipment, q, settings, carrier.name if carrier else None))
+        eligible_units = {r.pricing_unit for r in rows if not r.exclusions}
+        for row in rows:
+            if pricing_unit and row.pricing_unit != pricing_unit:
+                row.exclusions.append("Different pricing unit")
+            elif not pricing_unit and len(eligible_units) > 1 and not row.exclusions:
+                row.exclusions.append("Select one pricing unit before comparing")
         return _assemble(shipment, rows)
 
 
@@ -145,10 +174,11 @@ def _assemble(shipment: Shipment, rows: list[ComparisonRow]) -> ComparisonReport
 
     eligible = [
         r for r in rows
-        if r.comparison_status == ComparisonStatus.comparable
+        if not r.exclusions and r.comparison_status == ComparisonStatus.comparable
         and r.scope_compatible and r.converted_subtotal is not None
     ]
     for r in rows:
+        report.caveats.extend(f"{r.carrier_name or r.quote_reference}: {reason}" for reason in r.exclusions)
         if r.comparison_status != ComparisonStatus.comparable:
             report.caveats.append(f"{r.carrier_name or r.quote_reference or str(r.quotation_id)[:8]}: "
                                   f"{r.comparison_status.value}")

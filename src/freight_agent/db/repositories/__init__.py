@@ -132,6 +132,8 @@ def quotation_to_row(q: Quotation) -> m.QuotationRow:
         id=_u(q.id), shipment_id=_u(q.shipment_id),
         carrier_id=_u(q.carrier_id) if q.carrier_id else None,
         intake_item_id=_u(q.intake_item_id), quote_reference=q.quote_reference,
+        details_json=q.details.model_dump_json(), disposition=q.disposition,
+        disposition_reason=q.disposition_reason, archived_at=q.archived_at.isoformat() if q.archived_at else None,
         currency=q.currency, base_price=money_to_text(q.base_price),
         charges_json=json.dumps([c.model_dump(mode="json") for c in q.known_additional_charges]),
         included_services_json=json.dumps(q.included_services),
@@ -161,6 +163,8 @@ def quotation_from_row(r: m.QuotationRow) -> Quotation:
         id=_uid(r.id), shipment_id=_uid(r.shipment_id),
         carrier_id=_uid(r.carrier_id) if r.carrier_id else None,
         intake_item_id=_uid(r.intake_item_id), quote_reference=r.quote_reference,
+        details=json.loads(r.details_json or "{}"), disposition=r.disposition,
+        disposition_reason=r.disposition_reason, archived_at=m.iso_to_dt(r.archived_at),
         currency=r.currency, base_price=text_to_money(r.base_price),
         known_additional_charges=[Charge.model_validate(c) for c in json.loads(r.charges_json)],
         included_services=json.loads(r.included_services_json),
@@ -377,15 +381,23 @@ class Repos:
     def delete_intake_cascade(self, intake_id: str) -> None:
         """Delete an intake item and all associated data (quotations, evidence, gaps, drafts, replies)."""
         with self.atomic():
+            for proposal in self.session.scalars(select(m.DestinationProposalRow).where(m.DestinationProposalRow.intake_id == _u(intake_id))).all():
+                self.session.delete(proposal)
             # Find all quotations for this intake
             quotes = self.session.scalars(
                 select(m.QuotationRow).where(m.QuotationRow.intake_item_id == _u(intake_id))
             ).all()
             quote_ids = [q.id for q in quotes]
 
+            for row_type in (m.DestinationImportRow, m.ClarificationTurnRow):
+                for related in self.session.scalars(select(row_type).where(row_type.quotation_id.in_(quote_ids))).all():
+                    self.session.delete(related)
+            for source in self.session.scalars(select(m.SourceDocumentRow).where(m.SourceDocumentRow.intake_item_id == _u(intake_id))).all():
+                self.session.delete(source)
+
             # Delete supplier replies that reference this intake
             for reply in self.session.scalars(
-                select(m.SupplierReplyRow).where(m.SupplierReplyRow.intake_item_id == _u(intake_id))
+                select(m.SupplierReplyRow).where((m.SupplierReplyRow.intake_item_id == _u(intake_id)) | m.SupplierReplyRow.quotation_id.in_(quote_ids))
             ).all():
                 self.session.delete(reply)
 

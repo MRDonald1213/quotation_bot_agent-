@@ -46,6 +46,8 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
         notes: list[str] = []
 
         existing_quote = repos.quotation_for_intake(intake_id)
+        if existing_quote and existing_quote.disposition:
+            raise ValidationFailureError("Archived quotation history is read-only; register a new intake for a new offer")
         if (existing_quote is not None and selected_shipment is not None
                 and existing_quote.shipment_id != selected_shipment.id):
             raise ValidationFailureError("Existing quotation belongs to another shipment; cannot reassign it during processing.")
@@ -170,11 +172,13 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
         carrier = repos.get_or_create_carrier(cleaned.carrier_name.strip()) if cleaned.carrier_name else None
 
         total_known, total_notes = compute_total_known_cost(
-            cleaned.base_price, cleaned.currency, cleaned.charges)
+            cleaned.base_price, cleaned.currency, cleaned.charges, cleaned.pricing_unit)
         notes += total_notes
 
         from ..domain.enums import DeliveryScope
+        from ..domain.models import QuotationDetails
         quote = Quotation(
+            details=QuotationDetails.model_validate(cleaned.model_dump()),
             shipment_id=shipment_id,  # type: ignore[arg-type]
             carrier_id=carrier.id if carrier else None,
             intake_item_id=item.id,
@@ -217,12 +221,27 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
         evidence_rows = [
             FieldEvidence(
                 quotation_id=quote.id, field_name=e.field_name,
-                value_as_extracted=str(_field_value(quote, e.field_name)),
-                source_filename=item.original_filename,
+                value_as_extracted=str(cleaned.carrier_name if e.field_name == "carrier_name" else _field_value(quote, e.field_name)),
+                source_filename=e.source_filename or item.original_filename,
                 page_or_sheet=e.page_or_sheet, snippet=e.snippet, confidence=e.confidence,
                 validation_status=field_statuses.get(e.field_name, ValidationStatus.accepted),
             ) for e in evidence_items
         ]
+        from ..db.models import SourceDocumentRow
+        from sqlalchemy import select
+        from .validation import snippet_grounded, locate_snippet
+        sources = repos.session.scalars(select(SourceDocumentRow).where(SourceDocumentRow.intake_item_id == str(item.id))).all()
+        for evidence_row in evidence_rows:
+            matches = [source for source in sources if snippet_grounded(evidence_row.snippet, source.text)]
+            selected = [source for source in matches if source.filename == evidence_row.source_filename]
+            if selected:
+                matches = selected
+            if len(matches) == 1:
+                evidence_row.source_filename = matches[0].filename
+                evidence_row.page_or_sheet = locate_snippet(evidence_row.snippet, matches[0].text) or matches[0].location
+            elif sources:
+                evidence_row.validation_status = ValidationStatus.needs_review
+                quote.comparison_status = ComparisonStatus.needs_review
         for field in cleaned.fields_requiring_review:
             if not any(e.field_name == field for e in evidence_rows):
                 evidence_rows.append(FieldEvidence(
@@ -323,7 +342,7 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
 
 
 def _field_value(quote: Quotation, field: str):
-    return getattr(quote, field, None)
+    return getattr(quote.details, field) if field in type(quote.details).model_fields else getattr(quote, field, None)
 
 
 def _load_classification(settings: Settings, item) -> "object | None":

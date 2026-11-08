@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from ..config import Settings
 from ..db.engine import get_session
-from ..db.models import AuditEventRow, QuotationRegisterRow, SupplierQuotationActionRow, utcnow_iso
+from ..db.models import AuditEventRow, QuotationRegisterRow, SupplierQuotationActionRow, QuotationRow, utcnow_iso
 from ..domain.exceptions import NotFoundError, ValidationFailureError
 
 
@@ -30,14 +30,21 @@ def import_quotation_action(settings: Settings, action_id: str) -> dict:
         action = session.get(SupplierQuotationActionRow, action_id)
         if action is None:
             raise NotFoundError("Supplier quotation action not found")
-        if action.status != "ready_for_approval":
-            raise ValidationFailureError("Quotation must have ready_for_approval status before final import")
+        source_quote = session.scalar(select(QuotationRow).where(QuotationRow.intake_item_id == action.intake_id))
+        if source_quote and (source_quote.disposition or source_quote.review_status not in {"approved", "imported"}):
+            raise ValidationFailureError("Approve the canonical quotation before importing")
+        if action.status not in {"approved", "record_created"}:
+            raise ValidationFailureError("Approve the quotation before final import")
         proposed = json.loads(action.proposed_row_json)
         evidence = json.loads(action.evidence_json)
         source_hash = hashlib.sha256(json.dumps(proposed, sort_keys=True).encode("utf-8")).hexdigest()
         existing = session.scalars(select(QuotationRegisterRow).where(
             QuotationRegisterRow.intake_id == action.intake_id,
         ).order_by(QuotationRegisterRow.revision.desc())).first()
+        if existing and existing.source_hash == source_hash:
+            return {"id": existing.id, "revision": existing.revision, "status": existing.status, "imported_at": existing.imported_at}
+        if action.status != "approved":
+            raise ValidationFailureError("Changed records require approval before import")
         revision = 1 if existing is None else existing.revision + 1
         row = QuotationRegisterRow(id=str(uuid4()), database_id=action.database_id,
                                    intake_id=action.intake_id, revision=revision,

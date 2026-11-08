@@ -29,6 +29,8 @@ MATERIAL_FIELDS = [
     "insurance_included", "customs_included", "quote_reference",
     "included_services", "excluded_services", "origin_country", "destination_country",
     "cargo_description", "weight_kg", "volume_m3",
+    "supplier_id", "pricing_unit", "transport_type", "fuel_type", "dimensions",
+    "contact_person", "contact_email", "contact_phone", "valid_from", "additional_conditions",
 ]
 
 
@@ -45,6 +47,22 @@ def snippet_grounded(snippet: str, raw_text: str) -> bool:
         return False
     needle = _norm(snippet)
     return needle in _norm(raw_text)
+
+
+def locate_snippet(snippet: str, raw_text: str) -> str | None:
+    """Derive locations from parser boundaries rather than trusting a model's page claim."""
+    boundaries = list(re.finditer(r"(?m)^\[(page \d+|sheet [^\]]+)\]", raw_text))
+    locations = []
+    for index, boundary in enumerate(boundaries):
+        end = boundaries[index + 1].start() if index + 1 < len(boundaries) else len(raw_text)
+        if snippet_grounded(snippet, raw_text[boundary.end():end]):
+            locations.append(boundary.group(1))
+    if locations:
+        return ", ".join(locations)
+    position = raw_text.casefold().find(snippet.strip().casefold())
+    if position >= 0:
+        return f"line {raw_text[:position].count(chr(10)) + 1}"
+    return None
 
 
 def _amount_grounded(amount: Decimal, snippet: str) -> bool:
@@ -98,7 +116,7 @@ def country_from_location(location: str) -> str | None:
 
 
 def compute_total_known_cost(base_price: Decimal | None, currency: str | None,
-                             charges: list[Charge]) -> tuple[Decimal | None, list[str]]:
+                             charges: list[Charge], pricing_unit: str | None = None) -> tuple[Decimal | None, list[str]]:
     """Deterministic money — the LLM never calculates (spec §2, §10).
 
     Adds only charges that are: numeric, confirmed NOT included in base price,
@@ -123,6 +141,10 @@ def compute_total_known_cost(base_price: Decimal | None, currency: str | None,
         if ch.currency is None or ch.currency != currency:
             blocking = True
             notes.append(f"charge {ch.label!r} currency is unknown or differs from {currency}; not summed (no FX)")
+            continue
+        if (ch.pricing_unit and pricing_unit and ch.pricing_unit != pricing_unit) or (pricing_unit not in {None, "shipment"} and not ch.pricing_unit):
+            blocking = True
+            notes.append(f"charge {ch.label!r} pricing basis is incompatible or unknown; not summed")
             continue
         total += ch.amount
     return (None if blocking else total), notes
@@ -187,6 +209,7 @@ def validate_extraction(extraction: QuoteExtraction, raw_text: str,
     grounded: list[EvidenceItem] = []
     for ev in extraction.field_evidence:
         if snippet_grounded(ev.snippet, raw_text):
+            ev = ev.model_copy(update={"page_or_sheet": locate_snippet(ev.snippet, raw_text)})
             evidence_by_field[ev.field_name] = ev
             grounded.append(ev)
         else:
@@ -255,6 +278,29 @@ def validate_extraction(extraction: QuoteExtraction, raw_text: str,
             route_values["delivery_scope"] = None
         else:
             route_values["delivery_scope"] = scope
+
+    for field in ("carrier_name", "supplier_id", "contact_person", "contact_email", "contact_phone", "dimensions"):
+        value = getattr(extraction, field, None)
+        evidence = evidence_by_field.get(field)
+        if value and (evidence is None or not snippet_grounded(value, evidence.snippet)):
+            review_fields.add(field)
+            route_values[field] = None
+            issues.append(f"{field} value is not supported by its source snippet")
+    if extraction.valid_from and extraction.valid_until and extraction.valid_from > extraction.valid_until:
+        review_fields.update({"valid_from", "valid_until"})
+        route_values["valid_from"] = None
+        route_values["valid_until"] = None
+        issues.append("Validity start is after expiry")
+    if extraction.contact_email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", extraction.contact_email):
+        review_fields.add("contact_email")
+    from ..domain.models import QuotationDetails
+    for field in QuotationDetails.model_fields:
+        if field in review_fields:
+            route_values[field] = None
+    if extraction.pricing_unit and "pricing_unit" not in review_fields:
+        aliases = {"per shipment": "shipment", "per kg": "kg", "per kilogram": "kg", "kilogram": "kg", "kilograms": "kg", "per hour": "hour", "per litre": "litre"}
+        unit = extraction.pricing_unit.strip().lower()
+        route_values["pricing_unit"] = aliases.get(unit, unit)
 
     cleaned = extraction.model_copy(update={
         "currency": currency,

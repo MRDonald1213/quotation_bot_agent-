@@ -23,6 +23,7 @@ from sqlalchemy import text
 
 from ..config import Settings, is_local_endpoint
 from ..domain.enums import ShipmentStatus
+from ..domain.models import WorkspaceAction, ComparisonQuery
 from ..domain.exceptions import (ConfigurationError, DatabaseError, DocumentParsingError,
                                  DuplicateIntakeError, FreightAgentError, ModelUnavailableError,
                                  NotFoundError, ValidationFailureError)
@@ -86,8 +87,12 @@ def _next_step(row: dict[str, Any]) -> str:
 
 
 def _processing_budget_seconds(settings: Settings) -> float:
-    """Two bounded model calls (extraction, then the reply wording) plus the deterministic work."""
-    return settings.llm_timeout_seconds * (settings.llm_max_retries + 1) * 2 + 120
+    """Allow one bounded extraction for each active destination plus overhead."""
+    from ..db.engine import get_session
+    from ..db.models import SupplierDatabaseRow
+    with get_session(settings) as session:
+        count = session.query(SupplierDatabaseRow).filter_by(status="active").count()
+    return settings.llm_timeout_seconds * (settings.llm_max_retries + 1) * max(2, count) + 120
 
 
 def _error(exc: Exception, status: int) -> JSONResponse:
@@ -100,6 +105,7 @@ def create_app(settings: Settings) -> FastAPI:
     from ..db.migrations import init_schema, schema_status
 
     app = FastAPI(title="Freight AI Agent", version="0.1.0", docs_url=None, redoc_url=None)
+    app.state.sessions = {}
     app.state.settings = settings
     app.state.runner = JobRunner()
     app.state.oauth_pending_states: dict[str, tuple[float, str]] = {}
@@ -113,19 +119,160 @@ def create_app(settings: Settings) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     def _request_errors(request: Request, exc: RequestValidationError) -> JSONResponse:  # noqa: ARG001
         return JSONResponse(status_code=422, content={"ok": False,
-                                                      "error": "invalid request: " + str(exc.errors()[:3])})
+                                                      "error": "invalid request: " + "; ".join(".".join(str(part) for part in error["loc"]) + ": " + error["msg"] for error in exc.errors()[:3])})
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
         if request.method != "GET":
             origin = request.headers.get("origin") or request.headers.get("referer") or ""
-            if origin and not any(host in origin for host in ("127.0.0.1", "localhost", "[::1]")):
+            from urllib.parse import urlparse
+            if origin and urlparse(origin).netloc != request.url.netloc:
                 return JSONResponse(status_code=403, content={"ok": False, "error": "cross-origin request refused"})
+        public = {"/login", "/api/login", "/api/session"}
+        if settings.demo_login_enabled and request.url.path not in public and not request.url.path.startswith("/static/"):
+            expiry = app.state.sessions.get(request.cookies.get("freight_session"), 0)
+            if expiry < time.time():
+                if request.url.path.startswith("/api/"):
+                    return JSONResponse(status_code=401, content={"error": "Please sign in"})
+                return RedirectResponse("/login", status_code=303)
         response = await call_next(request)
         if request.url.path.startswith("/api/") or request.url.path.startswith("/static/"):
             # A cached copy would show the old pipeline state, or old UI after the app updates itself.
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.get("/login", include_in_schema=False)
+    def login_page():
+        return FileResponse(STATIC_DIR / "login.html")
+
+    @app.get("/api/session")
+    def session_status(request: Request):
+        return {"authenticated": not settings.demo_login_enabled or app.state.sessions.get(request.cookies.get("freight_session"), 0) > time.time(),
+                "demo": settings.demo_login_enabled}
+
+    @app.post("/api/login")
+    def login(body: dict[str, Any], response: Response):
+        from secrets import compare_digest
+        if not (compare_digest(str(body.get("username", "")).encode(), b"admin") and compare_digest(str(body.get("password", "")).encode(), b"1234")):
+            return JSONResponse(status_code=401, content={"error": "Incorrect username or password"})
+        token = token_urlsafe(32)
+        app.state.sessions[token] = time.time() + 8 * 3600
+        response.set_cookie("freight_session", token, httponly=True, samesite="lax", max_age=8 * 3600)
+        return {"ok": True}
+
+    @app.post("/api/logout")
+    def logout(request: Request, response: Response):
+        app.state.sessions.pop(request.cookies.get("freight_session"), None)
+        response.delete_cookie("freight_session")
+        return {"ok": True}
+
+    @app.get("/api/notifications")
+    def notifications():
+        from ..services.gmail_sync import gmail_inbox, queue_status
+        from ..services.destination_proposals import list_proposals
+        messages = gmail_inbox(settings, 50)
+        queue = queue_status(settings)
+        items = []
+        labels = {"received":"Received", "queued":"Waiting to be read", "analyzing":"Reading now",
+                  "draft_ready":"Ready for approval", "ready_for_approval":"Ready for approval",
+                  "needs_information":"Information missing", "needs_review":"Needs review", "attachment_unreadable":"Could not read attachment",
+                  "no_destination_match":"No destination matched", "not_a_quotation":"Set aside: not a quotation",
+                  "extraction_failed":"Could not finish reading", "reply_needs_linking":"Supplier reply needs linking"}
+        for message in messages:
+            if message["processing_status"] in {"not_a_quotation", "ignored"}: continue
+            items.append({"id":"mail-"+message["id"], "time":message["created_at"],
+                "title":message["subject"] or "Incoming email", "status":labels.get(message["processing_status"], message["processing_status"].replace("_"," ").title()), "href":"#/inbox"})
+        for proposal in list_proposals(settings):
+            items.append({"id":"proposal-"+proposal["id"],"time":proposal.get("updated_at"),
+                "title":proposal["source_name"]+" · "+proposal["database_name"],
+                "status":labels.get(proposal["status"],proposal["status"].replace("_"," ").title()),"href":"#/quotations"})
+        from ..db.models import AuditEventRow
+        with get_session(settings) as session:
+            recent = session.query(AuditEventRow).order_by(AuditEventRow.created_at.desc()).limit(50).all()
+            for event in recent:
+                items.append({"id":"event-"+event.id,"time":event.created_at,
+                    "title":event.action.replace("_", " ").capitalize(),"status":"Action recorded","href":"#/quotations"})
+        return {"items":sorted(items,key=lambda item:item["time"] or "",reverse=True)[:100],"queue":queue}
+
+    @app.get("/api/destination-proposals")
+    def destination_proposals():
+        from ..services.destination_proposals import list_proposals
+        return list_proposals(settings)
+
+    @app.post("/api/destination-proposals/{proposal_id}/{operation}")
+    def destination_decision(proposal_id: str, operation: str):
+        from ..services.destination_proposals import decide
+        return decide(settings, proposal_id, operation)
+
+    @app.get("/api/workspace/quotes")
+    def workspace_quotes(archived: bool = False, include_intake: bool = False):
+        from ..services.workspace import list_quotes
+        return list_quotes(settings, archived, include_intake)
+
+    @app.get("/api/workspace/quotes/{quote_id}")
+    def workspace_quote(quote_id: str):
+        from ..services.workspace import detail
+        return detail(settings, quote_id)
+
+    @app.get("/api/workspace/quotes/{quote_id}/sources/{source_id}/download")
+    def download_workspace_source(quote_id: str, source_id: str):
+        from ..services.common import with_session
+        from ..db.models import SourceDocumentRow, IntakeItemRow, GmailAttachmentRow
+        with with_session(settings) as repos:
+            quotation = repos.get_quotation(quote_id)
+            allowed = {str(quotation.intake_item_id)} | {str(reply.intake_item_id) for reply in repos.list_replies(str(quotation.shipment_id)) if reply.quotation_id == quotation.id}
+            source = repos.session.get(SourceDocumentRow, source_id)
+            if source is not None and source.intake_item_id not in allowed:
+                raise NotFoundError("Source document not found")
+            intake_id = source.intake_item_id if source else source_id
+            if intake_id not in allowed:
+                raise NotFoundError("Source document not found")
+            intake = repos.get_intake(intake_id)
+            filename = source.filename if source else intake.original_filename
+            source_path = Path(intake.stored_path) if intake.stored_path else None
+            intake_row = repos.session.get(IntakeItemRow, intake_id)
+            if source and source.source_kind == "attachment" and intake_row.gmail_message_id:
+                attachment = repos.session.query(GmailAttachmentRow).filter_by(message_id=intake_row.gmail_message_id, filename=filename).first()
+                source_path = Path(attachment.stored_path) if attachment and attachment.stored_path else None
+            elif source and filename != intake.original_filename:
+                source_path = None
+            if source_path and source_path.is_file():
+                return FileResponse(source_path, filename=filename)
+            from urllib.parse import quote as urlquote
+            name = Path(filename).stem + ".txt"
+            return Response(content=source.text if source else intake.raw_text, media_type="text/plain; charset=utf-8",
+                            headers={"Content-Disposition": "attachment; filename*=UTF-8''" + urlquote(name)})
+
+    @app.post("/api/workspace/quotes/{quote_id}/{operation}")
+    def workspace_operation(quote_id: str, operation: str, request_body: WorkspaceAction = Body(default=WorkspaceAction())) -> dict[str, Any]:
+        from ..services import workspace
+        body = request_body.model_dump()
+        if operation == "archive":
+            return workspace.archive(settings, quote_id, body.get("disposition", "archived"), body.get("reason", ""), body.get("reason_code", "other"))
+        if operation == "approve":
+            return workspace.approve(settings, quote_id)
+        if operation == "import":
+            return workspace.import_quote(settings, quote_id)
+        if operation == "waive-field":
+            return workspace.waive_field(settings, quote_id, body.get("field", ""), body.get("reason", ""))
+        if operation == "confirmation":
+            return workspace.request_confirmation(settings, quote_id)
+        if operation == "questions":
+            return workspace.start_questions(settings, quote_id)
+        if operation == "answer":
+            return workspace.answer(settings, quote_id, body.get("turn_id"), body.get("text", ""))
+        if operation == "save-draft":
+            return workspace.save_local_draft(settings, quote_id, body.get("turn_id"), body.get("recipient", ""), body.get("subject", ""), body.get("body", ""))
+        if operation == "draft":
+            return workspace.prepare_draft(settings, quote_id, body.get("turn_id"), body.get("recipient", ""), body.get("subject", ""), body.get("body", ""))
+        if operation == "resolve":
+            return workspace.resolve(settings, quote_id, body.get("evidence_id"), bool(body.get("use_candidate")), body.get("reason", ""))
+        raise ValidationFailureError("Unknown quotation operation")
+
+    @app.post("/api/workspace/comparison")
+    def workspace_comparison(body: ComparisonQuery) -> dict[str, Any]:
+        from ..services.workspace import compare
+        return compare(settings, body.shipment_id, body.question, body.pricing_unit)
 
     def runner() -> JobRunner:
         return app.state.runner
@@ -156,12 +303,12 @@ def create_app(settings: Settings) -> FastAPI:
                 parsers[name] = False
         return {
             "backend": "ok",
-            "database": {"url": settings.database_url, "path": str(settings.database_path),
+            "database": {"url": "configured", "path": "configured",
                          "initialized": initialized, "schema_version": version},
             "ollama": {**ollama, "model": settings.ollama_model, "base_url": settings.ollama_base_url,
                        "model_installed": settings.ollama_model in models if models else None,
                        "available_models": models},
-            "workspace": str(settings.workspace_dir),
+            "workspace": "configured",
             "limits": {"max_file_size_mb": settings.max_file_size_mb,
                        "confidence_threshold": settings.classification_confidence_threshold,
                        "supported_extensions": sorted(SUPPORTED_EXTENSIONS)},
@@ -303,7 +450,7 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.supplier_workflow import run_quotation_pipeline
 
         outcome = run_quotation_pipeline(settings, intake_id, database_id)
-        return {"ok": True, "action": outcome["action"], "draft": outcome.get("draft"),
+        return {"ok": True, "proposals": outcome.get("proposals", []), "action": outcome["action"], "draft": outcome.get("draft"),
                 "notes": outcome["notes"]}
 
     @app.post("/api/supplier-quotations/{intake_id}/analyze")
@@ -315,7 +462,7 @@ def create_app(settings: Settings) -> FastAPI:
             outcome = run_quotation_pipeline(
                 settings, intake_id, database_id,
                 progress=lambda step: setattr(job, "progress", step))
-            return {"supplier_action": outcome["action"], "draft": outcome.get("draft"),
+            return {"proposals": outcome.get("proposals", []), "supplier_action": outcome["action"], "draft": outcome.get("draft"),
                     "notes": outcome["notes"]}
 
         return {"ok": True, "job": runner().submit("supplier-analysis", intake_id, work,
@@ -343,6 +490,11 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.supplier_workflow import approve_action
         row = body.get("proposed_row") if isinstance(body.get("proposed_row"), dict) else None
         return {"ok": True, "action": approve_action(settings, action_id, row, body.get("notes"))}
+
+    @app.post("/api/supplier-actions/{action_id}/import")
+    def supplier_action_import(action_id: str):
+        from ..services.supplier_workflow import import_action
+        return {"ok": True, "action": import_action(settings, action_id)}
 
     @app.post("/api/supplier-actions/{action_id}/create-draft")
     def supplier_action_create_draft(action_id: str) -> dict[str, Any]:
@@ -372,6 +524,40 @@ def create_app(settings: Settings) -> FastAPI:
         return build_review(settings)
 
     # ---------------------------------------------------------------- documents
+    @app.post("/api/documents")
+    async def upload_documents(files: list[UploadFile] = File(...),
+                               on_duplicate: str = Form("error")) -> dict[str, Any]:
+        from ..services.intake import register_intake
+
+        if on_duplicate not in {"error", "skip", "reprocess"}:
+            raise ValidationFailureError("Choose skip or reprocess for duplicate documents")
+        results = []
+        for upload in files:
+            name = Path((upload.filename or "document").replace("\\", "/")).name
+            entry = {"file": name}
+            try:
+                if name in {"", ".", ".."}:
+                    raise ValidationFailureError("Choose a document with a valid filename")
+                payload = await upload.read(_upload_limit(settings) + 1)
+                if len(payload) > _upload_limit(settings):
+                    raise ValidationFailureError(
+                        f"File exceeds the configured limit of {_upload_limit(settings) // 1024 // 1024} MB")
+                with tempfile.TemporaryDirectory(prefix="freight-upload-") as directory:
+                    path = Path(directory) / name
+                    path.write_bytes(payload)
+                    item, skipped = register_intake(settings, None, path, on_duplicate=on_duplicate)
+                entry.update(status="duplicate" if skipped else "registered", intake_id=str(item.id),
+                             message="Document already imported" if skipped else "Document received")
+            except DuplicateIntakeError as exc:
+                entry.update(status="duplicate", intake_id=exc.existing_intake_id,
+                             options=["skip", "reprocess"], message="Document already imported")
+            except FreightAgentError as exc:
+                entry.update(status="rejected", error=str(exc))
+            finally:
+                await upload.close()
+            results.append(entry)
+        return {"results": results}
+
     @app.get("/api/documents")
     def documents(status: str | None = None, kind: str | None = None, q: str | None = None) -> list[dict[str, Any]]:
         rows = _document_rows(settings)
@@ -717,6 +903,13 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.gmail_drafts import approve_draft
         return {"ok": True, "draft": approve_draft(settings, draft_id)}
 
+    @app.post("/api/supplier-email-drafts/{draft_id}/reconcile")
+    def reconcile_email_delivery(draft_id: str, body: dict[str, Any]):
+        from ..services.gmail_send import reconcile_delivery
+        if not isinstance(body.get("delivered"), bool):
+            raise ValidationFailureError("Choose whether delivery was confirmed")
+        return reconcile_delivery(settings, draft_id, body["delivered"], str(body.get("message_id", "")), str(body.get("reason", "")))
+
     @app.post("/api/supplier-email-drafts/{draft_id}/send")
     def supplier_email_draft_send(draft_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         from ..services.gmail_send import send_approved_draft
@@ -757,7 +950,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app.state.gmail_stop_event = threading.Event()
     from ..services.gmail_sync import start_background_monitor
-    app.state.gmail_monitor_thread = start_background_monitor(settings, app.state.gmail_stop_event)
+    app.state.gmail_monitor_thread = start_background_monitor(settings, app.state.gmail_stop_event) if settings.gmail_background_enabled else None
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:

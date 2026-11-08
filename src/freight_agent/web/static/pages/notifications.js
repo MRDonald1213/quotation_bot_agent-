@@ -1,0 +1,6 @@
+window.NotificationsPage=async function(){
+ const {request,heading,frame,e}=WorkspacePages;heading('Notifications','Email processing, destination proposals, and actions in one live activity center.');
+ frame('<section class="panel"><p id="notification-live" aria-live="polite">Loading activity…</p><div id="notification-list"></div></section>');
+ const refresh=async()=>{const data=await request('/api/notifications');const target=document.getElementById('notification-list');if(!target)return;const count=document.getElementById('notification-count');if(count)count.textContent=data.items.length?String(data.items.length):'';document.getElementById('notification-live').textContent=data.queue.reading_message_id?'A quotation is being read now.':data.queue.queued?`${data.queue.queued} email(s) in the reading queue.`:'Mailbox is up to date.';target.innerHTML=data.items.map(item=>`<a class="workspace-gap row spread" href="${e(item.href)}"><span><strong>${e(item.title)}</strong><small>${e(item.diagnostic||item.time||'')}</small></span><span class="supplier-status">${e(item.status)}</span></a>`).join('')||'<p>No recent email or review activity.</p>';};
+ await refresh();clearInterval(window.notificationsPoll);window.notificationsPoll=setInterval(()=>refresh().catch(()=>{}),2500);
+};

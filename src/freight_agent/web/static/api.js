@@ -12,6 +12,7 @@
   }
 
   async function request(path, options) {
+    const epoch = window.freightRouteEpoch;
     let response;
     try {
       response = await fetch(path, options);
@@ -31,6 +32,7 @@
       throw new ApiError((payload && payload.error) || ("request failed with status " + response.status),
                          response.status, payload && payload.type);
     }
+    if (epoch !== window.freightRouteEpoch) throw new DOMException("Navigation changed", "AbortError");
     return payload;
   }
 

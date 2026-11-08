@@ -17,6 +17,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "sample_quotes"
 def settings(tmp_path: Path) -> Settings:
     s = Settings(
         _env_file=None,
+        demo_login_enabled=False, gmail_background_enabled=False,
         ollama_base_url="http://localhost:11434/v1",
         ollama_model="fake-model",
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
@@ -53,7 +54,7 @@ class FakeLLM:
         return FunctionModel(self.handler)
 
 
-@pytest.fixture()
+@pytest.fixture(autouse=True)
 def fake_llm(monkeypatch) -> FakeLLM:
     fake = FakeLLM()
     monkeypatch.setattr("freight_agent.agents.model.build_ollama_model",

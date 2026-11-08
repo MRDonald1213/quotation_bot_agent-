@@ -41,30 +41,50 @@ def _database_text(database: SupplierDatabaseRow) -> str:
 
 
 def route_databases(settings: Settings, text: str) -> tuple[list[dict], str | None, float]:
-    words = re.findall(r"[a-z0-9]+", text.lower())
+    # Whole tokens avoid matches such as "air" inside "repair". Generic column
+    # names alone cannot select a destination.
+    stop = {"supplier", "name", "email", "price", "currency", "quotation", "quote", "offer", "contact", "valid", "until"}
+    words = set(re.findall(r"[a-z0-9]+", text.lower())) - stop
     with get_session(settings) as session:
         databases = session.scalars(select(SupplierDatabaseRow).where(SupplierDatabaseRow.status == "active").order_by(SupplierDatabaseRow.created_at)).all()
     routing = []
     for database in databases:
         schema = json.loads(database.schema_json)
-        metadata = {
-            "name": database.name,
-            "description": database.description or "",
-            "category": database.category or "",
-            "aliases": " ".join(json.loads(database.routing_aliases_json)),
-            "schema": " ".join(field.get("name", "") + " " + field.get("description", "") for field in schema),
-        }
-        unique_words = {word for word in words if len(word) >= 4}
-        score = sum(weight for weight, text in (
-            (4, metadata["name"]), (3, metadata["description"]),
-            (2, metadata["category"]), (2, metadata["aliases"]), (1, metadata["schema"]),
-        ) for word in unique_words if word in text.lower())
-        if score:
-            reason = "Name, description, category, aliases, or schema metadata matched quotation text"
-        else:
-            reason = "No strong metadata match found"
-        routing.append({"database_id": database.id, "name": database.name, "score": float(score), "reason": reason})
+        metadata = [(4, database.name), (3, database.description or ""),
+                    (3, database.category or ""), (4, " ".join(json.loads(database.routing_aliases_json))),
+                    (1, " ".join(field.get("name", "") + " " + field.get("description", "") for field in schema))]
+        hits = [(weight, words & (set(re.findall(r"[a-z0-9]+", content.lower())) - stop)) for weight, content in metadata]
+        score = sum(weight * len(tokens) for weight, tokens in hits)
+        matched = sorted(set().union(*(tokens for _, tokens in hits)))
+        eligible = score >= 3
+        routing.append({"database_id": database.id, "name": database.name,
+            "score": float(score) if eligible else 0.0,
+            "reason": "Matched routing terms: " + ", ".join(matched) if eligible else "Insufficient routing evidence"})
     routing.sort(key=lambda item: item["score"], reverse=True)
+    # The overlap rule is fast and explainable; when it finds no plausible target,
+    # ask the configured local model about every database instead of stopping early.
+    if not any(item["score"] > 0 for item in routing) and databases:
+        semantic_error = None
+        try:
+            from ..agents.database_router import route
+            catalog = [{"database_id": row.id, "name": row.name, "description": row.description,
+                "category": row.category, "aliases": json.loads(row.routing_aliases_json),
+                "schema": json.loads(row.schema_json)} for row in databases]
+            choice = route(settings, text, catalog)
+            ids = {row.id for row in databases}
+            for candidate in choice.candidates:
+                if candidate.database_id in ids and candidate.confidence >= 0.45:
+                    routing.append({"database_id": candidate.database_id,
+                        "name": next(row.name for row in databases if row.id == candidate.database_id),
+                        "score": candidate.confidence,
+                        "reason": candidate.reason + " (local model routing)"})
+        except Exception as exc:
+            semantic_error = type(exc).__name__
+            logger.warning("semantic destination routing unavailable: %s", semantic_error)
+        if semantic_error and not any(item["score"] > 0 for item in routing):
+            for item in routing:
+                item["reason"] += "; local semantic router unavailable (" + semantic_error + ")"
+        routing.sort(key=lambda item: item["score"], reverse=True)
     if not routing:
         return routing, None, 0.0
     top = routing[0]
@@ -138,6 +158,13 @@ _CONCEPT_TERMS: dict[str, tuple[str, ...]] = {
     "supplier_name": ("carrier name", "supplier name", "vendor name", "company name",
                       "carrier", "supplier", "vendor", "company", "operator"),
     "contact_email": ("email address", "contact email", "e-mail", "email", "contact"),
+    "pricing_unit": ("pricing unit", "price basis", "unit", "basis"),
+    "origin": ("origin", "pickup", "loading location"),
+    "destination": ("destination", "delivery location"),
+    "fuel_type": ("fuel type",),
+    "contact_person": ("contact person", "contact name"),
+    "contact_phone": ("phone", "telephone", "contact phone"),
+    "dimensions": ("dimensions", "cargo dimensions"),
     "category": ("category", "transport mode", "transport type", "service type"),
     "lane": ("lanes", "lane", "routes", "route", "regions", "region", "corridor"),
     "price": ("unit price", "base price", "freight rate", "rate per", "freight", "price",
@@ -197,7 +224,7 @@ def _listed(raw: str | None) -> str:
     return ", ".join(items)
 
 
-def _quotation_facts(session, quote: QuotationRow | None) -> dict[str, tuple[str, str]]:
+def _quotation_facts_unfiltered(session, quote: QuotationRow | None) -> dict[str, tuple[str, str]]:
     """What workflow A already established for this document, keyed by meaning instead of column.
 
     Every value carries its grounded evidence snippet, so a supplier is never asked to repeat
@@ -256,7 +283,46 @@ def _quotation_facts(session, quote: QuotationRow | None) -> dict[str, tuple[str
         facts["quote_reference"] = (quote.quote_reference, grounded("quote_reference", "Reference of this quotation"))
     if quote.origin or quote.destination:
         facts["lane"] = (f"{place(quote.origin)} to {place(quote.destination)}", "Route read from this quotation")
+    details = json.loads(quote.details_json or "{}")
+    mapping = {"supplier_id": "record_id", "transport_type": "category", "weight_kg": "weight", "volume_m3": "volume"}
+    for field, value in details.items():
+        if value is not None:
+            facts[mapping.get(field, field)] = (str(value), grounded(field, ""))
     return facts
+
+
+def _quotation_facts(session, quote: QuotationRow | None) -> dict[str, tuple[str, str]]:
+    """Only accepted evidence grounded in a linked source can supply extracted facts."""
+    if quote is None:
+        return {}
+    from .validation import snippet_grounded
+    from ..db.models import SupplierReplyRow
+
+    source_ids = {quote.intake_item_id}
+    source_ids.update(session.scalars(select(SupplierReplyRow.intake_item_id).where(
+        SupplierReplyRow.quotation_id == quote.id)).all())
+    sources = session.scalars(select(IntakeItemRow).where(IntakeItemRow.id.in_(source_ids))).all()
+    from ..db.models import SourceDocumentRow
+    parts = session.scalars(select(SourceDocumentRow).where(SourceDocumentRow.intake_item_id.in_(source_ids))).all()
+    accepted = {}
+    for evidence in session.scalars(select(FieldEvidenceRow).where(
+            FieldEvidenceRow.quotation_id == quote.id, FieldEvidenceRow.validation_status == "accepted")):
+        if any(source.original_filename == evidence.source_filename
+               and snippet_grounded(evidence.snippet, source.raw_text) for source in sources) or any(
+                   part.filename == evidence.source_filename and snippet_grounded(evidence.snippet, part.text) for part in parts):
+            accepted[evidence.field_name] = evidence.snippet
+    field_map = {"supplier_name": "carrier_name", "price": "base_price",
+                 "charge": "charges", "transit_days": "transit_days", "record_id": "supplier_id",
+                 "category": "transport_type", "weight": "weight_kg", "volume": "volume_m3"}
+    result = {}
+    for concept, (value, _) in _quotation_facts_unfiltered(session, quote).items():
+        source_field = field_map.get(concept, concept)
+        snippet = accepted.get(source_field)
+        if concept == "transit_days":
+            snippet = snippet or accepted.get("transit_days_min") or accepted.get("transit_days_max")
+        if snippet:
+            result[concept] = (value, snippet)
+    return result
 
 
 def _match_database_record(schema: list[dict], proposed: dict[str, str], text: str,
@@ -316,6 +382,15 @@ def _action_payloads(session, actions: list[SupplierQuotationActionRow]) -> list
              "created_at": action.created_at, "updated_at": action.updated_at}
             for action in actions]
     for payload in payloads:
+        payload["database_matches"] = {
+            key: value for key, value in payload["proposed_row"].items()
+            if str(payload["evidence"].get(key, "")).startswith("Matched existing")
+        }
+        payload["extracted_fields"] = {
+            key: value for key, value in payload["proposed_row"].items()
+            if key not in payload["database_matches"] and payload["evidence"].get(key)
+            and not str(payload["evidence"][key]).startswith("Operator correction")
+        }
         # A draft asks the offer's open gaps, not the empty columns of the supplier record.
         try:
             payload["questions"] = _open_questions(session, payload)
@@ -389,9 +464,13 @@ def process_supplier_quotation(settings: Settings, intake_id: str, database_id: 
             action = existing
         else:
             action = SupplierQuotationActionRow(id=str(uuid4()), intake_id=intake_id, created_at=now)
-        if existing is not None and existing.status == "record_created":
-            # the approved row is already in the CSV; re-analysis must not erase that provenance
+        source_quote = session.scalar(select(QuotationRow).where(QuotationRow.intake_item_id == intake_id))
+        if existing is not None and existing.status == "record_created" and not (
+                source_quote and source_quote.version > 1 and source_quote.review_status == "extracted"):
             return get_action(settings, existing.id)
+        if source_quote and source_quote.review_status == "approved":
+            source_quote.review_status = "extracted"
+            source_quote.reviewed_at = None
 
         if database is None:
             action.database_id = None
@@ -500,9 +579,29 @@ def update_proposal(settings: Settings, action_id: str, proposed_row: dict[str, 
             raise NotFoundError("supplier quotation action not found")
         if action.status == "record_created":
             raise ValidationFailureError("an approved record cannot be changed after CSV creation")
+        previous = json.loads(action.proposed_row_json or "{}")
+        evidence = json.loads(action.evidence_json or "{}")
+        for field, value in proposed_row.items():
+            if previous.get(field) != value:
+                evidence[field] = "Operator correction; not extracted from quotation"
         action.proposed_row_json = json.dumps(proposed_row)
+        action.evidence_json = json.dumps(evidence)
+        database = session.get(SupplierDatabaseRow, action.database_id) if action.database_id else None
+        if database:
+            missing = [{"field": f["name"], "label": f.get("label", f["name"]), "required": True,
+                        "ask_supplier": False, "reason": "Destination requires this internal field"}
+                       for f in json.loads(database.schema_json) if f.get("required") and not str(proposed_row.get(f["name"]) or "").strip()]
+            action.missing_fields_json = json.dumps(missing)
+            questions = _open_questions(session, {"intake_id": action.intake_id, "missing_fields": []})
+            action.status = "needs_clarification" if questions else "needs_human_review" if missing else "ready_for_approval"
+        quote = session.scalar(select(QuotationRow).where(QuotationRow.intake_item_id == action.intake_id))
+        if quote and quote.review_status == "approved":
+            quote.review_status = "extracted"
+            quote.reviewed_at = None
         action.notes = notes or action.notes
         action.updated_at = utcnow_iso()
+        session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_quotation_action", entity_id=action.id,
+            action="proposal_corrected", details_json=json.dumps({"fields": list(proposed_row), "notes": notes}), created_at=utcnow_iso()))
         session.add(action)
         session.commit()
     return get_action(settings, action_id)
@@ -520,7 +619,7 @@ def _append_row(settings: Settings, database: SupplierDatabaseRow, row: dict[str
     normalized_key = tuple(normalized[name] for name in headers)
     for record in existing:
         if tuple(str(record.get(name) or "").strip() for name in headers) == normalized_key:
-            raise ValidationFailureError("this exact supplier record is already present in the CSV")
+            return normalized, "already present"
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup = path.with_name(path.stem + f".backup-{timestamp}" + path.suffix)
@@ -539,20 +638,51 @@ def _append_row(settings: Settings, database: SupplierDatabaseRow, row: dict[str
 
 
 def approve_action(settings: Settings, action_id: str, corrected_row: dict[str, str] | None = None, notes: str | None = None) -> dict:
+    """Approval records a verdict only; destination writes require a separate import."""
     with get_session(settings) as session:
+        action = session.get(SupplierQuotationActionRow, action_id)
+        if action is None:
+            raise NotFoundError("Supplier quotation action not found")
+        if action.status in {"approved", "record_created"}:
+            return get_action(settings, action_id)
+        if action.status != "ready_for_approval":
+            raise ValidationFailureError("Resolve missing information before approval")
+        if corrected_row:
+            proposal = json.loads(action.proposed_row_json)
+            proposal.update(corrected_row)
+            action.proposed_row_json = json.dumps(proposal)
+        action.status = "approved"
+        action.updated_at = utcnow_iso()
+        action.notes = notes or "Approved; import is a separate action"
+        session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_quotation_action", entity_id=action.id,
+            action="human_approved", details_json="{}", created_at=utcnow_iso()))
+        session.commit()
+    return get_action(settings, action_id)
+
+
+def import_action(settings: Settings, action_id: str, corrected_row: dict[str, str] | None = None, notes: str | None = None) -> dict:
+    from sqlalchemy import text
+    with get_session(settings) as session:
+        # Serialize CSV changes with the SQLite writer lock, including cross-process imports.
+        session.execute(text("BEGIN IMMEDIATE"))
         action = session.get(SupplierQuotationActionRow, action_id)
         if action is None:
             raise NotFoundError("supplier quotation action not found")
         if action.status == "record_created":
             return get_action(settings, action_id)
+        if action.status != "approved":
+            raise ValidationFailureError("Approve the proposal before importing")
+        source_quote = session.scalar(select(QuotationRow).where(QuotationRow.intake_item_id == action.intake_id))
+        if source_quote and (source_quote.disposition or source_quote.review_status not in {"approved", "imported"}):
+            raise ValidationFailureError("Approve the canonical quotation before importing the destination record")
         if not action.database_id:
-            raise ValidationFailureError("confirm a supplier database before approval")
+            raise ValidationFailureError("confirm a supplier database before import")
         database = session.get(SupplierDatabaseRow, action.database_id)
         if database is None or database.status != "active":
             raise NotFoundError("supplier database not found")
         proposed = json.loads(action.proposed_row_json)
-        if corrected_row:
-            proposed.update(corrected_row)
+        if corrected_row and any(proposed.get(field) != value for field, value in corrected_row.items()):
+            raise ValidationFailureError("Changed destination values require a new approval before import")
         missing = json.loads(action.missing_fields_json)
         if missing:
             schema_names = {field["name"]: field for field in json.loads(database.schema_json)}
@@ -560,6 +690,10 @@ def approve_action(settings: Settings, action_id: str, corrected_row: dict[str, 
                           and not str(proposed.get(item["field"]) or "").strip()]
             if unresolved:
                 raise ValidationFailureError("required fields remain unresolved: " + ", ".join(item["label"] for item in unresolved))
+        for field in json.loads(database.schema_json):
+            value = str(proposed.get(field["name"]) or "").strip()
+            if value and _validate_field(field, value) is None:
+                raise ValidationFailureError(f"Invalid destination field: {field.get('label') or field['name']}")
         normalized, backup = _append_row(settings, database, proposed)
         now = utcnow_iso()
         action.status = "record_created"
@@ -727,8 +861,8 @@ def _ensure_quotation_extracted(settings: Settings, intake_id: str,
                                 progress: Callable[[str], None] | None = None) -> tuple[str | None, list[str]]:
     """Run workflow A here when this document has no structured quotation yet, so nobody has to start it.
 
-    A model that cannot answer must not stop the rest of the pipeline: the note says so and the
-    supplier-record match continues from the document text.
+    A failed or uncertain extraction leaves a readable review result. Database schema matching
+    must not masquerade as a validated quotation when canonical extraction did not succeed.
     """
     from .extraction import extract_and_store_quote
 
@@ -742,7 +876,7 @@ def _ensure_quotation_extracted(settings: Settings, intake_id: str,
         return quote_id, []
     if progress:
         progress("extracting the quotation fields with the local model…")
-    override = _classifier_agreed_it_is_an_offer(settings, intake_id)
+    override = False  # Uncertain classification requires an explicit human override.
     try:
         summary = extract_and_store_quote(settings, intake_id, force=override)
     except FreightAgentError as exc:
@@ -750,46 +884,15 @@ def _ensure_quotation_extracted(settings: Settings, intake_id: str,
     except Exception as exc:  # noqa: BLE001 — the local model failing must still leave a readable result
         logger.warning("quotation extraction failed for %s: %s", intake_id, type(exc).__name__, exc_info=True)
         return None, [f"The local model did not complete the extraction ({type(exc).__name__}); "
-                      "the document was read directly instead."]
+                      "review the source before retrying."]
     return (str(summary.quotation_id) if summary.quotation_id else None), list(summary.notes)
 
 
 def run_quotation_pipeline(settings: Settings, intake_id: str, database_id: str | None = None,
                            progress: Callable[[str], None] | None = None) -> dict:
-    """Read the offer by meaning, match the supplier record, then draft only what is genuinely missing.
-
-    Preparing a draft is the end of the automatic path: a person still approves and sends it.
-    """
-    notes: list[str] = []
-    _quote_id, extraction_notes = _ensure_quotation_extracted(settings, intake_id, progress)
-    notes.extend(extraction_notes)
-    if progress:
-        progress("matching the supplier against the connected databases…")
-    action = process_supplier_quotation(settings, intake_id, database_id)
-    draft = None
-    if not action.get("database_id"):
-        notes.append("No unique supplier database matched. Select a database and analyze again.")
-        return {"action": action, "draft": draft, "notes": notes}
-    with get_session(settings) as session:
-        questions = _open_questions(session, action)
-    if questions:
-        try:
-            if progress:
-                progress("writing the reply draft with the local model…")
-            draft = _write_supplier_draft(settings, action, questions)
-            notes.append(f"{len(questions)} question(s) for the supplier — "
-                         "the reply draft is waiting for you in Draft review.")
-        except FreightAgentError as exc:
-            notes.append(str(exc))
-    elif action["status"] == "ready_for_approval":
-        notes.append("Nothing is missing from this quotation — no supplier email is needed. "
-                     "The record is ready for your approval and the price is available for comparison.")
-    elif action["status"] == "needs_human_review":
-        notes.append("Internal database fields are still empty for this supplier record; "
-                     "a person fills those in, the supplier is not asked.")
-    else:
-        notes.append("This quotation needs a person to read it before anything is recorded.")
-    return {"action": action, "draft": draft, "notes": notes}
+    """Route first, then extract independently against every matching destination schema."""
+    from .destination_proposals import process
+    return process(settings, intake_id, database_id, progress)
 
 
 def set_action_status(settings: Settings, action_id: str, status: str, notes: str | None = None) -> dict:
@@ -1085,13 +1188,15 @@ def _finding_records(settings: Settings, question_l: str, database_id: str | Non
         price_find, price_cites = _csv_price_rank(question_l, databases)
         if price_find:
             return price_find, price_cites
-    terms = [term for term in re.findall(r"[a-z0-9]+", question_l) if len(term) >= 4]
+    stopwords = {"which", "supplier", "suppliers", "quotation", "quotations", "offer", "offers", "from", "transportation", "transport", "records", "show", "list", "have", "does", "with", "that", "what", "about"}
+    terms = [term for term in re.findall(r"[a-z0-9]+", question_l) if len(term) >= 3 and term not in stopwords]
+    route_match = re.search(r"\bfrom\s+(.+?)\s+to\s+(.+?)[?.]?$", question_l.strip())
     matches = []
     for database in databases:
         _, rows = _read_csv(Path(database.csv_path))
         for row_index, row in enumerate(rows, start=2):
             haystack = " ".join(str(value) for value in row.values()).lower()
-            if terms and sum(term in haystack for term in terms) >= 1:
+            if (route_match and all(place.strip() in haystack for place in route_match.groups())) or (not route_match and terms and any(term in haystack for term in terms)):
                 matches.append((database, row_index, row))
     cites = [{"kind": "database_row", "database_id": database.id, "database_name": database.name,
               "csv_row": row_index, "row": row, "reason": "record matching your words"}
@@ -1130,10 +1235,23 @@ def _csv_price_rank(question_l: str, databases: list[SupplierDatabaseRow]) -> tu
                     candidates.append((number, database, field, row_index, row))
     if not candidates:
         return ("None of the connected supplier databases has a numeric price column to rank.", [])
+    bases = set()
+    for _, database, field, _, row in candidates:
+        normalized = {key.casefold(): str(value).strip().casefold() for key, value in row.items()}
+        currency = normalized.get("currency")
+        unit = normalized.get("unit") or normalized.get("pricing_unit")
+        if not currency or not unit:
+            return "A fair price comparison needs an explicit currency and pricing unit for every record.", []
+        bases.add((currency, unit, field["name"], normalized.get("origin"), normalized.get("destination")))
+    if len(bases) != 1:
+        return "These records have different currencies, pricing units, routes or price fields; select a compatible group before ranking.", []
     number, database, field, row_index, row = (max if wants_high else min)(candidates, key=lambda item: item[0])
     word = "highest" if wants_high else "lowest"
-    return (f"In the supplier records the {word} {str(field.get('label', field['name'])).lower()} is "
-            f"{number} in {database.name}, CSV row {row_index}: {_row_summary(row)}."), [
+    identity = next((str(value) for key, value in row.items() if any(term in key.lower() for term in ("supplier_name", "carrier_name", "vendor_name", "company_name"))), "The selected supplier")
+    normalized_row = {key.casefold(): str(value) for key, value in row.items()}
+    currency, unit = normalized_row.get("currency", ""), normalized_row.get("unit") or normalized_row.get("pricing_unit", "")
+    return (f"{identity} offers the {word} recorded rate at {number} {currency} per {unit} "
+            f"among the compatible records in {database.name}. This compares the recorded rate only; quotation eligibility still requires review."), [
         {"kind": "database_row", "database_id": database.id, "database_name": database.name,
          "csv_row": row_index, "row": row, "reason": f"{word} price column value"}]
 
@@ -1143,6 +1261,17 @@ def chat_supplier_databases(settings: Settings, question: str, database_id: str 
     from ..agents.chat_agent import phrase
     from ..domain.exceptions import ModelUnavailableError
 
+    if database_id is None:
+        from .workspace import compare
+        from .common import with_session
+        with with_session(settings) as repos:
+            shipments = repos.list_shipments()
+        if len(shipments) != 1:
+            return {"question": question, "answer": "Select a shipment/lane in Comparison or the Supplier Assistant before ranking quotations.",
+                    "citations": [], "intent": "select_lane", "wording": "plain"}
+        result = compare(settings, str(shipments[0].id), question)
+        return {**result, "question": question, "answer": result["explanation"],
+                "citations": [{"quotation_id": qid, "reason": result["explanation"]} for qid in result["selected_ids"]], "wording": "plain"}
     question_l = question.lower().strip()
     with get_session(settings) as session:
         fleet = _fleet(settings, session)
@@ -1161,13 +1290,15 @@ def chat_supplier_databases(settings: Settings, question: str, database_id: str 
             "value": lambda: _finding_value(fleet),
             "inventory": lambda: _finding_inventory(fleet),
         }
-        if intent in builders:
+        if database_id:
+            findings, citations = _finding_records(settings, question_l, database_id)
+        elif intent in builders:
             findings, citations = builders[intent]()
         else:
             findings, citations = _finding_records(settings, question_l, database_id)
     wording = "plain"
     answer = findings
-    if on_topic and intent != "off_topic":
+    if on_topic and intent != "off_topic" and database_id is None:
         try:
             answer = phrase(settings, question=question, findings=findings)
             wording = "local-model"

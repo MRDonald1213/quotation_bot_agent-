@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import base64
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import parseaddr, getaddresses
 import json
 import logging
+import re
 from uuid import uuid4
 
 from google.auth.transport.requests import Request
@@ -40,25 +41,32 @@ def _gmail_draft_message(recipient: str, cc: str, subject: str, body: str, threa
 
 def _create_or_update_gmail_draft(settings: Settings, recipient: str, cc: str, subject: str, body: str,
                                    thread_id: str | None, gmail_draft_id: str | None = None) -> str | None:
-    try:
-        credentials = _credentials(settings)
-        if credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
-        service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
-        payload = {"message": _gmail_draft_message(recipient, cc, subject, body, thread_id)}
-        if gmail_draft_id:
-            result = service.users().drafts().update(userId="me", id=gmail_draft_id, body=payload).execute()
-        else:
-            result = service.users().drafts().create(userId="me", body=payload).execute()
-        return result.get("id")
-    except Exception as exc:  # noqa: BLE001 — the local draft is still the record of the text
-        logger.warning("Gmail-side draft could not be written: %s", type(exc).__name__)
-        return None
+    return None  # Draft preparation is local; only explicit SEND contacts Gmail.
 
 
 def _address(value: str | None) -> str:
     _, address = parseaddr(str(value or ""))
     return (address or "").strip().lower()
+
+
+def _validate_content(recipient: str, cc: str, subject: str, body: str) -> None:
+    recipients = getaddresses([recipient])
+    copied = getaddresses([cc]) if cc.strip() else []
+    if (len(recipients) != 1 or any("\n" in value or "\r" in value for value in (recipient, cc, subject))
+            or not all(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) for _, address in recipients + copied)
+            or not subject.strip() or not body.strip()):
+        raise ValidationFailureError("Verify one recipient, valid copied addresses, subject and email content")
+
+
+def assert_current(session, draft: SupplierEmailDraftRow) -> None:
+    from ..db.models import QuotationRow, ClarificationTurnRow
+    if draft.quotation_id:
+        quotation = session.get(QuotationRow, draft.quotation_id)
+        turn = session.get(ClarificationTurnRow, draft.clarification_turn_id) if draft.clarification_turn_id else None
+        if not quotation or quotation.disposition or quotation.review_status == "rejected":
+            raise ValidationFailureError("Archived quotations cannot send or edit clarification emails")
+        if turn and (turn.quotation_version != quotation.version or turn.reply_text is not None):
+            raise ValidationFailureError("This email belongs to an answered or older quotation version; create current clarification questions")
 
 
 def _draft_context(session, settings: Settings, drafts: list[SupplierEmailDraftRow]) -> dict[str, dict]:
@@ -145,7 +153,7 @@ def list_drafts(settings: Settings) -> list[dict]:
         rows = session.query(SupplierEmailDraftRow).order_by(SupplierEmailDraftRow.updated_at.desc()).all()
         context = _draft_context(session, settings, list(rows))
     return [{**context.get(row.id, {"name": row.subject}),
-             "id": row.id,
+             "id": row.id, "quotation_id": row.quotation_id, "clarification_turn_id": row.clarification_turn_id,
              "name": context.get(row.id, {}).get("name") or row.subject,
              "recipient": row.recipient, "bound_recipient": row.bound_recipient,
              "recipient_locked": bool(row.bound_recipient), "cc": row.cc, "subject": row.subject,
@@ -156,13 +164,19 @@ def list_drafts(settings: Settings) -> list[dict]:
 
 
 def save_draft(settings: Settings, draft_id: str, recipient: str, cc: str, subject: str, body: str) -> dict:
+    _validate_content(recipient, cc, subject, body)
     now = utcnow_iso()
     with get_session(settings) as session:
         draft = session.get(SupplierEmailDraftRow, draft_id)
         if draft is None:
             raise NotFoundError("Email draft not found")
-        if draft.status in {"approved", "sent"}:
-            raise ValidationFailureError("Approved or sent drafts are locked and cannot be edited")
+        if draft.status in {"sent", "sending"}:
+            raise ValidationFailureError("Sent or pending-delivery drafts cannot be edited")
+        assert_current(session, draft)
+        draft.status = "draft"
+        draft.approved_recipient = None
+        draft.immutable_approved_body = None
+        draft.approved_subject = None
         if draft.bound_recipient and _address(recipient) != _address(draft.bound_recipient):
             raise ValidationFailureError(
                 f"This reply can only go to {draft.bound_recipient}, the sender of the quotation email.")
@@ -187,6 +201,7 @@ def get_draft(settings: Settings, draft_id: str) -> dict:
             raise NotFoundError("Email draft not found")
         label = _draft_context(session, settings, [draft]).get(draft.id, {}).get("name")
         return {"id": draft.id, "name": label or draft.subject,
+                "quotation_id": draft.quotation_id, "clarification_turn_id": draft.clarification_turn_id,
                 "recipient": draft.recipient, "bound_recipient": draft.bound_recipient,
                 "recipient_locked": bool(draft.bound_recipient), "cc": draft.cc, "subject": draft.subject,
                 "body": draft.body, "status": draft.status, "gmail_draft_id": draft.gmail_draft_id,
@@ -201,6 +216,7 @@ def create_draft(settings: Settings, *, recipient: str, cc: str, subject: str, b
                  gmail_account_id: str, quotation_register_id: str | None = None,
                  supplier_master_id: str | None = None, gmail_thread_id: str | None = None,
                  supplier_action_id: str | None = None, bound_recipient: str | None = None) -> dict:
+    _validate_content(recipient, cc, subject, body)
     if not recipient.strip() or not subject.strip() or not body.strip():
         raise ValidationFailureError("recipient, subject and body are required")
     if not _address(recipient):
@@ -236,7 +252,7 @@ def upsert_action_draft(settings: Settings, *, supplier_action_id: str, recipien
     open_draft = next((draft_id for draft_id, status in current if status == "draft"), None)
     if open_draft is not None:
         return save_draft(settings, open_draft, recipient=recipient, cc=cc, subject=subject, body=body)
-    locked = next((draft_id for draft_id, status in current if status in {"approved", "sent"}), None)
+    locked = next((draft_id for draft_id, status in current if status == "approved"), None)
     if locked is not None:
         return get_draft(settings, locked)
     return create_draft(settings, recipient=recipient, cc=cc, subject=subject, body=body,
@@ -262,8 +278,30 @@ def approve_draft(settings: Settings, draft_id: str) -> dict:
         draft = session.get(SupplierEmailDraftRow, draft_id)
         if draft is None:
             raise NotFoundError("Email draft not found")
-        if draft.status == "sent":
-            raise ValidationFailureError("Sent drafts cannot be approved again")
+        if draft.status in {"sent", "sending"}:
+            raise ValidationFailureError("Sent or pending-delivery drafts cannot be approved again")
+        _validate_content(draft.recipient, draft.cc, draft.subject, draft.body)
+        assert_current(session, draft)
+        if draft.clarification_turn_id:
+            from ..db.models import ClarificationTurnRow, ClarificationDraftRow, QuestionSetRow
+            turn = session.get(ClarificationTurnRow, draft.clarification_turn_id)
+            if turn:
+                questions = json.loads(turn.questions_json)
+                verified = all(q["text"] in draft.body for q in questions)
+                if verified:
+                    questions.sort(key=lambda q: draft.body.index(q["text"]))
+                for question in questions:
+                    question["order_verified"] = verified
+                turn.questions_json = json.dumps(questions)
+            local = session.get(ClarificationDraftRow, draft.clarification_turn_id)
+            if local:
+                local.subject, local.body, local.recipient = draft.subject, draft.body, draft.recipient
+                local.status, local.approved_at = "approved", now
+            question_set = session.get(QuestionSetRow, draft.clarification_turn_id)
+            if question_set:
+                question_set.status, question_set.approved_at = "approved", now
+        if not _address(draft.recipient) or "@" not in _address(draft.recipient) or not draft.subject.strip() or not draft.body.strip():
+            raise ValidationFailureError("Verify recipient, subject and body before approval")
         if draft.bound_recipient and _address(draft.recipient) != _address(draft.bound_recipient):
             raise ValidationFailureError(
                 f"This reply can only go to {draft.bound_recipient}, the sender of the quotation email.")

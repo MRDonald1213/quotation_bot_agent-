@@ -79,7 +79,13 @@ def register_intake(settings: Settings, shipment_id: str | None, path: Path,
             item.sender = parsed.sender[:300]
         if parsed.subject and not subject:
             item.subject = parsed.subject
-        repos.add_intake(item)
-        repos.add_audit(AuditEvent(entity_type="intake_item", entity_id=item.id, action="registered",
-                                   details_json=json.dumps({"sha256": digest[:16], "file": path.name})))
+        with repos.atomic():
+            repos.add_intake(item)
+            from ..db.models import SourceDocumentRow
+            from uuid import uuid4
+            repos.session.add(SourceDocumentRow(id=str(uuid4()), intake_item_id=str(item.id),
+                filename=item.original_filename, source_kind="document", text=parsed.text,
+                location=parsed.page_or_sheet_info))
+            repos.add_audit(AuditEvent(entity_type="intake_item", entity_id=item.id, action="registered",
+                                       details_json=json.dumps({"sha256": digest[:16], "file": path.name})))
         return item, False

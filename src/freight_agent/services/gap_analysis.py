@@ -42,6 +42,8 @@ ASKABLE_FIELDS: frozenset[str] = frozenset({
 
 ASKABLE_QUESTIONS: dict[str, str] = {
     "currency": "Which currency is this price in?",
+    "carrier_name": "What supplier or carrier name should we use for this quotation?",
+    "pricing_unit": "Is this price per shipment, per kilogram, per hour, or another pricing unit?",
     "base_price": "What is the base freight price, and what does it include?",
     "charges": "For each extra charge not included in the base price, what is the amount and currency?",
     "delivery_scope": "Does this price cover delivery to the final address, or only to the port?",

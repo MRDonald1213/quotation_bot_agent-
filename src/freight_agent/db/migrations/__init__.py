@@ -33,6 +33,21 @@ def init_schema(session: Session) -> list[str]:
             if not dbapi_connection.in_transaction:
                 connection.exec_driver_sql("BEGIN")
         Base.metadata.create_all(connection)
+        if current < 9:
+            draft_columns = {column["name"] for column in inspect(connection).get_columns("supplier_email_drafts")}
+            for name in ("quotation_id", "clarification_turn_id"):
+                if name not in draft_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE supplier_email_drafts ADD COLUMN {name} VARCHAR(36)")
+            columns = {column["name"] for column in inspect(connection).get_columns("quotations")}
+            for name, definition in (("details_json", "TEXT NOT NULL DEFAULT '{}'"),
+                                     ("disposition", "VARCHAR(24)"), ("disposition_reason", "TEXT"),
+                                     ("archived_at", "VARCHAR(32)")):
+                if name not in columns:
+                    connection.exec_driver_sql(f"ALTER TABLE quotations ADD COLUMN {name} {definition}")
+        if current < 9 and current >= 4:
+            connection.exec_driver_sql(
+                "UPDATE quotations SET disposition='rejected', disposition_reason=COALESCE(review_notes, 'Legacy rejection: reason not recorded'), "
+                "archived_at=COALESCE(reviewed_at, updated_at) WHERE review_status='rejected' AND disposition IS NULL")
         if current < 3:
             shipment_columns = {
                 column["name"] for column in inspect(connection).get_columns("shipments")
@@ -141,6 +156,21 @@ def init_schema(session: Session) -> list[str]:
                 description="schema v8: Gmail source linked to each intake and supplier drafts bound to their sender",
             ))
             applied.append("v8")
+        if current < 9:
+            session.add(SchemaVersionRow(version=9, applied_at=utcnow_iso(),
+                description="schema v9: universal quotation details, source documents, clarification turns, archive and import journal"))
+            applied.append("v9")
+        if current < 10:
+            session.add(SchemaVersionRow(version=10, applied_at=utcnow_iso(),
+                description="schema v10: independent schema-directed destination proposals"))
+            applied.append("v10")
+        if current < 11:
+            columns = {column["name"] for column in inspect(connection).get_columns("gmail_accounts")}
+            if "sync_after_at" not in columns:
+                connection.exec_driver_sql("ALTER TABLE gmail_accounts ADD COLUMN sync_after_at VARCHAR(32)")
+            session.add(SchemaVersionRow(version=11, applied_at=utcnow_iso(),
+                description="schema v11: mailbox receive cutoff for a clean workspace"))
+            applied.append("v11")
     return applied
 
 

@@ -10,25 +10,22 @@ from .common import Table, console, settings_or_exit, typed_errors
 
 
 @typed_errors
-def list_(shipment_id: Optional[str] = typer.Option(None, "--shipment-id")) -> None:
-    settings = settings_or_exit()
-    with with_session(settings) as repos:
-        quotes = repos.list_quotations(shipment_id)
-        carriers = {str(c.id): c.name for c in
-                    (repos.get_carrier(str(q.carrier_id)) for q in quotes if q.carrier_id) if c}
-    table = Table(title="quotations")
-    for col in ("id", "carrier", "ref", "base price", "known total", "valid until", "status"):
-        table.add_column(col)
-    for q in quotes:
-        table.add_row(
-            str(q.id)[:8],
-            carriers.get(str(q.carrier_id), "?") if q.carrier_id else "?",
-            q.quote_reference or "-",
-            format_money(q.base_price, q.currency),
-            format_money(q.total_known_cost, q.currency),
-            str(q.valid_until or "unknown"),
-            str(q.comparison_status),
-        )
+def list_(shipment_id: Optional[str] = typer.Option(None, "--shipment-id"),
+          archived: bool = typer.Option(False, "--archived")) -> None:
+    from decimal import Decimal
+    from ..services.workspace import list_quotes
+    rows = list_quotes(settings_or_exit(), archived)
+    if shipment_id:
+        rows = [row for row in rows if row["shipment_id"] == shipment_id]
+    table = Table(title="Archived quotations" if archived else "Quotations")
+    for column in ("id", "supplier", "lane", "reference", "price", "unit", "stage"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(row["id"][:8], row["supplier"] or "Not stated",
+            f"{row['origin'] or 'Unknown'} → {row['destination'] or 'Unknown'}",
+            row["quote_reference"] or "Not stated",
+            format_money(Decimal(row["base_price"]) if row["base_price"] is not None else None, row["currency"]),
+            row["details"]["pricing_unit"] or "Unknown", row["stage"])
     console.print(table)
 
 
@@ -106,3 +103,41 @@ def show(quote_id: str) -> None:
         console.print(gt)
     else:
         console.print("[green]no open gaps[/green]")
+
+
+@typed_errors
+def archive(quote_id: str, reason: str = typer.Option(..., "--reason"), disposition: str = typer.Option("archived", "--disposition")) -> None:
+    from ..services.workspace import archive as archive_quote
+    archive_quote(settings_or_exit(), quote_id, disposition, reason)
+    console.print("Quotation archived; history preserved")
+
+
+@typed_errors
+def approve(quote_id: str) -> None:
+    from ..services.workspace import approve as approve_quote
+    approve_quote(settings_or_exit(), quote_id)
+    console.print("Quotation approved; import remains separate")
+
+
+@typed_errors
+def import_(quote_id: str) -> None:
+    from ..services.workspace import import_quote
+    console.print(import_quote(settings_or_exit(), quote_id))
+
+
+@typed_errors
+def ask(quote_id: str) -> None:
+    from ..services.workspace import start_questions
+    console.print(start_questions(settings_or_exit(), quote_id))
+
+
+@typed_errors
+def answer(quote_id: str, turn_id: str, text: str) -> None:
+    from ..services.workspace import answer as answer_questions
+    console.print(answer_questions(settings_or_exit(), quote_id, turn_id, text))
+
+
+@typed_errors
+def resolve(quote_id: str, evidence_id: str, reason: str = typer.Option(..., "--reason"), use_candidate: bool = typer.Option(False, "--use-candidate")) -> None:
+    from ..services.workspace import resolve as resolve_conflict
+    console.print(resolve_conflict(settings_or_exit(), quote_id, evidence_id, use_candidate, reason))

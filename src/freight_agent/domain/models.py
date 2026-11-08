@@ -89,6 +89,7 @@ class Carrier(DomainModel):
 
 
 class Charge(DomainModel):
+    pricing_unit: str | None = None
     label: str
     amount: Decimal | None = None
     currency: str | None = None
@@ -97,7 +98,29 @@ class Charge(DomainModel):
     evidence_snippet: str | None = None
 
 
+class QuotationDetails(DomainModel):
+    origin_country: str | None = None
+    destination_country: str | None = None
+    supplier_id: str | None = None
+    pricing_unit: str | None = None
+    transport_type: str | None = None
+    fuel_type: str | None = None
+    cargo_description: str | None = None
+    weight_kg: Decimal | None = None
+    volume_m3: Decimal | None = None
+    dimensions: str | None = None
+    contact_person: str | None = None
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    valid_from: date | None = None
+    additional_conditions: str | None = None
+
+
 class Quotation(DomainModel):
+    details: QuotationDetails = Field(default_factory=QuotationDetails)
+    disposition: str | None = None
+    disposition_reason: str | None = None
+    archived_at: datetime | None = None
     id: UUID = Field(default_factory=uuid4)
     shipment_id: UUID
     carrier_id: UUID | None = None
@@ -200,13 +223,14 @@ class ClassificationResult(DomainModel):
 
 
 class EvidenceItem(DomainModel):
+    source_filename: str | None = None
     field_name: str
     snippet: str
     page_or_sheet: str | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
-class QuoteExtraction(DomainModel):
+class QuoteExtraction(QuotationDetails):
     carrier_name: str | None = None
     quote_reference: str | None = None
     currency: str | None = None
@@ -314,6 +338,9 @@ class ProcessingSummary(DomainModel):
 
 
 class ComparisonRow(DomainModel):
+    pricing_unit: str | None = None
+    transit_days: int | None = None
+    exclusions: list[str] = Field(default_factory=list)
     """One carrier quote normalized into the cross-carrier comparison schema (§10 output)."""
     quotation_id: UUID
     carrier_name: str | None = None
@@ -350,3 +377,23 @@ class ComparisonReport(DomainModel):
     recommendation: str | None = None
     recommendation_basis: list[str] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
+
+
+class WorkspaceAction(DomainModel):
+    disposition: str = "archived"
+    reason: str = Field(default="", max_length=4000)
+    reason_code: str = "other"
+    field: str = ""
+    turn_id: str | None = None
+    text: str = Field(default="", max_length=100000)
+    recipient: str = Field(default="", max_length=500)
+    subject: str = Field(default="", max_length=500)
+    body: str = Field(default="", max_length=100000)
+    evidence_id: str | None = None
+    use_candidate: bool = Field(default=False, strict=True)
+
+
+class ComparisonQuery(DomainModel):
+    shipment_id: str = Field(min_length=1, max_length=120)
+    question: str = Field(default="Which quotation is cheapest?", min_length=1, max_length=4000)
+    pricing_unit: str | None = Field(default=None, max_length=100)

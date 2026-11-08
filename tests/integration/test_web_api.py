@@ -111,7 +111,7 @@ def test_status_reports_local_model_and_schema_without_calling_it(client: TestCl
     payload = client.get("/api/status").json()
     assert payload["backend"] == "ok"
     assert payload["database"]["initialized"] is True
-    assert payload["database"]["schema_version"] == 8
+    assert payload["database"]["schema_version"] == 11
     assert payload["ollama"]["model"] == "fake-model"
     assert set(payload["parsers"]) == {"pdf", "docx", "xlsx"}
     assert ".eml" in payload["limits"]["supported_extensions"]
@@ -216,9 +216,10 @@ def test_complete_supplier_database_flow(client: TestClient, tmp_path: Path) -> 
         upload = client.post("/api/documents", files={"files": (quotation.name, handle)}, data={"on_duplicate": "error"})
     intake_id = upload.json()["results"][0]["intake_id"]
 
-    processed = client.post(f"/api/supplier-quotations/{intake_id}/process", params={"database_id": database_id})
-    assert processed.status_code == 200, processed.text
-    action = processed.json()["action"]
+    # The generic CSV adapter remains supported independently of freight extraction.
+    # A fuel-only document must not bypass canonical freight classification gates.
+    from freight_agent.services.supplier_workflow import process_supplier_quotation
+    action = process_supplier_quotation(client.app.state.settings, intake_id, database_id)
     assert action["database_id"] == database_id
     assert action["status"] == "ready_for_approval"
     assert action["proposed_row"]["supplier_name"] == "New Fuel Supplier"
@@ -226,7 +227,10 @@ def test_complete_supplier_database_flow(client: TestClient, tmp_path: Path) -> 
 
     approved = client.post(f"/api/supplier-actions/{action['id']}/approve")
     assert approved.status_code == 200, approved.text
-    created = approved.json()["action"]
+    assert approved.json()["action"]["status"] == "approved"
+    imported = client.post(f"/api/supplier-actions/{action['id']}/import")
+    assert imported.status_code == 200
+    created = imported.json()["action"]
     assert created["status"] == "record_created"
     assert created["created_csv_row"]["supplier_name"] == "New Fuel Supplier"
 
@@ -411,9 +415,31 @@ def test_import_is_refused_before_approval(reviewed_quote) -> None:
         assert repos.get_quotation(quote_id).review_status == ReviewStatus.extracted
 
 
+def _resolve_review_requirements(client, quote_id):
+    from freight_agent.domain.enums import GapStatus
+    with with_session(client.app.state.settings) as repos, repos.atomic():
+        quote = repos.get_quotation(quote_id)
+        quote.details.pricing_unit = "shipment"
+        shipment = repos.get_shipment(str(quote.shipment_id))
+        shipment.status = "open"
+        repos.update_shipment(shipment)
+        from freight_agent.domain.models import Gap
+        repos.add_gaps([Gap(shipment_id=quote.shipment_id, quotation_id=quote.id, field_name="pricing_unit", gap_type="missing", severity="critical", description="Explicit operator waiver in test", status="waived"),
+                       Gap(shipment_id=quote.shipment_id, quotation_id=quote.id, field_name="currency", gap_type="missing", severity="critical", description="Explicit operator waiver in test", status="waived")])
+        repos.update_quotation(quote)
+        for gap in repos.list_gaps(str(quote.shipment_id)):
+            gap.status = GapStatus.waived
+            repos.update_gap(gap)
+        for evidence in repos.evidence_for_quotation(quote_id):
+            evidence.validation_status = ValidationStatus.accepted
+            repos.update_evidence(evidence)
+
+
 def test_approval_then_import_commits_once(reviewed_quote) -> None:
     client, quote_id = reviewed_quote
     settings = client.app.state.settings
+    assert client.post(f"/api/quotes/{quote_id}/review/approve").status_code == 400
+    _resolve_review_requirements(client, quote_id)
     approved = client.post(f"/api/quotes/{quote_id}/review/approve", json={"notes": "checked against the PDF"})
     assert approved.status_code == 200
     assert approved.json()["review_status"] == ReviewStatus.approved.value
@@ -422,7 +448,7 @@ def test_approval_then_import_commits_once(reviewed_quote) -> None:
     assert preview["already_imported"] is False
     assert preview["creates"] == [{"record": "quotation", "id": quote_id}]
     assert preview["updates"][0]["to"] == ReviewStatus.imported.value
-    assert preview["warnings"], "open critical gaps must be warned about before importing"
+    assert not preview["linked"]["critical_gaps"]
 
     imported = client.post(f"/api/quotes/{quote_id}/import")
     assert imported.status_code == 200
@@ -442,6 +468,7 @@ def test_approval_then_import_commits_once(reviewed_quote) -> None:
 
 def test_reapproval_after_import_is_refused(reviewed_quote) -> None:
     client, quote_id = reviewed_quote
+    _resolve_review_requirements(client, quote_id)
     client.post(f"/api/quotes/{quote_id}/review/approve")
     client.post(f"/api/quotes/{quote_id}/import")
     response = client.post(f"/api/quotes/{quote_id}/review/approve")

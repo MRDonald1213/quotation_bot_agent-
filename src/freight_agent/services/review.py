@@ -35,10 +35,12 @@ def clear_quotation_data(settings: Settings) -> dict[str, int]:
         GmailAttachmentRow, GmailMessageRow, GmailSupplierReplyRow, IntakeItemRow,
         QuestionSetRow, QuotationRegisterRow, QuotationRow, QuotationVersionRow,
         ShipmentRow, SupplierEmailDraftRow, SupplierQuotationActionRow, SupplierReplyRow,
+        SourceDocumentRow, ClarificationTurnRow, DestinationImportRow, SupplierDatabaseRow, DestinationProposalRow,
     )
 
     deleted: dict[str, int] = {}
     models = (
+        DestinationProposalRow, DestinationImportRow, ClarificationTurnRow, SourceDocumentRow,
         SupplierEmailDraftRow, GmailSupplierReplyRow, QuotationRegisterRow,
         SupplierQuotationActionRow, GmailAttachmentRow, GmailMessageRow,
         ClarificationDraftRow, QuestionSetRow, SupplierReplyRow, QuotationVersionRow,
@@ -46,6 +48,14 @@ def clear_quotation_data(settings: Settings) -> dict[str, int]:
         CarrierRow, AuditEventRow,
     )
     with get_session(settings) as session:
+        preserved_paths = [Path(row.csv_path).resolve() for row in session.query(SupplierDatabaseRow).all()]
+        preserved_paths.append(settings.project_oauth_token_path)
+        if settings.google_oauth_credentials_path:
+            preserved_paths.append(settings.project_credentials_path)
+        cutoff = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        from ..db.models import GmailAccountRow
+        session.query(GmailAccountRow).filter(GmailAccountRow.status == "connected").update(
+            {GmailAccountRow.sync_after_at: cutoff}, synchronize_session=False)
         for model in models:
             result = session.query(model).delete(synchronize_session=False)
             deleted[model.__tablename__] = int(result)
@@ -54,6 +64,9 @@ def clear_quotation_data(settings: Settings) -> dict[str, int]:
     workspace_files = 0
     if settings.workspace_dir.exists():
         for child in settings.workspace_dir.iterdir():
+            resolved = child.resolve()
+            if any(resolved == path or resolved in path.parents for path in preserved_paths):
+                continue
             if child.is_file() or child.is_symlink():
                 child.unlink()
                 workspace_files += 1
@@ -246,7 +259,7 @@ def build_review(settings: Settings) -> dict[str, Any]:
                 "quotes": quotes,
                 "open_gaps": len([g for g in gaps if g.quotation_id is not None]),
                 "drafts": [{
-                    "id": str(d.id), "subject": d.subject, "body": d.body,
+                    "id": str(d.id), "question_set_id": str(d.question_set_id), "subject": d.subject, "body": d.body,
                     "recipient": d.recipient, "status": str(d.status),
                     "quotation_id": str(d.quotation_id),
                     "quotation_name": name_for_quotation(repos.session, str(d.quotation_id)),
@@ -284,14 +297,20 @@ def build_review(settings: Settings) -> dict[str, Any]:
             "counts": counts, "documents": documents, "shipments": shipment_cards, "activity": activity}
 
 
-def approve_review(settings: Settings, quotation_id: str, notes: str | None = None) -> Quotation:
+def _approve_review(settings: Settings, quotation_id: str, notes: str | None = None) -> Quotation:
     """Record the human review verdict; the canonical commit stays a separate step."""
     with with_session(settings) as repos, repos.atomic():
         quote = repos.get_quotation(quotation_id)
+        if quote.disposition or quote.review_status == ReviewStatus.rejected:
+            raise ValidationFailureError("Archived quotations cannot be approved")
         if quote.review_status in {ReviewStatus.imported}:
             raise ValidationFailureError("This quotation is already imported; reprocessing creates a new version to review.")
         if quote.review_status == ReviewStatus.approved:
             return quote
+        from .workspace import readiness
+        missing, conflicts, gaps = readiness(repos, quote)
+        if missing or conflicts or gaps:
+            raise ValidationFailureError("Resolve or waive missing information and conflicts before approval")
         stamp = _now()
         approved = quote.model_copy(update={
             "review_status": ReviewStatus.approved, "reviewed_at": stamp, "updated_at": stamp,
@@ -304,6 +323,8 @@ def approve_review(settings: Settings, quotation_id: str, notes: str | None = No
 
 
 def reject_review(settings: Settings, quotation_id: str, reason: str | None) -> Quotation:
+    if not reason or not reason.strip():
+        raise ValidationFailureError("A rejection reason is required")
     with with_session(settings) as repos, repos.atomic():
         quote = repos.get_quotation(quotation_id)
         if quote.review_status == ReviewStatus.imported:
@@ -311,12 +332,23 @@ def reject_review(settings: Settings, quotation_id: str, reason: str | None) -> 
         stamp = _now()
         rejected = quote.model_copy(update={
             "review_status": ReviewStatus.rejected, "reviewed_at": stamp, "updated_at": stamp,
+            "disposition": "rejected", "disposition_reason": reason, "archived_at": stamp,
             "review_notes": reason or quote.review_notes,
         })
         repos.update_quotation(rejected)
         repos.add_audit(AuditEvent(entity_type="quotation", entity_id=rejected.id, action="review_rejected",
                                    details_json=json.dumps({"reason": reason})))
         return rejected
+
+
+def approve_review(settings: Settings, quotation_id: str, notes: str | None = None) -> Quotation:
+    from .workspace import approve
+    return Quotation.model_validate(approve(settings, quotation_id, notes))
+
+
+def import_reviewed(settings: Settings, quotation_id: str) -> dict[str, Any]:
+    from .workspace import import_quote
+    return import_quote(settings, quotation_id)
 
 
 def preview_import(settings: Settings, quotation_id: str) -> dict[str, Any]:
@@ -355,13 +387,15 @@ def preview_import(settings: Settings, quotation_id: str) -> dict[str, Any]:
         }
 
 
-def import_reviewed(settings: Settings, quotation_id: str) -> dict[str, Any]:
+def _commit_reviewed(settings: Settings, quotation_id: str) -> dict[str, Any]:
     """Commit an approved extraction to the canonical record; safe to call twice."""
     with with_session(settings) as repos, repos.atomic():
         quote = repos.get_quotation(quotation_id)
         if quote.review_status == ReviewStatus.imported:
             return {"already_imported": True, "quotation_id": str(quote.id), "version": quote.version,
                     "message": f"quotation {quote.id} v{quote.version} was already imported — nothing changed"}
+        if quote.disposition:
+            raise ValidationFailureError("Archived quotations cannot be imported")
         if quote.review_status != ReviewStatus.approved:
             raise ValidationFailureError(
                 "Approve the review before importing; import only commits an approved extraction.")

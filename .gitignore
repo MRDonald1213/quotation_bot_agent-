@@ -9,3 +9,5 @@ build/
 secrets/
 data/google-oauth-token.json
 google-oauth-token.json
+
+.tools/

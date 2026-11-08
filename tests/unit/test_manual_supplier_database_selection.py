@@ -40,3 +40,26 @@ def test_manual_database_override_skips_routing_and_extracts_schema(settings):
         "carrier_name": "Baltic Lines",
         "contact_email": "sales@baltic.example",
     }
+
+
+def test_database_match_is_not_extracted_evidence(settings):
+    now = utcnow_iso()
+    settings.workspace_dir.mkdir(parents=True, exist_ok=True)
+    csv = settings.workspace_dir / "suppliers.csv"
+    csv.write_text("Supplier_Name,Supplier_ID\nTruckCO,SUP-1005\n")
+    with get_session(settings) as session:
+        session.add(IntakeItemRow(id="match-intake", source_type="upload",
+            original_filename="offer.txt", stored_path="offer.txt", content_sha256="c" * 64,
+            raw_text="Supplier Name: TruckCO", file_size_bytes=22,
+            classification_status="pending", processing_status="pending", created_at=now))
+        session.add(SupplierDatabaseRow(id="match-db", name="Carriers", csv_filename=csv.name,
+            csv_path=str(csv), schema_json=json.dumps([
+                {"name": "Supplier_Name", "label": "Supplier Name", "type": "text", "required": True},
+                {"name": "Supplier_ID", "label": "Supplier ID", "type": "text", "required": True}]),
+            routing_aliases_json="[]", record_count=1, status="active", created_at=now, updated_at=now))
+        session.commit()
+    result = process_supplier_quotation(settings, "match-intake", "match-db")
+    assert result["database_matches"]["Supplier_ID"] == "SUP-1005"
+    assert "Supplier_ID" not in result["extracted_fields"]
+    assert result["extracted_fields"]["Supplier_Name"] == "TruckCO"
+    assert any(field["field"] == "Supplier_ID" for field in result["missing_fields"])

@@ -306,10 +306,16 @@ freight review --port 8801 --no-open  # different port, no browser launch
 `freight review` runs the same application the CLI uses: a FastAPI backend that calls the
 existing services (`services/intake`, `services/extraction`, `services/review`,
 `services/shipments`, `services/clarification`, `services/comparison`) plus a plain
-HTML/CSS/JS page served by the same process (no React, no build step, no npm). There is no
+HTML/CSS/JS page served by the same process (no React and no Node/npm requirement to run it). There is no
 second data layer and no business logic in the routes or in the browser — every button maps
 to a service the CLI already calls, so validation, versioning and the audit trail are
 identical whichever way you work. Stop the server with Ctrl-C.
+
+The UI stylesheet uses Tailwind CSS and daisyUI. The compiled stylesheet is checked into
+the project and served directly, so running the app needs no frontend toolchain. To rebuild
+it after changing UI classes, run `bash scripts/build_css.sh`; this downloads and caches the
+Tailwind standalone executable in `.tools/` and compiles the vendored daisyUI plugin without
+Node.js or npm. The existing Freight green color theme is retained.
 
 Pages: **Dashboard** (real counts from the database only), **Documents** (drag-and-drop
 multi-upload, filters, duplicate handling), the split-pane **Document review workspace**
@@ -478,3 +484,22 @@ not fuzzy guesses. Unknown charges and currency mismatches remain unresolved.
 Comparison never sums across currencies unless an explicit `FX_RATES_JSON` rate is
 configured, never ranks expired/incomplete/scope-mismatched quotes, and the
 recommendation is advisory — a human makes the final carrier decision.
+
+
+## Updated quotation workspace
+
+Run `freight review --no-open`, then sign in locally with `admin` / `1234`.
+The horizontal navigation leads to Dashboard, Quotations, Comparison, Archived and Settings.
+The existing colored visual style and rounded controls are preserved.
+
+Receive documents from Quotations → Receive documents & link replies. Review the universal extracted values and original evidence in the quotation workspace. Database matches are shown separately. Resolve missing information, supplier responses and conflicts, confirm proposed routes, then approve and separately import. An optional supplier CSV destination prepares an explicit appended record; it is not documentary evidence.
+
+Clarification draft review verifies recipient and exact text. Only approval plus typed `SEND` and the Send click can deliver email. Editing requires fresh approval. Uncertain delivery is locked for an explicit Gmail Sent check before retrying.
+
+Archive decisions preserve original sources, correspondence and history. Comparison shows exclusions and highlights deterministic price/speed results. Unknown currency, pricing unit, FX, expiry or risk information is never silently guessed.
+
+New shared CLI operations: `freight quote approve`, `import`, `archive --reason`, `ask`, `answer`, and `resolve --reason`.
+
+For a fully synthetic isolated demo, run `python3 scripts/workflow_demo.py` from this directory and open http://127.0.0.1:8767. It writes only under `video/demo-data/workflow-v9`, disables Gmail polling and never reads the production database. Model extraction still requires the configured local Ollama model in a normal profile.
+
+Demo login is suitable for the local prototype only. Before deployment replace it with real account management, password hashing or a managed identity provider, secure transport/session controls and rate limiting. Setting `DEMO_LOGIN_ENABLED=false` does not make a public deployment secure.

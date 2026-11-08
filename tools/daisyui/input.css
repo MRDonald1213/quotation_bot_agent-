@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+/* Keep scanning focused on the app's static UI files. */
+@source not "./tailwindcss";
+@source not "./daisyui{,*}.mjs";
+@source "../../src/freight_agent/web/static";
+
+@plugin "./daisyui.mjs" {
+  themes: false;
+}
+
+@plugin "./daisyui-theme.mjs" {
+  name: "freight";
+  default: true;
+  prefersdark: false;
+  color-scheme: light;
+  --color-primary: #5c8b4c;
+  --color-primary-content: #ffffff;
+  --color-secondary: #eef6e8;
+  --color-secondary-content: #243027;
+  --color-accent: #2f5a74;
+  --color-accent-content: #ffffff;
+  --color-neutral: #243027;
+  --color-neutral-content: #ffffff;
+  --color-base-100: #ffffff;
+  --color-base-200: #f7fbf5;
+  --color-base-300: #e3e9dd;
+  --color-base-content: #243027;
+  --radius-selector: 0.625rem;
+  --radius-field: 0.75rem;
+  --radius-box: 0.75rem;
+}

@@ -1,29 +1,28 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="freight">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Freight AI Agent</title>
+<link rel="stylesheet" href="/static/tailwind.generated.css">
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to content</a>
 <div class="shell">
   <aside class="side">
     <div class="brand">Freight <span>AI Agent</span><small>Supplier Workspace</small></div>
     <nav id="nav" aria-label="Main navigation">
-      <a href="#/">Overview</a>
-      <a href="#/inbox">Operations Inbox</a>
-      <a href="#/supplier/databases">Data Sources &amp; Integrations</a>
-      <a href="#/supplier/quotations">Received Quotations</a>
-      <a href="#/supplier/actions">Action Center</a>
-      <a href="#/drafts">Drafts</a>
-      <a href="#/supplier/agent">Supplier Agent</a>
-      <a href="#/settings">Settings</a>
+      <a href="#/">Dashboard</a><a href="#/quotations">Quotations</a>
+      <a href="#/comparison">Comparison</a><a href="#/archived">Archived</a>
+      <a href="#/notifications">Notifications <span id="notification-count" class="supplier-status"></span></a><a href="#/settings">Settings</a>
     </nav>
+    <button class="supplier-btn supplier-btn-neutral" id="open-assistant">Supplier Assistant</button>
+    <button class="supplier-btn supplier-btn-neutral" id="logout">Sign out</button>
     <div class="system" id="system" aria-live="polite"></div>
   </aside>
 
-  <main>
+  <main id="main-content" tabindex="-1">
     <div class="topbar">
       <h1 id="page-title">Dashboard</h1>
       <p class="guide" id="page-guide"></p>
@@ -45,6 +44,14 @@
 
 <div id="toast" aria-live="polite"></div>
 <script src="/static/api.js"></script>
+<script src="/static/pages/workspace.js"></script>
+<script src="/static/pages/intake.js"></script>
+<script src="/static/pages/comparison.js"></script>
+<script src="/static/pages/draft.js"></script>
+<script src="/static/pages/connections.js"></script>
+<script src="/static/pages/settings.js"></script>
+<script src="/static/pages/notifications.js"></script>
+<script src="/static/pages/assistant.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

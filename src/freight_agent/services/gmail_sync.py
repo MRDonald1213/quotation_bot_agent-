@@ -195,8 +195,8 @@ def _classify_supplier_message(subject: str, body: str, attachments: list[str]) 
         return "SUPPLIER_QUOTATION_REPLY", 0.82, "Detected a supplier reply to an existing quotation conversation"
     if matches >= 2 or attachment_ext and matches >= 1:
         return "NEW_QUOTATION", 0.82 if matches >= 3 else 0.68, "Detected quotation language or a quotation document attachment"
-    if attachment_ext:
-        return "UNCERTAIN", 0.55, "Supported attachment found, but quotation evidence is not confirmed"
+    if attachment_ext or re.search(r"(?:[$€£¥]\s*\d|\b\d[\d,.]*\s*(?:USD|EUR|GBP|CNY|dollars)\b)", text, re.I):
+        return "UNCERTAIN", 0.55, "Possible quotation document or price found; local semantic classification is required"
     return "NON_QUOTATION", 0.8, "No reliable quotation evidence found"
 
 
@@ -302,21 +302,34 @@ def _process_quotation_message(settings: Settings, message_id: str, text_content
     from ..db.models import IntakeItemRow, SupplierDatabaseRow, utcnow_iso
     from ..parsers.base import parse_file
 
+    with get_session(settings) as session:
+        attachment_labels = {Path(row.stored_path).name: row.filename for row in session.query(GmailAttachmentRow).filter(GmailAttachmentRow.message_id == message_id).all() if row.stored_path}
     parsed_text = text_content.strip()
+    source_parts = [("Email body", "email", parsed_text, None, None)]
+    parsed_text = "[SOURCE: Email body]\n" + parsed_text
     evidence_path = attachment_paths[0] if attachment_paths else None
     for attachment in attachment_paths:
-        if attachment.suffix.lower() in {".pdf", ".xlsx", ".xls", ".docx", ".txt", ".eml", ".csv"}:
+        attachment_label = attachment_labels.get(attachment.name, attachment.name)
+        if attachment.suffix.lower() in {".pdf", ".xlsx", ".xls", ".docx", ".doc", ".txt", ".eml", ".csv", ".odt", ".rtf", ".pages"}:
             try:
+                if attachment.stat().st_size > settings.max_file_size_mb * 1024 * 1024:
+                    raise ValidationFailureError("Attachment exceeds the configured file size limit")
                 parsed = parse_file(attachment)
-                parsed_text += "\n" + parsed.text
+                parsed_text += "\n[SOURCE: " + attachment_label + "]\n" + parsed.text
+                source_parts.append((attachment_label, "attachment", parsed.text, parsed.page_or_sheet_info, None))
                 evidence_path = evidence_path or attachment
-            except Exception:
-                continue
-    if not parsed_text.strip():
+            except Exception as exc:
+                source_parts.append((attachment_label, "attachment", "", None, str(exc)[:500]))
+        else:
+            source_parts.append((attachment_label, "attachment", "", "Unsupported attachment: not used as extraction evidence",
+                                 "Unsupported document format"))
+    if not parsed_text.strip() or (not parsed_text.replace("[SOURCE: Email body]", "").strip()
+            and not any(text.strip() for _, kind, text, _, error in source_parts if kind == "attachment" and not error)
+            and not attachment_paths):
         return None
 
     now = utcnow_iso()
-    filename = evidence_path.name if evidence_path else f"gmail-{message_id[:8]}-quotation.txt"
+    filename = attachment_labels.get(evidence_path.name, evidence_path.name) if evidence_path else f"gmail-{message_id[:8]}-quotation.txt"
     stored_path = evidence_path if evidence_path else settings.workspace_dir.resolve() / "gmail_quotations" / filename
     if evidence_path is None:
         stored_path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,6 +361,13 @@ def _process_quotation_message(settings: Settings, message_id: str, text_content
             session.flush()
             intake_id = row.id
             session.commit()
+    from ..db.models import SourceDocumentRow
+    with get_session(settings) as session:
+        if not session.query(SourceDocumentRow).filter_by(intake_item_id=intake_id).first():
+            for filename, kind, source_text, location, error in source_parts:
+                session.add(SourceDocumentRow(id=str(uuid4()), intake_item_id=intake_id,
+                    filename=filename, source_kind=kind, text=source_text, location=location, parse_error=error))
+            session.commit()
     return intake_id
 
 
@@ -364,7 +384,16 @@ def analyze_inbound_quotation(settings: Settings, message_row_id: str, intake_id
         status = "extraction_failed"
     else:
         action = outcome["action"]
-        if outcome.get("draft"):
+        if "proposals" in outcome:
+            proposals = outcome["proposals"]
+            status = ("ready_for_approval" if any(p["status"] == "ready_for_approval" for p in proposals)
+                      else "needs_information" if proposals else "no_destination_match")
+        elif action.get("id") is None:
+            with get_session(settings) as session:
+                from ..db.models import IntakeItemRow
+                item = session.get(IntakeItemRow, intake_id)
+                status = "not_a_quotation" if item and item.classification_status == "irrelevant" else "needs_review"
+        elif outcome.get("draft"):
             status = "draft_ready"
         elif not action.get("database_id"):
             status = "needs_database"
@@ -379,7 +408,8 @@ def analyze_inbound_quotation(settings: Settings, message_row_id: str, intake_id
         if row is not None:
             row.processing_status = status
             session.commit()
-    _record_pipeline_notes(settings, (action or {}).get("id"), outcome)
+    if not outcome or "proposals" not in outcome:
+        _record_pipeline_notes(settings, (action or {}).get("id"), outcome)
     return status
 
 
@@ -448,14 +478,14 @@ def _replied_quotation(session, message: GmailMessageRow) -> tuple[str, str, str
             IntakeItemRow.source_type.in_(["gmail_body", "gmail_attachment"]),
             IntakeItemRow.sender.ilike(f"%{sender}%")).all()]
         candidates = candidates or quotations(intake_ids)
-        if len(candidates) > 1:
+        if candidates:
             text = f"{message.subject or ''}\n{message.body_text or ''}".lower()
             named = [item for item in candidates.values()
                      if (quote := session.get(QuotationRow, item[1])) and quote.quote_reference
                      and quote.quote_reference.lower() in text]
             if len(named) == 1:
                 return named[0]
-    return next(iter(candidates.values())) if len(candidates) == 1 else None
+    return None  # Sender alone is a suggestion, not proof of association.
 
 
 def _quotation_link(session, quotation_id: str) -> tuple[str, str, str] | None:
@@ -476,6 +506,41 @@ def process_inbound_reply(settings: Settings, message_row_id: str,
     further draft appears only while material points stay open. `quotation_id` is only for the
     rare reply that names no quotation, thread, or sender we can match.
     """
+    # Destination proposals have their own schema-directed reply path. A known
+    # thread supplies the original context without asking an operator to link it.
+    from ..db.models import DestinationProposalRow, IntakeItemRow, SourceDocumentRow
+    with get_session(settings) as session:
+        message = session.get(GmailMessageRow, message_row_id)
+        prior = []
+        if message and message.gmail_thread_id:
+            prior = session.query(IntakeItemRow).join(GmailMessageRow, IntakeItemRow.gmail_message_id == GmailMessageRow.id).join(
+                DestinationProposalRow, DestinationProposalRow.intake_id == IntakeItemRow.id).filter(
+                GmailMessageRow.gmail_thread_id == message.gmail_thread_id,
+                GmailMessageRow.id != message_row_id).order_by(IntakeItemRow.created_at.desc()).all()
+        if prior:
+            original = prior[0]
+            original_text = original.raw_text
+            targets = [row.database_id for row in session.query(DestinationProposalRow).filter_by(intake_id=original.id).all()]
+        else:
+            targets = []
+    if targets:
+        intake_id = ensure_message_quotation(settings, message_row_id)
+        with get_session(settings) as session:
+            intake = session.get(IntakeItemRow, intake_id)
+            marker = "[ORIGINAL QUOTATION CONTEXT]"
+            if not intake.raw_text.startswith(marker):
+                from .replies import _new_reply_text
+                reply = session.get(GmailMessageRow, message_row_id)
+                intake.raw_text = marker + "\n" + original_text + "\n[NEW SUPPLIER REPLY]\n" + _new_reply_text(reply.body_text or "") + "\n" + intake.raw_text
+                session.add(SourceDocumentRow(id=str(uuid4()), intake_item_id=intake_id,
+                    filename="Original quotation context", source_kind="document", text=original_text))
+                session.commit()
+        from .destination_proposals import process
+        outcome = process(settings, intake_id, target_ids=targets)
+        status = "ready_for_approval" if any(row["status"] == "ready_for_approval" for row in outcome["proposals"]) else "needs_information"
+        _set_message_status(settings, message_row_id, status)
+        return status
+
     from .replies import import_supplier_reply
     from .supplier_workflow import run_quotation_pipeline
 
@@ -492,12 +557,50 @@ def process_inbound_reply(settings: Settings, message_row_id: str,
             session.commit()
             return "reply_needs_linking"
         shipment_id, target_quote_id, intake_id = link
-        text = "\n".join(part for part in (message.subject, message.body_text) if part)
+        from .replies import _new_reply_text
+        text = _new_reply_text(message.body_text or "")
+        attachment_sources = []
+        from ..parsers.base import parse_file
+        for attachment in session.query(GmailAttachmentRow).filter(GmailAttachmentRow.message_id == message_row_id).all():
+            try:
+                parsed = parse_file(Path(attachment.stored_path))
+                text += "\n" + parsed.text
+                attachment_sources.append((attachment.filename, parsed.text, parsed.page_or_sheet_info, None))
+            except Exception as exc:
+                attachment_sources.append((attachment.filename, "", None, str(exc)[:500]))
         digest = message.source_hash or hashlib.sha256(text.encode()).hexdigest()
 
     try:
-        import_supplier_reply(settings, shipment_id, _reply_file(settings, digest, text),
-                              quote_id=target_quote_id, on_duplicate="skip")
+        from ..db.models import ClarificationTurnRow, SupplierEmailDraftRow
+        with get_session(settings) as session:
+            sent = session.query(SupplierEmailDraftRow).filter(
+                SupplierEmailDraftRow.quotation_id == target_quote_id,
+                SupplierEmailDraftRow.status == "sent").order_by(SupplierEmailDraftRow.sent_at.desc()).first()
+            turn_id = sent.clarification_turn_id if sent else None
+            turn = session.get(ClarificationTurnRow, turn_id) if turn_id else None
+            if turn and turn.reply_text is not None and turn.reply_text.strip() != text.strip():
+                turn_id = None  # Additional correspondence must not overwrite or replay a completed turn.
+        if turn_id:
+            from .workspace import answer
+            result = answer(settings, target_quote_id, turn_id, text)
+            if result["status"] == "needs_clarification":
+                with get_session(settings) as session:
+                    session.get(GmailMessageRow, message_row_id).processing_status = "reply_needs_review"
+                    session.commit()
+                return "reply_needs_review"
+            if result.get("intake_id"):
+                from ..db.models import SourceDocumentRow, IntakeItemRow
+                with get_session(settings) as session:
+                    session.get(IntakeItemRow, result["intake_id"]).gmail_message_id = message_row_id
+                    original_message = session.get(GmailMessageRow, message_row_id)
+                    session.add(SourceDocumentRow(id=str(uuid4()), intake_item_id=result["intake_id"], filename="Original supplier email", source_kind="email", text=original_message.body_text))
+                    for filename, content, location, error in attachment_sources:
+                        session.add(SourceDocumentRow(id=str(uuid4()), intake_item_id=result["intake_id"],
+                            filename=filename, source_kind="attachment", text=content, location=location, parse_error=error))
+                    session.commit()
+        else:
+            import_supplier_reply(settings, shipment_id, _reply_file(settings, digest, text),
+                                  quote_id=target_quote_id, on_duplicate="skip")
         outcome = run_quotation_pipeline(settings, intake_id)
     except Exception as exc:  # noqa: BLE001 — one unreadable reply must not stop the mailbox
         logger.warning("supplier reply %s could not be merged: %s", message_row_id,
@@ -631,13 +734,17 @@ def gmail_sync(settings: Settings, limit: int = 100, backfill_days: int | None =
                 raise ConfigurationError("No connected Gmail account found")
             account_id = account.id
 
-        account_history_id = None
         with get_session(settings) as session:
             account_row = session.get(GmailAccountRow, account_id)
+            sync_after_at = account_row.sync_after_at
             account_history_id = account_row.history_id
 
         window_days = backfill_days if backfill_days is not None else settings.gmail_backfill_days
-        query = f"newer_than:{window_days}d" if not account_history_id else None
+        if sync_after_at:
+            cutoff = datetime.fromisoformat(sync_after_at).timestamp()
+            query = f"after:{int(cutoff)}"
+        else:
+            query = f"newer_than:{window_days}d" if not account_history_id else None
         request = service.users().messages().list(userId="me", maxResults=max(1, min(limit, 100)), labelIds=["INBOX"])
         if query:
             request = service.users().messages().list(userId="me", maxResults=max(1, min(limit, 100)), labelIds=["INBOX"], q=query)
@@ -683,6 +790,12 @@ def gmail_sync(settings: Settings, limit: int = 100, backfill_days: int | None =
                 attachment_names.append(safe_name)
 
             classification, confidence, reason = _classify_supplier_message(subject, body_text, attachment_names)
+            with get_session(settings) as session:
+                thread_id = full.get("threadId")
+                prior_thread = session.query(GmailMessageRow).filter(GmailMessageRow.gmail_thread_id == thread_id,
+                    GmailMessageRow.classification.in_(QUOTATION_CLASSIFICATIONS)).first() if thread_id else None
+                if prior_thread and subject.casefold().startswith("re:"):
+                    classification, confidence, reason = "SUPPLIER_QUOTATION_REPLY", 0.95, "Reply in a known quotation thread"
             source_hash = hashlib.sha256((sender + "\n" + subject + "\n" + body_text).encode("utf-8")).hexdigest()
             row_id = str(uuid4())
             with get_session(settings) as session:
@@ -739,6 +852,9 @@ def gmail_inbox(settings: Settings, limit: int = 100) -> list[dict]:
     with get_session(settings) as session:
         rows = session.query(GmailMessageRow).filter(GmailMessageRow.classification.in_(["NEW_QUOTATION", "SUPPLIER_QUOTATION_REPLY", "UNCERTAIN"])).order_by(GmailMessageRow.created_at.desc()).limit(max(1, min(limit, 100))).all()
         attachments = session.query(GmailAttachmentRow).filter(GmailAttachmentRow.message_id.in_([row.id for row in rows])).all() if rows else []
+        from ..db.models import IntakeItemRow
+        intake_by_message = {item.gmail_message_id: item for item in session.query(IntakeItemRow).filter(
+            IntakeItemRow.gmail_message_id.in_([row.id for row in rows])).all()} if rows else {}
         from .quotation_naming import name_for_message
         labels = {row.id: name_for_message(session, row.id) for row in rows}
     counts: dict[str, int] = {}
@@ -751,7 +867,9 @@ def gmail_inbox(settings: Settings, limit: int = 100) -> list[dict]:
              "sender": row.sender, "subject": row.subject, "classification": row.classification,
              "processing_status": row.processing_status, "sent_at": row.sent_at,
              "body_preview": row.body_text[:300], "attachment_count": counts.get(row.id, 0),
-             "attachment_names": names.get(row.id, []), "created_at": row.created_at} for row in rows]
+             "attachment_names": names.get(row.id, []),
+             "diagnostic": intake_by_message.get(row.id).classification_reason if intake_by_message.get(row.id) else None,
+             "created_at": row.created_at} for row in rows]
 
 
 QUEUE_STATUSES = ("received", "pending", "queued", "supplier_reply_pending")
