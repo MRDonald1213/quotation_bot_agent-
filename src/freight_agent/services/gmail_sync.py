@@ -14,6 +14,7 @@ from pathlib import Path
 from secrets import token_urlsafe
 from uuid import uuid4
 
+from sqlalchemy import and_, func, or_
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -37,6 +38,33 @@ _SYNC_STATUS = {
     "ignored_messages": 0,
     "error": None,
 }
+
+
+def _ensure_receive_cutoffs(settings: Settings) -> dict[str, str]:
+    """Keep legacy mailbox history out of the fresh receive workflow, without deleting it."""
+    with get_session(settings) as session:
+        accounts = session.query(GmailAccountRow).all()
+        now = utcnow_iso()
+        changed = False
+        for account in accounts:
+            if not account.sync_after_at:
+                # Existing accounts start after their latest completed sync; a new
+                # connection starts at its creation time and will receive only new mail.
+                account.sync_after_at = account.last_synced_at or account.created_at or now
+                changed = True
+        if changed:
+            session.commit()
+        return {account.id: account.sync_after_at for account in accounts if account.sync_after_at}
+
+
+def _receive_cutoff_filter(cutoffs: dict[str, str]):
+    if not cutoffs:
+        return None
+    eligible = [and_(GmailMessageRow.account_id == account_id,
+                     func.coalesce(GmailMessageRow.sent_at, GmailMessageRow.created_at) > cutoff)
+                for account_id, cutoff in cutoffs.items()]
+    # Rows without a local Gmail account link are retained for migrated/test data.
+    return or_(GmailMessageRow.account_id.is_(None), *eligible)
 
 
 def _credential_path(settings: Settings) -> Path:
@@ -508,7 +536,7 @@ def process_inbound_reply(settings: Settings, message_row_id: str,
     """
     # Destination proposals have their own schema-directed reply path. A known
     # thread supplies the original context without asking an operator to link it.
-    from ..db.models import DestinationProposalRow, IntakeItemRow, SourceDocumentRow
+    from ..db.models import DestinationProposalRow, IntakeItemRow, GmailAttachmentRow
     with get_session(settings) as session:
         message = session.get(GmailMessageRow, message_row_id)
         prior = []
@@ -517,27 +545,37 @@ def process_inbound_reply(settings: Settings, message_row_id: str,
                 DestinationProposalRow, DestinationProposalRow.intake_id == IntakeItemRow.id).filter(
                 GmailMessageRow.gmail_thread_id == message.gmail_thread_id,
                 GmailMessageRow.id != message_row_id).order_by(IntakeItemRow.created_at.desc()).all()
+        proposal_id = None
         if prior:
             original = prior[0]
-            original_text = original.raw_text
-            targets = [row.database_id for row in session.query(DestinationProposalRow).filter_by(intake_id=original.id).all()]
-        else:
-            targets = []
-    if targets:
-        intake_id = ensure_message_quotation(settings, message_row_id)
+            proposal = session.query(DestinationProposalRow).filter_by(intake_id=original.id).order_by(
+                DestinationProposalRow.created_at.desc()).first()
+            proposal_id = proposal.id if proposal else None
+    if proposal_id:
+        from .replies import _new_reply_text
+        from ..parsers.base import parse_file
         with get_session(settings) as session:
-            intake = session.get(IntakeItemRow, intake_id)
-            marker = "[ORIGINAL QUOTATION CONTEXT]"
-            if not intake.raw_text.startswith(marker):
-                from .replies import _new_reply_text
-                reply = session.get(GmailMessageRow, message_row_id)
-                intake.raw_text = marker + "\n" + original_text + "\n[NEW SUPPLIER REPLY]\n" + _new_reply_text(reply.body_text or "") + "\n" + intake.raw_text
-                session.add(SourceDocumentRow(id=str(uuid4()), intake_item_id=intake_id,
-                    filename="Original quotation context", source_kind="document", text=original_text))
-                session.commit()
-        from .destination_proposals import process
-        outcome = process(settings, intake_id, target_ids=targets)
-        status = "ready_for_approval" if any(row["status"] == "ready_for_approval" for row in outcome["proposals"]) else "needs_information"
+            reply = session.get(GmailMessageRow, message_row_id)
+            attachments = session.query(GmailAttachmentRow).filter(
+                GmailAttachmentRow.message_id == message_row_id).all()
+            parts = [_new_reply_text(reply.body_text or "")]
+            source_names = ["Supplier reply"]
+            for attachment in attachments:
+                if not attachment.stored_path or not Path(attachment.stored_path).is_file():
+                    continue
+                try:
+                    parsed = parse_file(Path(attachment.stored_path))
+                    if parsed.text.strip():
+                        parts.append(f"[Attachment: {attachment.filename}]\n{parsed.text}")
+                        source_names.append(attachment.filename)
+                except Exception as exc:  # noqa: BLE001 — retain readable reply text if an attachment fails
+                    logger.warning("supplier reply attachment %s could not be parsed: %s",
+                                   attachment.filename, type(exc).__name__)
+        reply_text = "\n\n".join(part for part in parts if part.strip())
+        from .destination_proposals import process_reply
+        outcome = process_reply(settings, proposal_id, message_row_id, reply_text,
+                                source_name=", ".join(source_names))
+        status = str(outcome.get("status") or "needs_information")
         _set_message_status(settings, message_row_id, status)
         return status
 
@@ -728,6 +766,7 @@ def gmail_sync(settings: Settings, limit: int = 100, backfill_days: int | None =
         if credentials.expired and credentials.refresh_token:
             credentials.refresh(Request())
         service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+        _ensure_receive_cutoffs(settings)
         with get_session(settings) as session:
             account = session.query(GmailAccountRow).filter(GmailAccountRow.status == "connected").first()
             if account is None:
@@ -849,12 +888,20 @@ def gmail_sync(settings: Settings, limit: int = 100, backfill_days: int | None =
         _SYNC_LOCK.release()
 
 def gmail_inbox(settings: Settings, limit: int = 100) -> list[dict]:
+    cutoffs = _ensure_receive_cutoffs(settings)
     with get_session(settings) as session:
-        rows = session.query(GmailMessageRow).filter(GmailMessageRow.classification.in_(["NEW_QUOTATION", "SUPPLIER_QUOTATION_REPLY", "UNCERTAIN"])).order_by(GmailMessageRow.created_at.desc()).limit(max(1, min(limit, 100))).all()
+        query = session.query(GmailMessageRow).filter(
+            GmailMessageRow.classification.in_(["NEW_QUOTATION", "SUPPLIER_QUOTATION_REPLY", "UNCERTAIN"]))
+        cutoff_filter = _receive_cutoff_filter(cutoffs)
+        if cutoff_filter is not None:
+            query = query.filter(cutoff_filter)
+        rows = query.order_by(GmailMessageRow.created_at.desc()).limit(max(1, min(limit, 100))).all()
         attachments = session.query(GmailAttachmentRow).filter(GmailAttachmentRow.message_id.in_([row.id for row in rows])).all() if rows else []
-        from ..db.models import IntakeItemRow
+        from ..db.models import IntakeItemRow, QuotationRow
         intake_by_message = {item.gmail_message_id: item for item in session.query(IntakeItemRow).filter(
             IntakeItemRow.gmail_message_id.in_([row.id for row in rows])).all()} if rows else {}
+        quote_by_intake = {quote.intake_item_id: quote for quote in session.query(QuotationRow).filter(
+            QuotationRow.intake_item_id.in_([item.id for item in intake_by_message.values()])).all()} if intake_by_message else {}
         from .quotation_naming import name_for_message
         labels = {row.id: name_for_message(session, row.id) for row in rows}
     counts: dict[str, int] = {}
@@ -866,7 +913,9 @@ def gmail_inbox(settings: Settings, limit: int = 100) -> list[dict]:
              "gmail_thread_id": row.gmail_thread_id,
              "sender": row.sender, "subject": row.subject, "classification": row.classification,
              "processing_status": row.processing_status, "sent_at": row.sent_at,
-             "body_preview": row.body_text[:300], "attachment_count": counts.get(row.id, 0),
+             "body_preview": row.body_text[:300], "intake_id": intake_by_message.get(row.id).id if intake_by_message.get(row.id) else None,
+             "quotation_id": quote_by_intake.get(intake_by_message[row.id].id).id if intake_by_message.get(row.id) and quote_by_intake.get(intake_by_message[row.id].id) else None,
+             "attachment_count": counts.get(row.id, 0),
              "attachment_names": names.get(row.id, []),
              "diagnostic": intake_by_message.get(row.id).classification_reason if intake_by_message.get(row.id) else None,
              "created_at": row.created_at} for row in rows]
@@ -889,11 +938,15 @@ def _set_message_status(settings: Settings, message_row_id: str, status: str) ->
 
 def _claim_next_queued(settings: Settings) -> str | None:
     """Atomically take the email that arrived earliest and mark it as being read; newest must not jump the queue."""
+    cutoffs = _ensure_receive_cutoffs(settings)
     with get_session(settings) as session:
-        row = session.query(GmailMessageRow).filter(
+        query = session.query(GmailMessageRow).filter(
             GmailMessageRow.classification.in_(QUOTATION_CLASSIFICATIONS),
-            GmailMessageRow.processing_status.in_(QUEUE_STATUSES),
-        ).order_by(GmailMessageRow.sent_at.is_(None), GmailMessageRow.sent_at.asc(),
+            GmailMessageRow.processing_status.in_(QUEUE_STATUSES))
+        cutoff_filter = _receive_cutoff_filter(cutoffs)
+        if cutoff_filter is not None:
+            query = query.filter(cutoff_filter)
+        row = query.order_by(GmailMessageRow.sent_at.is_(None), GmailMessageRow.sent_at.asc(),
                    GmailMessageRow.created_at.asc(), GmailMessageRow.id.asc()).first()
         if row is None:
             return None
@@ -940,12 +993,18 @@ def read_one_queued_message(settings: Settings) -> str | None:
 
 def queue_status(settings: Settings) -> dict:
     """How much still waits to be read and what the reader is busy with right now."""
+    cutoffs = _ensure_receive_cutoffs(settings)
     with get_session(settings) as session:
-        queued = session.query(GmailMessageRow).filter(
+        queued_query = session.query(GmailMessageRow).filter(
             GmailMessageRow.classification.in_(QUOTATION_CLASSIFICATIONS),
-            GmailMessageRow.processing_status.in_(QUEUE_STATUSES)).count()
-        reading = session.query(GmailMessageRow).filter(
-            GmailMessageRow.processing_status == "analyzing").count()
+            GmailMessageRow.processing_status.in_(QUEUE_STATUSES))
+        reading_query = session.query(GmailMessageRow).filter(GmailMessageRow.processing_status == "analyzing")
+        cutoff_filter = _receive_cutoff_filter(cutoffs)
+        if cutoff_filter is not None:
+            queued_query = queued_query.filter(cutoff_filter)
+            reading_query = reading_query.filter(cutoff_filter)
+        queued = queued_query.count()
+        reading = reading_query.count()
     return {**_QUEUE_STATUS, "queued": queued, "reading": reading}
 
 

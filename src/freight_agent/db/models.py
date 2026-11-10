@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 15
 
 
 def utcnow_iso() -> str:
@@ -139,6 +139,7 @@ class FieldEvidenceRow(Base):
     page_or_sheet: Mapped[str | None] = mapped_column(String(64))
     snippet: Mapped[str] = mapped_column(Text)
     confidence: Mapped[float | None] = mapped_column(Float)
+    explanation: Mapped[str | None] = mapped_column(Text)
     validation_status: Mapped[str] = mapped_column(String(24))
     created_at: Mapped[str] = mapped_column(String(32))
 
@@ -294,6 +295,9 @@ class GmailAttachmentRow(Base):
 class SupplierEmailDraftRow(Base):
     quotation_id: Mapped[str | None] = mapped_column(String(36))
     clarification_turn_id: Mapped[str | None] = mapped_column(String(36))
+    destination_proposal_id: Mapped[str | None] = mapped_column(ForeignKey("destination_proposals.id", ondelete="SET NULL"), index=True)
+    draft_type: Mapped[str] = mapped_column(String(32), default="missing_information", server_default="missing_information")
+    requested_fields_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
     __tablename__ = "supplier_email_drafts"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     quotation_register_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("quotation_register.id"), index=True)

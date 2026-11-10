@@ -224,6 +224,7 @@ def extract_and_store_quote(settings: Settings, intake_id: str, dry_run: bool = 
                 value_as_extracted=str(cleaned.carrier_name if e.field_name == "carrier_name" else _field_value(quote, e.field_name)),
                 source_filename=e.source_filename or item.original_filename,
                 page_or_sheet=e.page_or_sheet, snippet=e.snippet, confidence=e.confidence,
+                explanation=e.explanation,
                 validation_status=field_statuses.get(e.field_name, ValidationStatus.accepted),
             ) for e in evidence_items
         ]

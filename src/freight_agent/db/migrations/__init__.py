@@ -171,6 +171,50 @@ def init_schema(session: Session) -> list[str]:
             session.add(SchemaVersionRow(version=11, applied_at=utcnow_iso(),
                 description="schema v11: mailbox receive cutoff for a clean workspace"))
             applied.append("v11")
+        if current < 12:
+            connection.exec_driver_sql(
+                "UPDATE gmail_accounts SET sync_after_at = "
+                "CASE WHEN last_synced_at IS NOT NULL AND "
+                "(sync_after_at IS NULL OR last_synced_at > sync_after_at) "
+                "THEN last_synced_at ELSE COALESCE(sync_after_at, created_at) END"
+            )
+            session.add(SchemaVersionRow(version=12, applied_at=utcnow_iso(),
+                description="schema v12: hide previously synchronized mailbox backlog from the active receive workspace"))
+            applied.append("v12")
+        if current < 13:
+            evidence_columns = {column["name"] for column in inspect(connection).get_columns("field_evidence")}
+            if "explanation" not in evidence_columns:
+                connection.exec_driver_sql("ALTER TABLE field_evidence ADD COLUMN explanation TEXT")
+            draft_columns = {column["name"] for column in inspect(connection).get_columns("supplier_email_drafts")}
+            if "destination_proposal_id" not in draft_columns:
+                connection.exec_driver_sql("ALTER TABLE supplier_email_drafts ADD COLUMN destination_proposal_id VARCHAR(36)")
+            if "draft_type" not in draft_columns:
+                connection.exec_driver_sql("ALTER TABLE supplier_email_drafts ADD COLUMN draft_type VARCHAR(32) NOT NULL DEFAULT 'missing_information'")
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_supplier_email_drafts_destination_proposal_id "
+                "ON supplier_email_drafts (destination_proposal_id)"
+            )
+            session.add(SchemaVersionRow(version=13, applied_at=utcnow_iso(),
+                description="schema v13: field confidence explanations and typed quotation clarification drafts"))
+            applied.append("v13")
+        if current < 14:
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_supplier_email_draft_proposal_type_open "
+                "ON supplier_email_drafts (destination_proposal_id, draft_type) "
+                "WHERE destination_proposal_id IS NOT NULL AND status = 'draft'"
+            )
+            session.add(SchemaVersionRow(version=14, applied_at=utcnow_iso(),
+                description="schema v14: one persistent clarification draft of each type per quotation proposal"))
+            applied.append("v14")
+        if current < 15:
+            draft_columns = {column["name"] for column in inspect(connection).get_columns("supplier_email_drafts")}
+            if "requested_fields_json" not in draft_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE supplier_email_drafts ADD COLUMN requested_fields_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            session.add(SchemaVersionRow(version=15, applied_at=utcnow_iso(),
+                description="schema v15: clarification drafts retain the exact fields they ask suppliers to resolve"))
+            applied.append("v15")
     return applied
 
 

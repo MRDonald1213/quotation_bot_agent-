@@ -69,20 +69,91 @@ def assert_current(session, draft: SupplierEmailDraftRow) -> None:
             raise ValidationFailureError("This email belongs to an answered or older quotation version; create current clarification questions")
 
 
+def _draft_resolution_status(draft_type: str, draft_status: str, result: dict,
+                             requested_fields: list[str] | None = None) -> str | None:
+    """Derive message progress from the latest proposal without changing send lifecycle state."""
+    unresolved_fields = set(result.get("missing") or []) | set(result.get("uncertain") or [])
+    if requested_fields:
+        unresolved = unresolved_fields.intersection(requested_fields)
+    else:
+        # Legacy messages did not retain their field list. Stay conservative: only
+        # show them as solved once every current proposal gap has been resolved.
+        unresolved = unresolved_fields
+    has_reply = bool(result.get("reply_history"))
+    if draft_status == "sent":
+        if not unresolved:
+            return "solved"
+        return "follow_up_required" if has_reply else "awaiting_reply"
+    if has_reply and unresolved:
+        return "follow_up_required"
+    return None
+
+
 def _draft_context(session, settings: Settings, drafts: list[SupplierEmailDraftRow]) -> dict[str, dict]:
     """A draft is reviewed beside the quotation it answers: the human title, the supplier record it
     matched, the email it came from, the offer as it now stands, and the points still open. The page
     must not have to chase those links itself."""
-    from ..db.models import (IntakeItemRow, QuotationRow, SupplierDatabaseRow,
-                             SupplierQuotationActionRow)
+    from ..db.models import (DestinationProposalRow, GmailMessageRow, IntakeItemRow, QuotationRow,
+                             SupplierDatabaseRow, SupplierQuotationActionRow)
     from .gmail_sync import _message_quotation_view
     from .quotation_naming import name_for_intake
 
     empty = {"name": None, "intake_id": None, "message_id": None, "supplier": None,
-             "email_subject": None, "email_sent_at": None, "quotation": None, "missing_fields": []}
+             "email_subject": None, "email_sent_at": None, "quotation": None,
+             "missing_fields": [], "resolution_status": None}
+    context = {d.id: {**empty, "name": d.subject} for d in drafts}
+    proposal_ids = {d.destination_proposal_id for d in drafts if d.destination_proposal_id}
+    if proposal_ids:
+        proposals = {row.id: row for row in session.query(DestinationProposalRow).filter(
+            DestinationProposalRow.id.in_(proposal_ids)).all()}
+        proposal_intake_ids = {row.intake_id for row in proposals.values()}
+        proposal_intakes = {row.id: row for row in session.query(IntakeItemRow).filter(
+            IntakeItemRow.id.in_(proposal_intake_ids)).all()} if proposal_intake_ids else {}
+        proposal_message_ids = {row.gmail_message_id for row in proposal_intakes.values() if row.gmail_message_id}
+        proposal_messages = {row.id: row for row in session.query(GmailMessageRow).filter(
+            GmailMessageRow.id.in_(proposal_message_ids)).all()} if proposal_message_ids else {}
+        from .quotation_naming import name_for_intake
+        for draft in drafts:
+            proposal = proposals.get(draft.destination_proposal_id or "")
+            intake = proposal_intakes.get(proposal.intake_id) if proposal else None
+            if proposal is None or intake is None:
+                continue
+            message = proposal_messages.get(intake.gmail_message_id or "")
+            try:
+                result = json.loads(proposal.result_json or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            try:
+                requested_fields = json.loads(draft.requested_fields_json or "[]")
+                if not isinstance(requested_fields, list):
+                    requested_fields = []
+            except (TypeError, ValueError):
+                requested_fields = []
+            values = result.get("values", {}) or {}
+            supplier = str(values.get("Supplier_Name") or (message.sender if message else "") or "Supplier")
+            reference = str(values.get("Quotation_Reference") or values.get("Quotation_ID") or "")
+            label = name_for_intake(session, intake.id) or intake.original_filename
+            context[draft.id] = {
+                **empty,
+                "name": f"{supplier} · {reference}" if reference else f"{supplier} · {label}",
+                "intake_id": intake.id,
+                "message_id": message.id if message else None,
+                "supplier": supplier,
+                "email_subject": message.subject if message else None,
+                "email_sent_at": message.sent_at if message else None,
+                "resolution_status": _draft_resolution_status(
+                    draft.draft_type, draft.status, result, requested_fields),
+                "missing_fields": [{"field": name,
+                                    "label": next((str(f.get("label") or name.replace("_", " "))
+                                                   for f in json.loads(proposal.schema_json or "[]")
+                                                   if f.get("name") == name), name.replace("_", " ")),
+                                    "reason": str((result.get("explanations") or {}).get(name) or
+                                                  ("Needs supplier confirmation" if name in (result.get("uncertain") or []) else "Missing from quotation"))}
+                                   for name in [*(result.get("uncertain") or []), *(result.get("missing") or [])]],
+            }
     action_ids = {d.supplier_action_id for d in drafts if d.supplier_action_id}
     if not action_ids:
-        return {d.id: {**empty, "name": d.subject} for d in drafts}
+        return context
     actions = {row.id: row for row in
                session.query(SupplierQuotationActionRow).filter(
                    SupplierQuotationActionRow.id.in_(action_ids)).all()}
@@ -90,7 +161,6 @@ def _draft_context(session, settings: Settings, drafts: list[SupplierEmailDraftR
     intakes = {row.id: row for row in session.query(IntakeItemRow).filter(
         IntakeItemRow.id.in_(intake_ids)).all()} if intake_ids else {}
     message_ids = {i.gmail_message_id for i in intakes.values() if i.gmail_message_id}
-    from ..db.models import GmailMessageRow
     messages = {row.id: row for row in session.query(GmailMessageRow).filter(
         GmailMessageRow.id.in_(message_ids)).all()} if message_ids else {}
     database_ids = {a.database_id for a in actions.values() if a.database_id}
@@ -103,11 +173,9 @@ def _draft_context(session, settings: Settings, drafts: list[SupplierEmailDraftR
             if best is None or int(quote.version or 0) >= int(best.version or 0):
                 quotes[quote.intake_item_id] = quote
 
-    context: dict[str, dict] = {}
     for draft in drafts:
         action = actions.get(draft.supplier_action_id or "")
         if action is None:
-            context[draft.id] = {**empty, "name": draft.subject}
             continue
         intake = intakes.get(action.intake_id)
         message = messages.get(intake.gmail_message_id) if intake and intake.gmail_message_id else None
@@ -154,6 +222,7 @@ def list_drafts(settings: Settings) -> list[dict]:
         context = _draft_context(session, settings, list(rows))
     return [{**context.get(row.id, {"name": row.subject}),
              "id": row.id, "quotation_id": row.quotation_id, "clarification_turn_id": row.clarification_turn_id,
+             "destination_proposal_id": row.destination_proposal_id, "draft_type": row.draft_type,
              "name": context.get(row.id, {}).get("name") or row.subject,
              "recipient": row.recipient, "bound_recipient": row.bound_recipient,
              "recipient_locked": bool(row.bound_recipient), "cc": row.cc, "subject": row.subject,
@@ -189,6 +258,9 @@ def save_draft(settings: Settings, draft_id: str, recipient: str, cc: str, subje
                                                         draft.body, draft.gmail_thread_id, draft.gmail_draft_id)
         if gmail_draft_id:
             draft.gmail_draft_id = gmail_draft_id
+        session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_email_draft", entity_id=draft.id,
+            action="human_saved", details_json=json.dumps({"draft_type": draft.draft_type,
+                "destination_proposal_id": draft.destination_proposal_id}), created_at=now))
         session.commit()
         draft_id = draft.id
     return get_draft(settings, draft_id)
@@ -199,9 +271,10 @@ def get_draft(settings: Settings, draft_id: str) -> dict:
         draft = session.get(SupplierEmailDraftRow, draft_id)
         if draft is None:
             raise NotFoundError("Email draft not found")
-        label = _draft_context(session, settings, [draft]).get(draft.id, {}).get("name")
-        return {"id": draft.id, "name": label or draft.subject,
+        context = _draft_context(session, settings, [draft]).get(draft.id, {})
+        return {"id": draft.id, "name": context.get("name") or draft.subject,
                 "quotation_id": draft.quotation_id, "clarification_turn_id": draft.clarification_turn_id,
+                "destination_proposal_id": draft.destination_proposal_id, "draft_type": draft.draft_type,
                 "recipient": draft.recipient, "bound_recipient": draft.bound_recipient,
                 "recipient_locked": bool(draft.bound_recipient), "cc": draft.cc, "subject": draft.subject,
                 "body": draft.body, "status": draft.status, "gmail_draft_id": draft.gmail_draft_id,
@@ -209,13 +282,15 @@ def get_draft(settings: Settings, draft_id: str) -> dict:
                 "approved_recipient": draft.approved_recipient,
                 "sent_message_id": draft.sent_message_id, "sent_at": draft.sent_at,
                 "immutable_approved_body": draft.immutable_approved_body,
-                "approved_subject": draft.approved_subject, "updated_at": draft.updated_at}
+                "approved_subject": draft.approved_subject, "updated_at": draft.updated_at,
+                "resolution_status": context.get("resolution_status")}
 
 
 def create_draft(settings: Settings, *, recipient: str, cc: str, subject: str, body: str,
                  gmail_account_id: str, quotation_register_id: str | None = None,
                  supplier_master_id: str | None = None, gmail_thread_id: str | None = None,
-                 supplier_action_id: str | None = None, bound_recipient: str | None = None) -> dict:
+                 supplier_action_id: str | None = None, bound_recipient: str | None = None,
+                 destination_proposal_id: str | None = None, draft_type: str = "missing_information") -> dict:
     _validate_content(recipient, cc, subject, body)
     if not recipient.strip() or not subject.strip() or not body.strip():
         raise ValidationFailureError("recipient, subject and body are required")
@@ -227,6 +302,7 @@ def create_draft(settings: Settings, *, recipient: str, cc: str, subject: str, b
             raise NotFoundError("Gmail account not found")
         row = SupplierEmailDraftRow(id=str(uuid4()), quotation_register_id=quotation_register_id,
                                     supplier_master_id=supplier_master_id, gmail_account_id=gmail_account_id,
+                                    destination_proposal_id=destination_proposal_id, draft_type=draft_type,
                                     gmail_thread_id=gmail_thread_id, supplier_action_id=supplier_action_id,
                                     bound_recipient=(bound_recipient or "").strip() or None,
                                     recipient=recipient.strip(), cc=cc.strip(),
@@ -280,6 +356,8 @@ def approve_draft(settings: Settings, draft_id: str) -> dict:
             raise NotFoundError("Email draft not found")
         if draft.status in {"sent", "sending"}:
             raise ValidationFailureError("Sent or pending-delivery drafts cannot be approved again")
+        if draft.status == "cancelled":
+            raise ValidationFailureError("Restore and save a cancelled draft before approval")
         _validate_content(draft.recipient, draft.cc, draft.subject, draft.body)
         assert_current(session, draft)
         if draft.clarification_turn_id:
@@ -314,4 +392,25 @@ def approve_draft(settings: Settings, draft_id: str) -> dict:
                                   action="human_approved", details_json=json.dumps(
                                       {"approved": True, "recipient": draft.approved_recipient}), created_at=now))
         session.commit()
+    return get_draft(settings, draft_id)
+
+
+def discard_draft(settings: Settings, draft_id: str) -> dict:
+    """Cancel an unsent draft while retaining its audit history."""
+    with get_session(settings) as session:
+        draft = session.get(SupplierEmailDraftRow, draft_id)
+        if draft is None:
+            raise NotFoundError("Email draft not found")
+        if draft.status in {"sent", "sending"}:
+            raise ValidationFailureError("Sent or pending-delivery drafts cannot be discarded")
+        if draft.status != "cancelled":
+            now = utcnow_iso()
+            draft.status = "cancelled"
+            draft.approved_recipient = None
+            draft.immutable_approved_body = None
+            draft.approved_subject = None
+            draft.updated_at = now
+            session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_email_draft", entity_id=draft.id,
+                action="discarded", details_json=json.dumps({"draft_type": draft.draft_type}), created_at=now))
+            session.commit()
     return get_draft(settings, draft_id)

@@ -27,6 +27,7 @@ const state = {
 
 const PAGES = {
   quotations: {title:"Quotations", guide:"Review quotations, missing information and next actions."},
+  proposals: {title:"Extraction summary", guide:"Review extracted quotation fields, evidence, missing information and supplier drafts."},
   archived: {title:"Archived quotations", guide:"Preserved sources, correspondence and decisions."},
   comparison: {title:"Comparison", guide:"Compare compatible quotations for the selected lane."},
   draft: {title:"Clarification draft", guide:"Review the recipient and exact content before sending."},
@@ -41,6 +42,7 @@ const PAGES = {
     guide:
       "Unified email, document and supplier-workflow intake with explicit human review actions.",
   },
+  suppliers: {title:"Supplier Directory", guide:"Explore supplier capabilities, routes, terms and data quality."},
   documents: {
     title: "Quotation workspace",
     guide:
@@ -417,6 +419,30 @@ async function refreshStatus() {
     `<div class="line"><a href="#/settings">System details</a></div>`;
 }
 
+async function refreshDraftCount() {
+  const badge = document.getElementById("drafts-count");
+  if (!badge) return;
+  const routeEpoch = window.freightRouteEpoch;
+  try {
+    const [drafts, localDrafts] = await Promise.all([
+      api.get("/api/supplier-email-drafts"),
+      api.get("/api/drafts"),
+    ]);
+    const localPending = localDrafts.filter((draft) =>
+      draft.id === draft.question_set_id &&
+      ["draft", "approved"].includes(draft.status) &&
+      !drafts.some((item) => item.clarification_turn_id === draft.id),
+    ).length;
+    if (routeEpoch !== window.freightRouteEpoch) return;
+    const count = drafts.filter((draft) => ["draft", "approved"].includes(draft.status)).length + localPending;
+    badge.textContent = count ? String(count) : "";
+    badge.hidden = count === 0;
+    badge.setAttribute("aria-label", `${count} pending clarification draft${count === 1 ? "" : "s"}`);
+  } catch {
+    if (routeEpoch === window.freightRouteEpoch) badge.hidden = true;
+  }
+}
+
 // -------------------------------------------------------------------- routes
 function parseHash() {
   const raw = (location.hash || "#/").replace(/^#\/?/, "").split("?")[0];
@@ -425,11 +451,13 @@ function parseHash() {
 }
 
 function markActive(page) {
+  const draftPage = ["drafts", "draft", "email-draft"].includes(page);
+  const activePage = page === "proposals" ? "quotations" : page;
   for (const link of nav.querySelectorAll("a")) {
     const linkPage = (link.getAttribute("href") || "#/")
       .replace(/^#\/?/, "")
       .split("/")[0];
-    link.classList.toggle("active", linkPage === (page || ""));
+    link.classList.toggle("active", linkPage === (activePage || "") || (linkPage === "drafts" && draftPage));
   }
 }
 
@@ -462,18 +490,22 @@ async function route() {
     setDirty(false);
   }
   const { page, id } = parseHash();
+  if (page !== "inbox") { clearInterval(window.mailboxPoll); window.mailboxPoll = null; }
   markActive(page);
   const meta = PAGES[page] || PAGES[""];
   pageTitle.textContent = meta.title;
   pageGuide.textContent = meta.guide;
   skeleton("Loading workspace…");
   await refreshStatus();
+  refreshDraftCount();
   if (window.freightRouteEpoch !== routeEpoch) return;
   try {
     if (page === "") return await WorkspacePages.dashboard();
     if (page === "quotations") return id ? await WorkspacePages.detail(id) : await WorkspacePages.list();
+    if (page === "proposals") return id ? await WorkspacePages.proposal(id) : await WorkspacePages.list();
     if (page === "archived") return await WorkspacePages.list(true);
     if (page === "comparison") return await ComparisonPage();
+    if (page === "suppliers") return await SupplierIntelligencePage(id);
     if (page === "draft") return await QuotationDraftPage(id);
     if (page === "drafts") return await DraftListPage();
     if (page === "email-draft") return await EmailDraftPage(id);
@@ -541,6 +573,11 @@ window.addEventListener("beforeunload", (event) => {
     event.returnValue = "";
   }
 });
+
+const themeButton = document.getElementById("theme-toggle");
+function syncThemeControl(){const dark=document.documentElement.dataset.theme==="freight-dark";themeButton?.setAttribute("aria-label",`Switch to ${dark?'light':'dark'} mode`);themeButton?.setAttribute("title",`Switch to ${dark?'light':'dark'} mode`);const glyph=document.getElementById("theme-glyph");if(glyph)glyph.textContent=dark?'☀':'☾';const label=themeButton?.querySelector('.theme-label');if(label)label.textContent=dark?'Light mode':'Dark mode';}
+themeButton?.addEventListener("click",()=>{const next=document.documentElement.dataset.theme==="freight-dark"?'freight':'freight-dark';document.documentElement.dataset.theme=next;try{localStorage.setItem('freight-theme',next);}catch{}syncThemeControl();});
+syncThemeControl();
 
 route();
 

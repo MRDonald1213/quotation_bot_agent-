@@ -128,7 +128,7 @@ def create_app(settings: Settings) -> FastAPI:
             from urllib.parse import urlparse
             if origin and urlparse(origin).netloc != request.url.netloc:
                 return JSONResponse(status_code=403, content={"ok": False, "error": "cross-origin request refused"})
-        public = {"/login", "/api/login", "/api/session"}
+        public = {"/login", "/api/login", "/api/session", "/health"}
         if settings.demo_login_enabled and request.url.path not in public and not request.url.path.startswith("/static/"):
             expiry = app.state.sessions.get(request.cookies.get("freight_session"), 0)
             if expiry < time.time():
@@ -144,6 +144,21 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/login", include_in_schema=False)
     def login_page():
         return FileResponse(STATIC_DIR / "login.html")
+
+    @app.get("/health", include_in_schema=False)
+    def health() -> Any:
+        """Small unauthenticated liveness/readiness response for host monitors."""
+        from ..db.migrations import schema_status
+        from ..db.models import SCHEMA_VERSION
+
+        try:
+            with get_session(settings) as session:
+                initialized, version = schema_status(session)
+        except Exception:  # noqa: BLE001 — monitors need an unambiguous unavailable status
+            return JSONResponse(status_code=503, content={"status": "unavailable"})
+        if not initialized or version != SCHEMA_VERSION:
+            return JSONResponse(status_code=503, content={"status": "not_ready"})
+        return {"status": "ok"}
 
     @app.get("/api/session")
     def session_status(request: Request):
@@ -175,7 +190,9 @@ def create_app(settings: Settings) -> FastAPI:
         items = []
         labels = {"received":"Received", "queued":"Waiting to be read", "analyzing":"Reading now",
                   "draft_ready":"Ready for approval", "ready_for_approval":"Ready for approval",
-                  "needs_information":"Information missing", "needs_review":"Needs review", "attachment_unreadable":"Could not read attachment",
+                  "approved":"Approved · awaiting import", "imported":"Imported successfully",
+                  "rejected":"Record rejected", "needs_information":"Information missing",
+                  "needs_review":"Needs review", "attachment_unreadable":"Could not read attachment",
                   "no_destination_match":"No destination matched", "not_a_quotation":"Set aside: not a quotation",
                   "extraction_failed":"Could not finish reading", "reply_needs_linking":"Supplier reply needs linking"}
         for message in messages:
@@ -185,11 +202,40 @@ def create_app(settings: Settings) -> FastAPI:
         for proposal in list_proposals(settings):
             items.append({"id":"proposal-"+proposal["id"],"time":proposal.get("updated_at"),
                 "title":proposal["source_name"]+" · "+proposal["database_name"],
-                "status":labels.get(proposal["status"],proposal["status"].replace("_"," ").title()),"href":"#/quotations"})
-        from ..db.models import AuditEventRow
+                "status":labels.get(proposal["status"],proposal["status"].replace("_"," ").title()),
+                "href":"#/proposals/"+proposal["id"]})
+        from ..db.models import (
+            AuditEventRow, ClarificationDraftRow, DestinationProposalRow, GapRow,
+            GmailMessageRow, IntakeItemRow, QuotationRegisterRow, QuotationRow, QuestionSetRow,
+            ShipmentRow, SupplierDatabaseRow, SupplierEmailDraftRow, SupplierMasterRow,
+            SupplierQuotationActionRow, SupplierReplyRow,
+        )
+        entity_models = {
+            "clarification_draft": ClarificationDraftRow,
+            "destination_proposal": DestinationProposalRow,
+            "gap": GapRow,
+            "gmail_message": GmailMessageRow,
+            "intake_item": IntakeItemRow,
+            "quotation": QuotationRow,
+            "quotation_register": QuotationRegisterRow,
+            "question_set": QuestionSetRow,
+            "shipment": ShipmentRow,
+            "supplier_database": SupplierDatabaseRow,
+            "supplier_email_draft": SupplierEmailDraftRow,
+            "supplier_master": SupplierMasterRow,
+            "supplier_quotation_action": SupplierQuotationActionRow,
+            "supplier_reply": SupplierReplyRow,
+        }
         with get_session(settings) as session:
             recent = session.query(AuditEventRow).order_by(AuditEventRow.created_at.desc()).limit(50).all()
             for event in recent:
+                if event.action == "synthetic_test_email_hidden_from_active_work":
+                    continue
+                entity_model = entity_models.get(event.entity_type)
+                if entity_model is not None and session.get(entity_model, event.entity_id) is None:
+                    # Keep the audit row for history, but don't surface an event for
+                    # a source record that has since been removed from this workspace.
+                    continue
                 items.append({"id":"event-"+event.id,"time":event.created_at,
                     "title":event.action.replace("_", " ").capitalize(),"status":"Action recorded","href":"#/quotations"})
         return {"items":sorted(items,key=lambda item:item["time"] or "",reverse=True)[:100],"queue":queue}
@@ -198,6 +244,24 @@ def create_app(settings: Settings) -> FastAPI:
     def destination_proposals():
         from ..services.destination_proposals import list_proposals
         return list_proposals(settings)
+
+    @app.get("/api/destination-proposals/{proposal_id}")
+    def destination_proposal(proposal_id: str):
+        from ..services.destination_proposals import get_proposal
+        return get_proposal(settings, proposal_id)
+
+    @app.post("/api/destination-proposals/{proposal_id}/reanalyze")
+    def destination_proposal_reanalyze(proposal_id: str):
+        from ..services.destination_proposals import reanalyze
+
+        def work(job) -> dict[str, Any]:
+            outcome = reanalyze(settings, proposal_id,
+                                progress=lambda step: setattr(job, "progress", step))
+            return {"proposals": outcome.get("proposals", []), "notes": outcome.get("notes", [])}
+
+        return {"ok": True, "job": runner().submit(
+            "proposal-reanalysis", proposal_id, work,
+            max_seconds=_processing_budget_seconds(settings)).as_dict()}
 
     @app.post("/api/destination-proposals/{proposal_id}/{operation}")
     def destination_decision(proposal_id: str, operation: str):
@@ -328,6 +392,24 @@ def create_app(settings: Settings) -> FastAPI:
                 "activity": review["activity"][:6], "jobs": runner().recent(5)}
 
     # ------------------------------------------------ supplier databases
+    @app.get("/api/supplier-intelligence")
+    def supplier_intelligence(query: str = Query(default=""), service: str = Query(default=""),
+                              mode: str = Query(default=""), compliance: str = Query(default=""),
+                              category: str = Query(default=""), origin: str = Query(default=""),
+                              destination: str = Query(default="")) -> dict[str, Any]:
+        from ..services.supplier_intelligence import list_suppliers
+        return list_suppliers(query, service, mode, compliance, category, origin, destination)
+
+    @app.post("/api/supplier-intelligence/query")
+    def supplier_intelligence_query(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..services.supplier_intelligence import query
+        return query(str(body.get("question") or ""))
+
+    @app.get("/api/supplier-intelligence/{supplier_id}")
+    def supplier_intelligence_detail(supplier_id: str) -> dict[str, Any]:
+        from ..services.supplier_intelligence import supplier_detail
+        return supplier_detail(supplier_id)
+
     @app.get("/api/supplier-databases")
     def supplier_databases() -> list[dict[str, Any]]:
         from ..services.supplier_databases import list_supplier_databases
@@ -903,6 +985,11 @@ def create_app(settings: Settings) -> FastAPI:
         from ..services.gmail_drafts import approve_draft
         return {"ok": True, "draft": approve_draft(settings, draft_id)}
 
+    @app.post("/api/supplier-email-drafts/{draft_id}/discard")
+    def supplier_email_draft_discard(draft_id: str) -> dict[str, Any]:
+        from ..services.gmail_drafts import discard_draft
+        return {"ok": True, "draft": discard_draft(settings, draft_id)}
+
     @app.post("/api/supplier-email-drafts/{draft_id}/reconcile")
     def reconcile_email_delivery(draft_id: str, body: dict[str, Any]):
         from ..services.gmail_send import reconcile_delivery
@@ -921,6 +1008,11 @@ def create_app(settings: Settings) -> FastAPI:
     def supplier_master(database_id: str | None = Query(default=None)) -> list[dict[str, Any]]:
         from ..services.supplier_master import list_supplier_master
         return list_supplier_master(settings, database_id)
+
+    @app.get("/api/comparison/supplier-master")
+    def supplier_master_comparison() -> dict[str, Any]:
+        from ..services.comparison import compare_supplier_master_quotes
+        return compare_supplier_master_quotes(settings)
 
     @app.post("/api/supplier-master/{database_id}/sync")
     def supplier_master_sync(database_id: str) -> dict[str, Any]:

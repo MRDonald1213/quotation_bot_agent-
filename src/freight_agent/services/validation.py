@@ -31,6 +31,10 @@ MATERIAL_FIELDS = [
     "cargo_description", "weight_kg", "volume_m3",
     "supplier_id", "pricing_unit", "transport_type", "fuel_type", "dimensions",
     "contact_person", "contact_email", "contact_phone", "valid_from", "additional_conditions",
+    "origin_city", "origin_port", "destination_city", "destination_port", "service_type",
+    "cargo_type", "equipment_type", "container_type", "delivery_time", "estimated_delivery_date",
+    "quotation_validity_period", "fuel_surcharge", "payment_terms", "incoterms",
+    "included_charges", "excluded_charges", "quotation_notes",
 ]
 
 
@@ -210,7 +214,7 @@ def validate_extraction(extraction: QuoteExtraction, raw_text: str,
     for ev in extraction.field_evidence:
         if snippet_grounded(ev.snippet, raw_text):
             ev = ev.model_copy(update={"page_or_sheet": locate_snippet(ev.snippet, raw_text)})
-            evidence_by_field[ev.field_name] = ev
+            evidence_by_field.setdefault(ev.field_name, ev)
             grounded.append(ev)
         else:
             issues.append(f"evidence for {ev.field_name!r} not found verbatim in source — ungrounded")
@@ -234,6 +238,11 @@ def validate_extraction(extraction: QuoteExtraction, raw_text: str,
         if field not in evidence_by_field and field not in self_grounded:
             review_fields.add(field)
             issues.append(f"field {field!r} extracted without source evidence — flagged for review")
+        field_evidence = [item for item in grounded if item.field_name == field]
+        if field_evidence and any(item.confidence is None or item.confidence < 0.70 for item in field_evidence):
+            review_fields.add(field)
+            if any(item.confidence is None for item in field_evidence):
+                issues.append(f"field {field!r} has no extraction confidence; flagged for review")
 
     route_values: dict[str, object] = {}
     for field in ("origin", "destination"):
@@ -308,6 +317,7 @@ def validate_extraction(extraction: QuoteExtraction, raw_text: str,
         "charges": charges,
         **route_values,
         "fields_requiring_review": sorted(review_fields),
+        "not_applicable_fields": sorted(set(extraction.not_applicable_fields)),
     })
     statuses: dict[str, ValidationStatus] = {
         f: (ValidationStatus.needs_review if f in review_fields else ValidationStatus.accepted)

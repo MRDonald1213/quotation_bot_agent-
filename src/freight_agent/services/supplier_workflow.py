@@ -41,57 +41,61 @@ def _database_text(database: SupplierDatabaseRow) -> str:
 
 
 def route_databases(settings: Settings, text: str) -> tuple[list[dict], str | None, float]:
-    # Whole tokens avoid matches such as "air" inside "repair". Generic column
-    # names alone cannot select a destination.
-    stop = {"supplier", "name", "email", "price", "currency", "quotation", "quote", "offer", "contact", "valid", "until"}
-    words = set(re.findall(r"[a-z0-9]+", text.lower())) - stop
+    """Route every confirmed quotation to the one canonical supplier master."""
+    from .supplier_databases import (SUPPLIER_MASTER_FILE, connect_supplier_database_path,
+                                     refresh_canonical_supplier_schema)
+
     with get_session(settings) as session:
-        databases = session.scalars(select(SupplierDatabaseRow).where(SupplierDatabaseRow.status == "active").order_by(SupplierDatabaseRow.created_at)).all()
-    routing = []
-    for database in databases:
-        schema = json.loads(database.schema_json)
-        metadata = [(4, database.name), (3, database.description or ""),
-                    (3, database.category or ""), (4, " ".join(json.loads(database.routing_aliases_json))),
-                    (1, " ".join(field.get("name", "") + " " + field.get("description", "") for field in schema))]
-        hits = [(weight, words & (set(re.findall(r"[a-z0-9]+", content.lower())) - stop)) for weight, content in metadata]
-        score = sum(weight * len(tokens) for weight, tokens in hits)
-        matched = sorted(set().union(*(tokens for _, tokens in hits)))
-        eligible = score >= 3
-        routing.append({"database_id": database.id, "name": database.name,
-            "score": float(score) if eligible else 0.0,
-            "reason": "Matched routing terms: " + ", ".join(matched) if eligible else "Insufficient routing evidence"})
-    routing.sort(key=lambda item: item["score"], reverse=True)
-    # The overlap rule is fast and explainable; when it finds no plausible target,
-    # ask the configured local model about every database instead of stopping early.
-    if not any(item["score"] > 0 for item in routing) and databases:
-        semantic_error = None
+        row = session.scalar(select(SupplierDatabaseRow).where(
+            SupplierDatabaseRow.status == "active",
+            SupplierDatabaseRow.csv_path == str(SUPPLIER_MASTER_FILE.resolve()),
+        ).order_by(SupplierDatabaseRow.created_at).limit(1))
+        database_id = row.id if row else None
+        database_name = row.name if row else None
+    if database_id is None and SUPPLIER_MASTER_FILE.is_file():
         try:
-            from ..agents.database_router import route
-            catalog = [{"database_id": row.id, "name": row.name, "description": row.description,
-                "category": row.category, "aliases": json.loads(row.routing_aliases_json),
-                "schema": json.loads(row.schema_json)} for row in databases]
-            choice = route(settings, text, catalog)
-            ids = {row.id for row in databases}
-            for candidate in choice.candidates:
-                if candidate.database_id in ids and candidate.confidence >= 0.45:
-                    routing.append({"database_id": candidate.database_id,
-                        "name": next(row.name for row in databases if row.id == candidate.database_id),
-                        "score": candidate.confidence,
-                        "reason": candidate.reason + " (local model routing)"})
+            connected = connect_supplier_database_path(
+                settings, str(SUPPLIER_MASTER_FILE), name="Supplier Master Database",
+                description="One unified supplier and freight quotation master table.",
+                category="Supplier master", routing_aliases=["freight quotation", "supplier quote", "carrier offer"],
+            )
+            database_id, database_name = connected["id"], connected["name"]
         except Exception as exc:
-            semantic_error = type(exc).__name__
-            logger.warning("semantic destination routing unavailable: %s", semantic_error)
-        if semantic_error and not any(item["score"] > 0 for item in routing):
-            for item in routing:
-                item["reason"] += "; local semantic router unavailable (" + semantic_error + ")"
-        routing.sort(key=lambda item: item["score"], reverse=True)
-    if not routing:
-        return routing, None, 0.0
-    top = routing[0]
-    second_score = routing[1]["score"] if len(routing) > 1 else 0
-    if top["score"] <= 0 or (top["score"] == second_score and len(routing) > 1):
-        return routing, None, float(top["score"])
-    return routing, top["database_id"], float(top["score"])
+            logger.warning("canonical supplier master could not be connected: %s", type(exc).__name__)
+            database_id = database_name = None
+    elif database_id is not None:
+        refresh_canonical_supplier_schema(settings, database_id)
+        with get_session(settings) as session:
+            refreshed = session.get(SupplierDatabaseRow, database_id)
+            database_name = refreshed.name if refreshed else database_name
+    if database_id is None:
+        with get_session(settings) as session:
+            others = session.scalars(select(SupplierDatabaseRow).where(
+                SupplierDatabaseRow.status == "active")).all()
+            for other in others:
+                other.status = "disconnected"
+                other.updated_at = utcnow_iso()
+                session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_database", entity_id=other.id,
+                    action="retired_missing_canonical_master",
+                    details_json=json.dumps({"canonical_file": str(SUPPLIER_MASTER_FILE)}), created_at=other.updated_at))
+            if others:
+                session.commit()
+        return [], None, 0.0
+    with get_session(settings) as session:
+        others = session.scalars(select(SupplierDatabaseRow).where(
+            SupplierDatabaseRow.status == "active", SupplierDatabaseRow.id != database_id
+        )).all()
+        for other in others:
+            other.status = "disconnected"
+            other.updated_at = utcnow_iso()
+            session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_database", entity_id=other.id,
+                action="superseded_by_single_supplier_master",
+                details_json=json.dumps({"master_database_id": database_id}), created_at=other.updated_at))
+        if others:
+            session.commit()
+    routing = [{"database_id": database_id, "name": database_name, "score": 1.0,
+                "reason": "Single canonical supplier master selected; supplier and quotation fields share one schema."}]
+    return routing, database_id, 1.0
 
 
 def _normalize_aliases(field: dict) -> list[str]:
@@ -102,6 +106,11 @@ def _normalize_aliases(field: dict) -> list[str]:
         names.extend(["Email", "Contact Email"])
     if field["name"] == "Category":
         names.append("Service")
+    canonical_aliases = {
+        "Quotation_Valid_Until": ["Valid until", "Valid through", "Expiry date", "Expiration date"],
+        "Quoted_Price": ["Quoted price", "Total price", "Freight price", "Price"],
+    }
+    names.extend(canonical_aliases.get(field["name"], []))
     names.extend(field.get("aliases", []) or [])
     return list(dict.fromkeys(name.strip().lower() for name in names if name.strip()))
 
@@ -332,6 +341,11 @@ def _match_database_record(schema: list[dict], proposed: dict[str, str], text: s
         return {}, {}, None
     headers, rows = _read_csv(database_path)
     schema_names = {field["name"] for field in schema}
+    supplier_fields = {
+        "Supplier_ID", "Supplier_Name", "Category", "Primary_Lanes_Regions",
+        "Service_Contract_Type", "Compliance_Status", "Supplier_Default_Payment_Terms",
+        "Primary_Contact_Email", "OTD_Rating_Pct", "Billing_Accuracy_Pct",
+    } & schema_names
     proposed_supplier = str(proposed.get("Supplier_Name") or "").strip().lower()
     if not proposed_supplier:
         for key, value in proposed.items():
@@ -343,21 +357,27 @@ def _match_database_record(schema: list[dict], proposed: dict[str, str], text: s
         for row in rows:
             supplier = str(row.get("Supplier_Name") or row.get("supplier_name") or "").strip()
             if supplier and supplier.lower() in source_lower:
-                return {key: str(value) for key, value in row.items() if key in schema_names}, {
-                    key: "Matched existing supplier record by Supplier_Name"
-                    for key in row if key in schema_names
+                matched = {key: str(row.get(key) or "").strip() for key in supplier_fields if str(row.get(key) or "").strip()}
+                return matched, {
+                    key: f"Matched supplier master field for {supplier}; not quotation evidence"
+                    for key in matched
                 }, row
 
+    normalize = lambda value: re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
     matches = []
     for row in rows:
         supplier = str(row.get("Supplier_Name") or row.get("supplier_name") or "").strip().lower()
-        if supplier and proposed_supplier and (supplier == proposed_supplier or supplier in proposed_supplier or proposed_supplier in supplier):
+        if supplier and proposed_supplier and normalize(supplier) == normalize(proposed_supplier):
             matches.append(row)
     if not matches:
         return {}, {}, None
-    match = matches[0]
-    matched = {key: str(match[key]).strip() for key in headers if key in schema_names and str(match.get(key) or "").strip()}
-    evidence = {key: f"Matched existing Supplier_Name record: {match.get('Supplier_Name', '')}" for key in matched}
+    unique_suppliers = {str(row.get("Supplier_ID") or row.get("supplier_id") or "") for row in matches}
+    unique_suppliers.discard("")
+    if len(unique_suppliers) > 1:
+        return {}, {}, None
+    match = next((row for row in matches if not str(row.get("Quotation_ID") or "").strip()), matches[0])
+    matched = {key: str(match.get(key) or "").strip() for key in supplier_fields if str(match.get(key) or "").strip()}
+    evidence = {key: f"Matched supplier master field for {match.get('Supplier_Name', '')}; not quotation evidence" for key in matched}
     return matched, evidence, match
 
 
@@ -635,6 +655,144 @@ def _append_row(settings: Settings, database: SupplierDatabaseRow, row: dict[str
         shutil.copy2(backup, path)
         raise
     return normalized, str(backup)
+
+
+def generate_proposal_clarification_drafts(settings: Settings, proposal_id: str,
+                                           proposal: dict) -> list[dict]:
+    """Persist one supplier-confirmation and one missing-information draft per proposal."""
+    from ..db.models import DestinationProposalRow, SupplierEmailDraftRow
+    from .gmail_drafts import _address, _validate_content
+
+    result = proposal
+    has_previous_reply = bool(result.get("reply_history"))
+    schema = {str(field.get("name")): field for field in proposal.get("schema", [])}
+    values = proposal.get("values", {}) or {}
+    confidence = proposal.get("confidence", {}) or {}
+    explanations = proposal.get("explanations", {}) or {}
+    evidence = proposal.get("evidence", {}) or {}
+    uncertain_names = [name for name in (proposal.get("uncertain") or []) if name in schema]
+    missing_names = [name for name in (proposal.get("missing") or []) if name in schema]
+    field_specs = (
+        ("supplier_confirmation", "Supplier confirmation", uncertain_names),
+        ("missing_information", "Missing quotation information", missing_names),
+    )
+
+    with get_session(settings) as session:
+        proposal_row = session.get(DestinationProposalRow, proposal_id)
+        if proposal_row is None:
+            raise NotFoundError("Quotation proposal not found")
+        intake = session.get(IntakeItemRow, proposal_row.intake_id)
+        message = session.get(GmailMessageRow, intake.gmail_message_id) if intake and intake.gmail_message_id else None
+        account = session.get(GmailAccountRow, message.account_id) if message else None
+        recipient = _address(message.sender if message else None)
+        if not recipient:
+            recipient = _address(str(values.get("Supplier_Contact_Email") or values.get("Primary_Contact_Email") or ""))
+        if not account or not recipient:
+            # This workflow is entered from mailbox intake. A file without a linked
+            # mailbox sender cannot produce a sendable supplier email yet.
+            return []
+        subject_root = str(values.get("Quotation_Reference") or values.get("Quotation_ID") or
+                           (intake.subject if intake else "Freight quotation"))
+        supplier_name = str(values.get("Supplier_Name") or recipient)
+        generated: list[dict] = []
+        existing_rows = session.query(SupplierEmailDraftRow).filter(
+            SupplierEmailDraftRow.destination_proposal_id == proposal_id).order_by(
+                SupplierEmailDraftRow.created_at.desc()).all()
+        now = utcnow_iso()
+        for draft_type, title, field_names in field_specs:
+            active = next((row for status in ("draft", "approved", "cancelled") for row in existing_rows
+                           if row.draft_type == draft_type and row.status == status), None)
+            if not field_names:
+                if active and active.status in {"draft", "approved"}:
+                    active.status = "cancelled"
+                    active.updated_at = now
+                    session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_email_draft",
+                        entity_id=active.id, action="superseded_after_supplier_reply",
+                        details_json=json.dumps({"destination_proposal_id": proposal_id, "draft_type": draft_type}),
+                        created_at=now))
+                continue
+            # A saved draft is user-owned content. Keep it while the proposal is
+            # unchanged; a new supplier reply advances the proposal timestamp and
+            # allows the unanswered fields to be refreshed.
+            if active and active.status == "draft" and active.updated_at >= proposal_row.updated_at:
+                generated.append({"id": active.id, "draft_type": draft_type, "subject": active.subject,
+                                  "recipient": active.recipient, "status": "draft"})
+                continue
+            lines = []
+            for index, name in enumerate(field_names, start=1):
+                field = schema[name]
+                label = str(field.get("label") or name.replace("_", " "))
+                if draft_type == "supplier_confirmation":
+                    candidate = str(values.get(name) or "candidate not extracted")
+                    score = confidence.get(name)
+                    score_text = f" ({round(float(score) * 100)}% confidence)" if score is not None else ""
+                    reason = str(explanations.get(name) or "The quotation wording is ambiguous.")
+                    source_excerpt = str(evidence.get(name) or "")
+                    lines.append(f"{index}. {label}: {candidate}{score_text}. {reason}" +
+                                 (f' Source excerpt: “{source_excerpt}”' if source_excerpt else "") +
+                                 f"\n   Could you please confirm the {label.casefold()} for this quotation?")
+                else:
+                    lines.append(f"{index}. {label}: Could you please provide or confirm this information?")
+            if draft_type == "supplier_confirmation":
+                if has_previous_reply:
+                    intro = (f"Thank you for your reply to our earlier questions about quotation {subject_root} from {supplier_name}. "
+                             "Your previous reply did not fully resolve the questions below. We have reanalyzed the offer, "
+                             "but these details are still unclear or inconsistent with the quotation. "
+                             "Please provide a more detailed answer to each point so we can complete the review:")
+                else:
+                    intro = (f"We are reviewing quotation {subject_root} from {supplier_name}. "
+                             "The quotation contains the following details, but the source is not conclusive:")
+            else:
+                if has_previous_reply:
+                    intro = (f"Thank you for your reply to our earlier questions about quotation {subject_root} from {supplier_name}. "
+                             "Your previous reply did not fully answer the questions below. We have reanalyzed the offer, "
+                             "but these details are still missing or unclear. Please provide a more detailed response "
+                             "to each point so we can complete the quotation review:")
+                else:
+                    intro = (f"We are reviewing quotation {subject_root} from {supplier_name}. "
+                             "The following required details were not found in the quotation:")
+            body = "Hello,\n\n" + intro + "\n\n" + "\n\n".join(lines) + \
+                   "\n\nThank you for your help.\n\nKind regards,\nFreight AI Agent"
+            subject = f"{'Follow-up: ' if has_previous_reply else ''}{title}: {subject_root}"
+            _validate_content(recipient, "", subject, body)
+            if active and active.status == "approved" and active.recipient == recipient and \
+                    active.subject == subject and active.body == body:
+                generated.append({"id": active.id, "draft_type": draft_type, "subject": active.subject,
+                                  "recipient": active.recipient, "status": "approved"})
+                continue
+            if active is None:
+                active = SupplierEmailDraftRow(
+                    id=str(uuid4()), destination_proposal_id=proposal_id, draft_type=draft_type,
+                    requested_fields_json=json.dumps(field_names),
+                    gmail_account_id=account.id, gmail_thread_id=message.gmail_thread_id,
+                    bound_recipient=recipient, recipient=recipient, cc="", subject=subject, body=body,
+                    status="draft", created_at=now, updated_at=now,
+                )
+                session.add(active)
+                action = "created"
+            else:
+                active.status = "draft"
+                active.requested_fields_json = json.dumps(field_names)
+                active.approved_recipient = None
+                active.immutable_approved_body = None
+                active.approved_subject = None
+                active.gmail_account_id = account.id
+                active.gmail_thread_id = message.gmail_thread_id
+                active.bound_recipient = recipient
+                active.recipient = recipient
+                active.cc = ""
+                active.subject = subject
+                active.body = body
+                active.updated_at = now
+                action = "refreshed"
+            session.add(AuditEventRow(id=str(uuid4()), entity_type="supplier_email_draft",
+                entity_id=active.id, action=action,
+                details_json=json.dumps({"destination_proposal_id": proposal_id, "draft_type": draft_type,
+                                         "fields": field_names}), created_at=now))
+            generated.append({"id": active.id, "draft_type": draft_type, "subject": subject,
+                              "recipient": recipient, "status": "draft"})
+        session.commit()
+        return generated
 
 
 def approve_action(settings: Settings, action_id: str, corrected_row: dict[str, str] | None = None, notes: str | None = None) -> dict:

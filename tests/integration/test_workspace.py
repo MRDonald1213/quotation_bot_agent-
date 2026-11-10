@@ -210,8 +210,8 @@ def test_v8_migration_preserves_quotation_and_evidence(settings,quote):
             session.execute(text(f'ALTER TABLE supplier_email_drafts DROP COLUMN {column}'))
         session.execute(text('DELETE FROM schema_version WHERE version>=9'))
         session.commit()
-        assert init_schema(session)==['v9', 'v10']
-        assert schema_status(session)==(True,10)
+        assert init_schema(session)==['v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15']
+        assert schema_status(session)==(True,15)
         assert init_schema(session)==[]
     with with_session(settings) as repos:
         restored=repos.get_quotation(str(quote.id))
@@ -348,7 +348,7 @@ def test_draft_is_saved_locally_without_gmail(settings,quote):
     with with_session(settings) as repos:assert str(repos.get_draft(turn['id']).status)=='cancelled'
 
 
-def test_pipeline_without_database_does_not_extract(settings,tmp_path,fake_llm):
+def test_pipeline_without_database_classifies_but_does_not_extract(settings,tmp_path,fake_llm):
     from freight_agent.services.intake import register_intake
     from freight_agent.services.supplier_workflow import run_quotation_pipeline
     path=tmp_path/'uncertain.txt';path.write_text('TruckCO, Shenzhen to Beijing, $1200')
@@ -358,9 +358,10 @@ def test_pipeline_without_database_does_not_extract(settings,tmp_path,fake_llm):
     assert result['action']['id'] is None
     with with_session(settings) as repos:
         assert repos.list_quotations()==[]
-        assert str(repos.get_intake(str(item.id)).classification_status)=='pending'
+        assert str(repos.get_intake(str(item.id)).classification_status)=='needs_review'
     assert result['proposals']==[]
-    assert fake_llm.prompts==[]
+    assert len(fake_llm.prompts)==1
+    assert 'You are a document classifier' in fake_llm.prompts[0]
 
 
 def test_parser_location_overrides_model_claim():
@@ -400,11 +401,15 @@ def test_source_download_is_available_in_archive(settings,quote):
         assert client.get(f'/api/workspace/quotes/{quote.id}/sources/{uuid4()}/download').status_code==404
 
 
-def test_received_documents_share_quotation_queue_without_invented_values(settings,tmp_path):
+def test_unclassified_documents_wait_outside_quotation_queue_until_verified(settings,tmp_path,fake_llm):
+    from freight_agent.services.classification import classify_intake
     from freight_agent.services.intake import register_intake
     source=tmp_path/'received.txt';source.write_text('A newly received quotation awaiting extraction')
     item,_=register_intake(settings,None,source)
     assert workspace.list_quotes(settings)==[]
+    assert workspace.list_quotes(settings,include_intake=True)==[]
+    fake_llm.responses={'You are a document classifier':{'is_freight_quote':True,'reason':'Quotation for testing','confidence':0.99,'needs_human_review':False,'document_type':'carrier_quote'}}
+    classify_intake(settings,str(item.id))
     rows=workspace.list_quotes(settings,include_intake=True)
     assert len(rows)==1 and rows[0]['record_type']=='intake'
     assert rows[0]['stage']=='Received' and rows[0]['base_price'] is None

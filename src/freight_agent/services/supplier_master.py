@@ -16,6 +16,10 @@ from .supplier_databases import _parse_csv
 
 
 def _identity(headers: list[str], row: dict[str, str]) -> str:
+    supplier_id = str(row.get("Supplier_ID") or row.get("supplier_id") or "").strip()
+    quotation_id = str(row.get("Quotation_ID") or row.get("quotation_id") or "").strip()
+    if supplier_id and quotation_id:
+        return f"{supplier_id}:{quotation_id}"
     priority = [h for h in headers if "supplier_id" in h.lower() or "supplier id" in h.lower()]
     priority += [h for h in headers if re.search(r"supplier|vendor|carrier|company", h.lower()) and h not in priority]
     priority += [h for h in headers if "email" in h.lower() and h not in priority]

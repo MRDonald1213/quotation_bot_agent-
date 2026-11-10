@@ -100,15 +100,33 @@ class Charge(DomainModel):
 
 class QuotationDetails(DomainModel):
     origin_country: str | None = None
+    origin_city: str | None = None
+    origin_port: str | None = None
     destination_country: str | None = None
+    destination_city: str | None = None
+    destination_port: str | None = None
     supplier_id: str | None = None
     pricing_unit: str | None = None
     transport_type: str | None = None
+    service_type: str | None = None
+    cargo_type: str | None = None
     fuel_type: str | None = None
+    equipment_type: str | None = None
+    container_type: str | None = None
     cargo_description: str | None = None
     weight_kg: Decimal | None = None
     volume_m3: Decimal | None = None
     dimensions: str | None = None
+    delivery_time: str | None = None
+    estimated_delivery_date: date | None = None
+    quotation_validity_period: str | None = None
+    fuel_surcharge: str | None = None
+    payment_terms: str | None = None
+    incoterms: str | None = None
+    included_charges: list[str] = Field(default_factory=list)
+    excluded_charges: list[str] = Field(default_factory=list)
+    quotation_notes: str | None = None
+    not_applicable_fields: list[str] = Field(default_factory=list)
     contact_person: str | None = None
     contact_email: str | None = None
     contact_phone: str | None = None
@@ -133,6 +151,12 @@ class Quotation(DomainModel):
     included_services: list[str] = Field(default_factory=list)
     origin: str | None = None
     destination: str | None = None
+    origin_country: str | None = None
+    origin_city: str | None = None
+    origin_port: str | None = None
+    destination_country: str | None = None
+    destination_city: str | None = None
+    destination_port: str | None = None
     transit_days_min: int | None = None
     transit_days_max: int | None = None
     valid_until: date | None = None
@@ -163,6 +187,7 @@ class FieldEvidence(DomainModel):
     page_or_sheet: str | None = None
     snippet: str
     confidence: float | None = None
+    explanation: str | None = None
     validation_status: ValidationStatus = ValidationStatus.accepted
     created_at: datetime = Field(default_factory=_now)
 
@@ -202,9 +227,11 @@ class Gap(DomainModel):
 
 
 class AuditEvent(DomainModel):
-    id: UUID = Field(default_factory=uuid4)
+    # Preserve malformed legacy identifiers on read so old audit rows cannot
+    # break the review console. New events still use UUIDs by default.
+    id: UUID | str = Field(default_factory=uuid4)
     entity_type: str
-    entity_id: UUID
+    entity_id: UUID | str
     action: str
     details_json: str = "{}"
     created_at: datetime = Field(default_factory=_now)
@@ -215,7 +242,7 @@ class AuditEvent(DomainModel):
 class ClassificationResult(DomainModel):
     is_freight_quote: bool
     reason: str
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     carrier_name: str | None = None
     shipment_reference: str | None = None
     needs_human_review: bool = False
@@ -227,7 +254,8 @@ class EvidenceItem(DomainModel):
     field_name: str
     snippet: str
     page_or_sheet: str | None = None
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    explanation: str | None = Field(default=None, max_length=500)
 
 
 class QuoteExtraction(QuotationDetails):
@@ -240,6 +268,10 @@ class QuoteExtraction(QuotationDetails):
     excluded_services: list[str] = Field(default_factory=list)
     origin: str | None = None
     destination: str | None = None
+    origin_city: str | None = None
+    origin_port: str | None = None
+    destination_city: str | None = None
+    destination_port: str | None = None
     origin_country: str | None = None
     destination_country: str | None = None
     cargo_description: str | None = None
@@ -248,11 +280,25 @@ class QuoteExtraction(QuotationDetails):
     transit_days_min: int | None = None
     transit_days_max: int | None = None
     valid_until: date | None = None
+    payment_terms: str | None = None
+    incoterms: str | None = None
+    service_type: str | None = None
+    cargo_type: str | None = None
+    equipment_type: str | None = None
+    container_type: str | None = None
+    delivery_time: str | None = None
+    estimated_delivery_date: date | None = None
+    quotation_validity_period: str | None = None
+    fuel_surcharge: str | None = None
+    included_charges: list[str] = Field(default_factory=list)
+    excluded_charges: list[str] = Field(default_factory=list)
+    quotation_notes: str | None = None
     delivery_scope: str | None = None
     insurance_included: bool | None = None
     customs_included: bool | None = None
     assumptions: list[str] = Field(default_factory=list)
     fields_requiring_review: list[str] = Field(default_factory=list)
+    not_applicable_fields: list[str] = Field(default_factory=list)
     field_evidence: list[EvidenceItem] = Field(default_factory=list)
 
 
@@ -364,6 +410,28 @@ class ComparisonRow(DomainModel):
     unresolved_critical_gaps: list[str] = Field(default_factory=list)
     unresolved_other_gaps: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
+    origin: str | None = None
+    destination: str | None = None
+    transport_mode: str | None = None
+    service_type: str | None = None
+    cargo_type: str | None = None
+    fuel_type: str | None = None
+    equipment_type: str | None = None
+    container_type: str | None = None
+    cargo_weight: str | None = None
+    cargo_volume: str | None = None
+    delivery_time: str | None = None
+    estimated_delivery_date: date | None = None
+    fuel_surcharge: str | None = None
+    additional_charges: list[str] = Field(default_factory=list)
+    included_charges: list[str] = Field(default_factory=list)
+    excluded_charges: list[str] = Field(default_factory=list)
+    payment_terms: str | None = None
+    quotation_validity_period: str | None = None
+    incoterms: str | None = None
+    insurance_included: bool | None = None
+    field_confidence: dict[str, float | None] = Field(default_factory=dict)
+    field_status: dict[str, str] = Field(default_factory=dict)
 
 
 class ComparisonReport(DomainModel):

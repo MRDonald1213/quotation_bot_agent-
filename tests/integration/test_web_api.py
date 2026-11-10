@@ -9,11 +9,13 @@ from __future__ import annotations
 import time
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 from freight_agent.api.app import create_app
+from freight_agent.db.models import AuditEventRow
 from freight_agent.domain.enums import ReviewStatus, ValidationStatus
 from freight_agent.services.common import with_session
 from freight_agent.services.shipments import create_shipment
@@ -106,12 +108,42 @@ def _quote_of(client: TestClient, intake_id: str) -> dict:
     return detail["quotations"][0]
 
 
+def test_review_pages_keep_loading_with_malformed_legacy_audit_identifier(
+    client: TestClient, settings,
+) -> None:
+    with with_session(settings) as repos:
+        repos.session.add(AuditEventRow(
+            id="legacy-audit-id",
+            entity_type="intake_item",
+            entity_id=str(uuid4()),
+            action="classification_restored_after_reanalysis_error",
+            details_json="{}",
+            created_at="2026-11-09T00:00:00+00:00",
+        ))
+        repos.session.commit()
+
+    assert client.get("/api/drafts").status_code == 200
+    assert client.get("/api/shipments").status_code == 200
+    assert client.get("/api/workspace/quotes?include_intake=true").status_code == 200
+    notifications = client.get("/api/notifications")
+    assert notifications.status_code == 200
+    assert not any(item["id"] == "event-legacy-audit-id" for item in notifications.json()["items"])
+
+
+def test_public_health_endpoint_works_with_login_enabled(settings) -> None:
+    settings.demo_login_enabled = True
+    with TestClient(create_app(settings)) as health_client:
+        response = health_client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 # ------------------------------------------------------------------ status
 def test_status_reports_local_model_and_schema_without_calling_it(client: TestClient) -> None:
     payload = client.get("/api/status").json()
     assert payload["backend"] == "ok"
     assert payload["database"]["initialized"] is True
-    assert payload["database"]["schema_version"] == 11
+    assert payload["database"]["schema_version"] == 15
     assert payload["ollama"]["model"] == "fake-model"
     assert set(payload["parsers"]) == {"pdf", "docx", "xlsx"}
     assert ".eml" in payload["limits"]["supported_extensions"]
@@ -256,6 +288,23 @@ def test_dashboard_counts_come_from_the_database(client: TestClient, settings) -
     assert payload["counts"]["documents"] == 0
     assert payload["recent"] == []
     assert [s["reference"] for s in client.get("/api/shipments").json()] == ["SHP-EMPTY"]
+
+
+def test_supplier_intelligence_starts_without_seed_records(client: TestClient) -> None:
+    result = client.post("/api/supplier-intelligence/query", json={
+        "question": "Find ocean suppliers operating between Shenzhen and Hamburg",
+    })
+    assert result.status_code == 200
+    payload = result.json()
+    assert payload["exact_matches"] == []
+    assert payload["partial_matches"] == []
+    assert "sample" not in payload["data_note"].lower()
+
+    directory = client.get("/api/supplier-intelligence", params={
+        "category": "Ocean Carrier (VOCC)", "origin": "Shenzhen", "destination": "Hamburg",
+    })
+    assert directory.status_code == 200
+    assert directory.json()["suppliers"] == []
 
 
 # ------------------------------------------------------------------- intake

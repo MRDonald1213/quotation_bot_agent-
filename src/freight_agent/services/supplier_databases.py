@@ -17,6 +17,77 @@ from ..db.engine import get_session
 from ..db.models import AuditEventRow, SupplierDatabaseRow, utcnow_iso
 from ..domain.exceptions import NotFoundError, ValidationFailureError
 
+SUPPLIER_MASTER_FILE = Path(__file__).resolve().parents[3] / "mock_data" / "Supplier_Master_Database.csv"
+
+SUPPLIER_MASTER_FIELDS = {
+    "supplier_id", "category", "primary_lanes_regions",
+    "service_contract_type", "compliance_status", "supplier_default_payment_terms",
+    "primary_contact_email", "otd_rating_pct", "billing_accuracy_pct",
+}
+SUPPLIER_MASTER_ONLY_FIELDS = SUPPLIER_MASTER_FIELDS - {"supplier_name", "primary_contact_email"}
+SUPPLIER_QUOTATION_REQUIRED = {
+    "quotation_reference", "origin_city", "origin_country", "destination_city",
+    "destination_country", "transport_mode", "cargo_type", "quoted_price", "currency",
+    "pricing_basis", "delivery_time", "quotation_valid_until", "payment_terms",
+}
+
+
+def annotate_supplier_master_schema(fields: list[dict]) -> list[dict]:
+    """Keep supplier metadata and quote extraction requirements distinct in the one CSV schema."""
+    result = []
+    for field in fields:
+        item = dict(field)
+        key = str(item.get("name", "")).casefold()
+        if key in SUPPLIER_MASTER_FIELDS:
+            item.update(scope="supplier_master", required=False)
+            if key in {"otd_rating_pct", "billing_accuracy_pct"}:
+                item["extraction_enabled"] = False
+        elif key in SUPPLIER_QUOTATION_REQUIRED:
+            item.update(scope="quotation", required=True)
+        elif key == "supplier_name":
+            item.update(scope="quotation", required=True)
+        elif key in {"quotation_id", "quotation_received_date", "record_data_status", "data_status",
+                     "data_source", "extraction_confidence_json", "extraction_evidence_json",
+                     "extraction_notes"}:
+            item.update(scope="system", required=False, extraction_enabled=False)
+        elif key == "supplier_contact_email":
+            item.update(scope="quotation", required=False)
+        elif key in {"origin_port", "destination_port"}:
+            item.update(scope="quotation", required=False, not_applicable_for=("road", "air"))
+        else:
+            item.setdefault("scope", "quotation")
+        result.append(item)
+    return result
+
+
+def _merge_schema_metadata(inferred: list[dict], existing: list[dict]) -> list[dict]:
+    """Refresh source columns while keeping editable labels and aliases.
+
+    Extraction scope and the required quote fields are product rules for the
+    canonical master. A stale saved schema must not turn those rules off again.
+    """
+    by_name = {field["name"]: field for field in existing
+               if isinstance(field, dict) and field.get("name")}
+    merged = []
+    for field in inferred:
+        custom = by_name.get(field["name"], {})
+        scope = field.get("scope")
+        required = bool(field.get("required"))
+        if scope in {"supplier_master", "system"}:
+            required = False
+        elif field["name"].casefold() not in SUPPLIER_QUOTATION_REQUIRED | {"supplier_name"}:
+            required = bool(custom.get("required", required))
+        merged.append({
+            **field,
+            "label": str(custom.get("label") or field["label"]),
+            "type": str(custom.get("type") or field["type"]),
+            "required": required,
+            "description": str(custom.get("description") or field.get("description") or ""),
+            "aliases": list(custom.get("aliases") or field.get("aliases") or []),
+            "searchable": bool(custom.get("searchable", field.get("searchable", True))),
+        })
+    return merged
+
 
 def _parse_csv(path: Path) -> tuple[list[str], list[dict[str, str]], list[dict[str, str]]]:
     encodings = ("utf-8-sig", "utf-8", "cp1252")
@@ -144,6 +215,8 @@ def infer_schema(path: Path) -> tuple[list[dict], int]:
             "aliases": [],
             "searchable": True,
         })
+    if path.name.casefold() == "supplier_master_database.csv":
+        fields = annotate_supplier_master_schema(fields)
     return fields, len(rows)
 
 
@@ -169,9 +242,13 @@ def row_payload(row: SupplierDatabaseRow) -> dict:
 
 
 def list_supplier_databases(settings: Settings) -> list[dict]:
+    # Register the single canonical file on first use and retire any legacy active
+    # connection records, while retaining their audit/history rows.
+    from .supplier_workflow import route_databases
+    route_databases(settings, "")
     with get_session(settings) as session:
         rows = session.scalars(select(SupplierDatabaseRow).order_by(SupplierDatabaseRow.created_at.desc())).all()
-        return [row_payload(row) for row in rows if row.status != "disconnected"]
+        return [row_payload(row) for row in rows if row.status == "active"]
 
 
 def get_supplier_database(settings: Settings, database_id: str) -> dict:
@@ -186,70 +263,10 @@ def connect_supplier_database(settings: Settings, uploaded_name: str, upload_byt
                                name: str, description: str = "", category: str | None = None,
                                routing_aliases: list[str] | None = None,
                                schema: list[dict] | None = None) -> dict:
-    if not uploaded_name.lower().endswith(".csv"):
-        raise ValidationFailureError("only CSV supplier databases are supported")
-    if len(upload_bytes) > settings.max_file_size_mb * 1024 * 1024:
-        raise ValidationFailureError(f"CSV is larger than the configured limit of {settings.max_file_size_mb} MB")
-
-    database_id = str(uuid4())
-    directory = settings.workspace_dir.resolve() / "supplier_databases" / database_id
-    directory.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(uploaded_name).name or "supplier-database.csv"
-    path = directory / safe_name
-    path.write_bytes(upload_bytes)
-
-    try:
-        inferred, record_count = infer_schema(path)
-    except Exception:
-        shutil.rmtree(directory, ignore_errors=True)
-        raise
-
-    if schema:
-        by_name = {field["name"]: field for field in schema if isinstance(field, dict) and field.get("name")}
-        final_schema = []
-        for inferred_field in inferred:
-            custom = by_name.get(inferred_field["name"], {})
-            final_schema.append({
-                **inferred_field,
-                "label": str(custom.get("label") or inferred_field["label"]),
-                "type": str(custom.get("type") or inferred_field["type"]),
-                "required": bool(custom.get("required", False)),
-                "description": str(custom.get("description") or ""),
-                "aliases": list(custom.get("aliases") or []),
-                "searchable": bool(custom.get("searchable", True)),
-            })
-    else:
-        final_schema = inferred
-
-    now = utcnow_iso()
-    with get_session(settings) as session:
-        with session.begin():
-            row = SupplierDatabaseRow(
-                id=database_id,
-                name=name.strip() or Path(safe_name).stem,
-                description=description.strip(),
-                category=(category.strip() if category else None),
-                routing_aliases_json=json.dumps(routing_aliases or []),
-                csv_filename=safe_name,
-                csv_path=str(path),
-                schema_json=json.dumps(final_schema),
-                record_count=record_count,
-                status="active",
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(row)
-            session.add(AuditEventRow(
-                id=str(uuid4()), entity_type="supplier_database", entity_id=database_id,
-                action="connected", details_json=json.dumps({"csv_filename": safe_name, "record_count": record_count}),
-                created_at=now,
-            ))
-            session.flush()
-            database_id_value = row.id
-            payload = row_payload(row)
-        from .supplier_master import sync_supplier_master
-        sync_supplier_master(settings, database_id_value)
-        return payload
+    raise ValidationFailureError(
+        "This workspace uses one canonical Supplier_Master_Database.csv. "
+        "Add supplier and quotation rows to that file instead of connecting another CSV."
+    )
 
 
 def connect_supplier_database_path(settings: Settings, supplied_path: str, *, name: str,
@@ -257,27 +274,22 @@ def connect_supplier_database_path(settings: Settings, supplied_path: str, *, na
                                    routing_aliases: list[str] | None = None,
                                    schema: list[dict] | None = None) -> dict:
     path = resolve_supplier_csv_path(settings, supplied_path)
+    if path != SUPPLIER_MASTER_FILE.resolve():
+        raise ValidationFailureError(
+            "Only the canonical Supplier_Master_Database.csv can be connected in this workspace."
+        )
     if path.stat().st_size > settings.max_file_size_mb * 1024 * 1024:
         raise ValidationFailureError(f"CSV is larger than the configured limit of {settings.max_file_size_mb} MB")
 
     inferred, record_count = infer_schema(path)
-    if schema:
-        by_name = {field["name"]: field for field in schema if isinstance(field, dict) and field.get("name")}
-        final_schema = []
-        for inferred_field in inferred:
-            custom = by_name.get(inferred_field["name"], {})
-            final_schema.append({
-                **inferred_field,
-                "label": str(custom.get("label") or inferred_field["label"]),
-                "type": str(custom.get("type") or inferred_field["type"]),
-                "required": bool(custom.get("required", False)),
-                "description": str(custom.get("description") or ""),
-                "aliases": list(custom.get("aliases") or []),
-                "searchable": bool(custom.get("searchable", True)),
-            })
-    else:
-        final_schema = inferred
+    final_schema = _merge_schema_metadata(inferred, schema or [])
 
+    with get_session(settings) as session:
+        existing = session.scalar(select(SupplierDatabaseRow).where(
+            SupplierDatabaseRow.csv_path == str(path), SupplierDatabaseRow.status == "active"
+        ).order_by(SupplierDatabaseRow.created_at).limit(1))
+        if existing:
+            return row_payload(existing)
     database_id = str(uuid4())
     now = utcnow_iso()
     with get_session(settings) as session:
@@ -346,24 +358,9 @@ def reanalyze_supplier_database(settings: Settings, database_id: str) -> dict:
 
     path = resolve_supplier_csv_path(settings, row.csv_path)
     inferred, record_count = infer_schema(path)
-    existing_by_name = {
-        field["name"]: field
-        for field in existing_schema
-        if isinstance(field, dict) and field.get("name")
-    }
-    merged_schema = []
+    merged_schema = _merge_schema_metadata(inferred, existing_schema)
     removed_fields = []
     inferred_names = {field["name"] for field in inferred}
-    for inferred_field in inferred:
-        custom = existing_by_name.get(inferred_field["name"], {})
-        merged_schema.append({
-            **inferred_field,
-            "label": str(custom.get("label") or inferred_field["label"]),
-            "required": bool(custom.get("required", False)),
-            "description": str(custom.get("description") or ""),
-            "aliases": list(custom.get("aliases") or []),
-            "searchable": bool(custom.get("searchable", True)),
-        })
     removed_fields = [field["name"] for field in existing_schema if isinstance(field, dict) and field.get("name") not in inferred_names]
 
     now = utcnow_iso()
@@ -390,12 +387,55 @@ def reanalyze_supplier_database(settings: Settings, database_id: str) -> dict:
     return payload
 
 
+def refresh_canonical_supplier_schema(settings: Settings, database_id: str) -> dict:
+    """Synchronize the saved canonical schema with the actual CSV header safely."""
+    with get_session(settings) as session:
+        row = session.get(SupplierDatabaseRow, database_id)
+        if row is None or row.status != "active":
+            raise NotFoundError("supplier database not found")
+        path = Path(row.csv_path)
+        existing_schema = json.loads(row.schema_json)
+    if path.resolve() != SUPPLIER_MASTER_FILE.resolve():
+        return row_payload(row)
+    inferred, record_count = infer_schema(path)
+    merged = _merge_schema_metadata(inferred, existing_schema)
+    schema_json = json.dumps(merged)
+    if schema_json == row.schema_json and record_count == row.record_count:
+        return row_payload(row)
+    now = utcnow_iso()
+    with get_session(settings) as session:
+        with session.begin():
+            current = session.get(SupplierDatabaseRow, database_id)
+            if current is None or current.status != "active":
+                raise NotFoundError("supplier database not found")
+            if current.schema_json != schema_json or current.record_count != record_count:
+                previous_fields = len(json.loads(current.schema_json))
+                current.schema_json = schema_json
+                current.record_count = record_count
+                current.updated_at = now
+                session.add(AuditEventRow(
+                    id=str(uuid4()), entity_type="supplier_database", entity_id=database_id,
+                    action="canonical_schema_refreshed",
+                    details_json=json.dumps({"field_count": len(merged),
+                                             "previous_field_count": previous_fields,
+                                             "record_count": record_count}),
+                    created_at=now,
+                ))
+            session.flush()
+            payload = row_payload(current)
+    from .supplier_master import sync_supplier_master
+    sync_supplier_master(settings, database_id)
+    return payload
+
+
 def disconnect_supplier_database(settings: Settings, database_id: str) -> dict:
     with get_session(settings) as session:
         with session.begin():
             row = session.get(SupplierDatabaseRow, database_id)
             if row is None:
                 raise NotFoundError("supplier database not found")
+            if Path(row.csv_path).resolve() == SUPPLIER_MASTER_FILE.resolve():
+                raise ValidationFailureError("The canonical supplier master is required and cannot be disconnected.")
             row.status = "disconnected"
             row.updated_at = utcnow_iso()
             session.add(AuditEventRow(

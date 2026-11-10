@@ -15,7 +15,8 @@ from ..domain.models import Quotation, Carrier
 from ..db.repositories import Repos
 from ..agents.model import make_agent
 from ..agents.prompts import wrap_untrusted
-from ..db.models import (ClarificationTurnRow, SourceDocumentRow, SupplierEmailDraftRow,
+from ..db.models import (ClarificationTurnRow, DestinationProposalRow, SourceDocumentRow,
+                         SupplierDatabaseRow, SupplierEmailDraftRow,
                          SupplierQuotationActionRow, GmailMessageRow)
 from ..domain.enums import ReviewStatus, ValidationStatus, GapStatus, ComparisonStatus
 from ..domain.exceptions import ValidationFailureError, NotFoundError
@@ -97,19 +98,66 @@ def list_quotes(settings: Settings, archived: bool = False, include_intake: bool
         if include_intake and not archived:
             all_quotes = repos.list_quotations()
             consumed = {str(q.intake_item_id) for q in all_quotes}
+            proposal_rows = repos.session.execute(
+                select(DestinationProposalRow, SupplierDatabaseRow).join(
+                    SupplierDatabaseRow,
+                    DestinationProposalRow.database_id == SupplierDatabaseRow.id,
+                ).order_by(DestinationProposalRow.created_at.desc())
+            ).all()
+            proposal_by_intake = {}
+            for proposal_row, database_row in proposal_rows:
+                proposal_by_intake.setdefault(str(proposal_row.intake_id), (proposal_row, database_row))
             for item in repos.list_intakes(None, None):
                 if (str(item.id) in consumed or item.source_type == "imported_reply"
                         or item.classification_status != __import__("freight_agent.domain.enums", fromlist=["ClassificationStatus"]).ClassificationStatus.relevant):
                     continue
-                stage = ("Reading" if item.processing_status == "processing" else
-                         "Reading failed" if item.processing_status == "failed" else
-                         "Confirm document type" if item.classification_status == "needs_review" else "Received")
+                proposal_pair = proposal_by_intake.get(str(item.id))
+                proposal = database = result_data = None
+                if proposal_pair:
+                    proposal, database = proposal_pair
+                    result_data = json.loads(proposal.result_json or "{}")
+                    proposal_stages = {
+                        "ready_for_approval": ("Ready for review", "extracted"),
+                        "approved": ("Approved", "approved"),
+                        "imported": ("Imported", "imported"),
+                        "needs_information": ("Missing information", "extracted"),
+                        "rejected": ("Rejected", "rejected"),
+                        "failed": ("Reading failed", None),
+                    }
+                    stage, review_status = proposal_stages.get(proposal.status, ("Needs review", None))
+                else:
+                    stage = ("Reading" if item.processing_status == "processing" else
+                             "Reading failed" if item.processing_status == "failed" else
+                             "Confirm document type" if item.classification_status == "needs_review" else
+                             "Needs review" if item.processing_status == "needs_review" else
+                             "Analysis complete" if item.processing_status == "processed" else "Received")
+                    review_status = None
+                values = (result_data or {}).get("values", {})
+                schema = json.loads(proposal.schema_json) if proposal else []
+                required_fields = [field for field in schema if field.get("required")]
+                missing = (result_data or {}).get("missing", [])
+                uncertain = (result_data or {}).get("uncertain", [])
+                field_statuses = (result_data or {}).get("field_status", {})
+                if proposal and proposal.status == "needs_information" and not missing and uncertain:
+                    stage = "Resolve conflicts"
+                location = lambda city, country: ", ".join(
+                    part for part in (str(values.get(city) or "").strip(),
+                                      str(values.get(country) or "").strip()) if part)
+                can_approve = bool(proposal and proposal.status == "ready_for_approval")
+                can_import = bool(proposal and proposal.status == "approved")
                 result.append({"id": str(item.id), "record_type": "intake", "intake_item_id": str(item.id),
-                    "supplier": None, "quote_reference": item.subject or item.original_filename,
-                    "origin": None, "destination": None, "currency": None, "base_price": None,
-                    "created_at": item.created_at.isoformat(), "review_status": None,
-                    "stage": stage, "missing": [], "conflicts": [], "filled": None, "required": None,
-                    "can_approve": False, "can_import": False, "details": {"pricing_unit": None}})
+                    "proposal_id": proposal.id if proposal else None,
+                    "supplier": values.get("Supplier_Name"),
+                    "quote_reference": values.get("Quotation_Reference") or values.get("Quotation_ID") or item.subject or item.original_filename,
+                    "origin": location("Origin_City", "Origin_Country") or values.get("Origin_Port"),
+                    "destination": location("Destination_City", "Destination_Country") or values.get("Destination_Port"),
+                    "currency": values.get("Currency"), "base_price": values.get("Quoted_Price"),
+                    "created_at": item.created_at.isoformat(), "review_status": review_status,
+                    "stage": stage, "missing": missing, "conflicts": uncertain,
+                    "filled": sum(1 for field in required_fields if values.get(field["name"]) not in (None, "")),
+                    "required": len(required_fields) if proposal else None,
+                    "can_approve": can_approve, "can_import": can_import,
+                    "details": {"pricing_unit": values.get("Pricing_Basis")}})
         return result
 
 
@@ -127,13 +175,18 @@ def detail(settings: Settings, quote_id: str) -> dict[str, Any]:
         if not source_data:
             source_data = [{"id": str(item.id), "filename": item.original_filename, "kind": "document", "text": item.raw_text}]
         fields = []
+        not_applicable = set(quote.details.not_applicable_fields)
         for field in dict.fromkeys(REQUIRED + tuple(MATERIAL_FIELDS)):
             value = value_of(quote, field, carrier)
             supporting = [e.model_dump(mode="json") for e in evidence if e.field_name == field]
+            required = field in REQUIRED
+            status = ("Not applicable" if field in not_applicable else
+                      "Needs review" if any(e["validation_status"] == "needs_review" for e in supporting) else
+                      "Found" if value is not None and any(e["validation_status"] == "accepted" for e in supporting) else
+                      "Source not verified" if value is not None else "Missing" if required else "Not stated")
             fields.append({"field": field, "value": str(value) if value is not None else None,
-                           "status": "Needs review" if any(e["validation_status"] == "needs_review" for e in supporting)
-                           else "Found" if value is not None and any(e["validation_status"] == "accepted" for e in supporting) else "Source not verified" if value is not None else "Missing",
-                           "evidence": supporting})
+                           "required": required, "not_applicable": field in not_applicable,
+                           "status": status, "evidence": supporting})
         missing, conflicts, gaps = readiness(repos, quote)
         from .supplier_workflow import action_for_intake
         from .supplier_databases import list_supplier_databases

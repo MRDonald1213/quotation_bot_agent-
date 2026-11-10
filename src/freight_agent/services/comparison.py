@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import csv
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +22,214 @@ from ..db.repositories import Repos
 from .common import with_session
 from .gap_analysis import detect_gaps_deterministic
 from . import money
+
+
+def compare_supplier_master_quotes(settings: Settings) -> dict:
+    """Compare quote rows from the single supplier master only on identical terms."""
+    from .supplier_databases import SUPPLIER_MASTER_FILE
+
+    if not SUPPLIER_MASTER_FILE.is_file():
+        return {"quotes": [], "groups": [], "data_note": "Supplier_Master_Database.csv is missing."}
+    with SUPPLIER_MASTER_FILE.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    quotes = []
+    by_comparison_key: dict[tuple[str, ...], list[dict]] = {}
+    required_for_comparison = ("Origin_City", "Origin_Country", "Destination_City", "Destination_Country",
+                               "Transport_Mode", "Cargo_Type", "Currency", "Pricing_Basis", "Fuel_Type",
+                               "Quotation_Valid_Until")
+    demo_statuses = {"high_confidence", "demo"}
+    for raw in rows:
+        if not str(raw.get("Quotation_ID") or "").strip():
+            continue
+        try:
+            confidence = json.loads(raw.get("Extraction_Confidence_JSON") or "{}")
+            if not isinstance(confidence, dict):
+                confidence = {}
+        except (TypeError, ValueError):
+            confidence = {}
+        try:
+            evidence = json.loads(raw.get("Extraction_Evidence_JSON") or "{}")
+            if isinstance(evidence, list):
+                evidence = {}
+            if not isinstance(evidence, dict):
+                evidence = {}
+        except (TypeError, ValueError):
+            evidence = {}
+        fields = {name: name for name in (
+            "Quotation_Reference", "Quotation_Validity_Period", "Quotation_Valid_From", "Quotation_Valid_Until",
+            "Origin_Country", "Origin_City", "Origin_Port", "Destination_Country", "Destination_City",
+            "Destination_Port", "Transport_Mode", "Service_Type", "Cargo_Type", "Fuel_Type", "Equipment_Type",
+            "Container_Type", "Cargo_Weight", "Cargo_Volume", "Delivery_Time", "Transit_Time_Min_Days",
+            "Transit_Time_Max_Days", "Estimated_Delivery_Date", "Quoted_Price", "Currency", "Pricing_Basis",
+            "Fuel_Surcharge", "Additional_Charges", "Included_Charges", "Excluded_Charges", "Payment_Terms",
+            "Incoterms", "Insurance_Included",
+        )}
+        is_demo = "synthetic" in str(raw.get("Record_Data_Status") or "").casefold()
+        conflict_text = str(raw.get("Extraction_Notes") or "")
+        conflict_fields = {name for name in fields if re.search(
+            rf"(?:conflicting source values|conflict)[^\n]*\b{re.escape(name)}\b", conflict_text, re.I)}
+        field_status = {}
+        for field_name, column in fields.items():
+            value = str(raw.get(column) or "").strip()
+            score = confidence.get(field_name)
+            try:
+                score = float(score) if score is not None else None
+            except (TypeError, ValueError):
+                score = None
+            field_evidence = evidence.get(field_name)
+            has_evidence = bool(field_evidence)
+            evidence_rows = field_evidence if isinstance(field_evidence, list) else []
+            explicitly_not_applicable = any(
+                isinstance(item, dict) and item.get("status") == "not_applicable" for item in evidence_rows)
+            if not value:
+                if explicitly_not_applicable:
+                    status = "not_applicable"
+                else:
+                    status = "missing" if field_name in {*required_for_comparison, "Quoted_Price"} else "not_stated"
+            elif is_demo:
+                status = "demo"
+            elif field_name in conflict_fields:
+                status = "uncertain"
+            elif score is not None and score < .70:
+                status = "uncertain"
+            elif score is not None and has_evidence:
+                status = "high_confidence"
+            elif score is not None:
+                status = "uncertain"
+            else:
+                status = "unverified"
+            field_status[field_name] = {"status": status,
+                "confidence": round(score * 100) if score is not None else None,
+                "evidence": field_evidence}
+        quote = {
+            **{field: str(raw.get(column) or "").strip() for field, column in fields.items()},
+            "Supplier_ID": str(raw.get("Supplier_ID") or "").strip(),
+            "Supplier_Name": str(raw.get("Supplier_Name") or "").strip(),
+            "Quotation_ID": str(raw.get("Quotation_ID") or "").strip(),
+            "Quotation_Received_Date": str(raw.get("Quotation_Received_Date") or "").strip(),
+            "Quotation_Validity_Period": str(raw.get("Quotation_Validity_Period") or "").strip(),
+            "Origin_Country": str(raw.get("Origin_Country") or "").strip(),
+            "Origin_Port": str(raw.get("Origin_Port") or "").strip(),
+            "Destination_Country": str(raw.get("Destination_Country") or "").strip(),
+            "Destination_Port": str(raw.get("Destination_Port") or "").strip(),
+            "Transit_Time_Min_Days": str(raw.get("Transit_Time_Min_Days") or "").strip(),
+            "Transit_Time_Max_Days": str(raw.get("Transit_Time_Max_Days") or "").strip(),
+            "Cargo_Weight": str(raw.get("Cargo_Weight") or "").strip(),
+            "Cargo_Volume": str(raw.get("Cargo_Volume") or "").strip(),
+            "Service_Type": str(raw.get("Service_Type") or "").strip(),
+            "Record_Data_Status": str(raw.get("Record_Data_Status") or "Unverified quotation record"),
+            "Data_Source": str(raw.get("Data_Source") or ""),
+            "field_status": field_status,
+            "evidence": evidence,
+            "comparison_group": None,
+        }
+        valid_until = quote["Quotation_Valid_Until"]
+        try:
+            valid_date = date.fromisoformat(valid_until[:10]) if valid_until else None
+        except ValueError:
+            valid_date = None
+        quote["availability_status"] = (
+            "expired" if valid_date and valid_date < date.today()
+            else "active" if valid_date
+            else "unknown"
+        )
+        price = None
+        try:
+            price = Decimal(re.sub(r"[^0-9.\-]", "", quote["Quoted_Price"]))
+        except Exception:  # noqa: BLE001 — malformed CSV values are shown but not ranked
+            pass
+        quote["_price"] = price
+        transit = None
+        transit_candidates = ("Transit_Time_Min_Days", "Delivery_Time", "Transit_Time_Max_Days")
+        for candidate_name in transit_candidates:
+            candidate = quote[candidate_name]
+            if quote["field_status"][candidate_name]["status"] not in demo_statuses:
+                continue
+            match = re.search(r"\d+(?:\.\d+)?", candidate)
+            if match:
+                try:
+                    transit = Decimal(match.group())
+                    break
+                except Exception:  # noqa: BLE001
+                    pass
+        quote["_transit"] = transit
+        quotes.append(quote)
+        equipment = quote["Equipment_Type"] or quote["Container_Type"]
+        key_fields = (*(field for field in required_for_comparison if field != "Quotation_Valid_Until"),
+                      "Origin_Port", "Destination_Port", "Service_Type", "Equipment_Type", "Container_Type",
+                      "Cargo_Weight", "Cargo_Volume")
+        key_values = [str(raw.get(field) or "").strip().casefold() for field in key_fields]
+        key_is_grounded = all(quote["field_status"][field]["status"] in demo_statuses
+                              for field in required_for_comparison)
+        optional_match_fields = ("Origin_Port", "Destination_Port", "Service_Type", "Equipment_Type",
+                                 "Container_Type", "Cargo_Weight", "Cargo_Volume")
+        optional_details_grounded = all(
+            not quote[field] or quote["field_status"][field]["status"] in demo_statuses
+            for field in optional_match_fields)
+        equipment_is_grounded = any(
+            quote["field_status"][field]["status"] in demo_statuses and quote[field]
+            for field in ("Equipment_Type", "Container_Type"))
+        if key_is_grounded and optional_details_grounded and equipment and equipment_is_grounded \
+                and quote["availability_status"] == "active":
+            by_comparison_key.setdefault(tuple(key_values), []).append(quote)
+
+    groups = []
+    for index, (key, group_quotes) in enumerate(by_comparison_key.items(), start=1):
+        if len(group_quotes) < 2:
+            continue
+        comparable_prices = [quote for quote in group_quotes if quote["_price"] is not None and
+                             quote["field_status"]["Quoted_Price"]["status"] in demo_statuses]
+        lowest = min(comparable_prices, key=lambda quote: quote["_price"]) if comparable_prices else None
+        with_transit = [quote for quote in group_quotes if quote["_transit"] is not None and any(
+            quote["field_status"][field]["status"] in demo_statuses
+            for field in ("Transit_Time_Min_Days", "Delivery_Time", "Transit_Time_Max_Days"))]
+        fastest = min(with_transit, key=lambda quote: quote["_transit"]) if with_transit else None
+        payment_scores = []
+        for quote in group_quotes:
+            if quote["field_status"]["Payment_Terms"]["status"] not in demo_statuses:
+                continue
+            term = quote["Payment_Terms"].casefold()
+            net = re.search(r"\bnet\s*(\d+)\b", term)
+            if net:
+                payment_scores.append((int(net.group(1)), quote))
+            elif any(pattern in term for pattern in ("prepayment", "prepaid", "cash in advance", "advance payment")):
+                payment_scores.append((0, quote))
+        payment_flexible = max(payment_scores, key=lambda item: item[0])[1] if payment_scores else None
+        documented_charge_counts = [
+            (quote, len([part for part in re.split(r"[;|\n]+", quote["Additional_Charges"]) if part.strip()]))
+            for quote in group_quotes if quote["field_status"]["Additional_Charges"]["status"] in {"high_confidence", "demo"}
+        ]
+        fewest_count = min((count for _, count in documented_charge_counts), default=None) \
+            if len(documented_charge_counts) == len(group_quotes) else None
+        group_id = f"master-compare-{index}"
+        for quote in group_quotes:
+            quote["comparison_group"] = group_id
+        groups.append({
+            "id": group_id,
+            "route": f"{group_quotes[0]['Origin_City']} → {group_quotes[0]['Destination_City']}",
+            "transport_mode": group_quotes[0]["Transport_Mode"],
+            "cargo_type": group_quotes[0]["Cargo_Type"],
+            "fuel_type": group_quotes[0]["Fuel_Type"],
+            "equipment": group_quotes[0]["Equipment_Type"] or group_quotes[0]["Container_Type"],
+            "currency": group_quotes[0]["Currency"],
+            "pricing_basis": group_quotes[0]["Pricing_Basis"],
+            "quotation_ids": [quote["Quotation_ID"] for quote in group_quotes],
+            "lowest_price_quote_id": lowest["Quotation_ID"] if lowest else None,
+            "fastest_quote_id": fastest["Quotation_ID"] if fastest else None,
+            "most_flexible_payment_quote_id": payment_flexible["Quotation_ID"] if payment_flexible else None,
+            "fewest_additional_charge_quote_ids": [quote["Quotation_ID"] for quote, count in documented_charge_counts
+                                                    if fewest_count is not None and count == fewest_count],
+            "fewest_additional_charge_count": fewest_count,
+            "additional_charge_counts": {quote["Quotation_ID"]: len([part for part in re.split(r"[;|\n]+", quote["Additional_Charges"]) if part.strip()])
+                                          for quote in group_quotes},
+            "quotes": [{key: value for key, value in quote.items() if not key.startswith("_")}
+                       for quote in group_quotes],
+        })
+    for quote in quotes:
+        quote.pop("_price", None)
+        quote.pop("_transit", None)
+    return {"quotes": quotes, "groups": groups,
+            "data_note": "Prices are compared only when route, mode, cargo, fuel, equipment, currency, and pricing basis match."}
 
 
 def _convert(subtotal: Decimal | None, currency: str | None, target: str,
@@ -101,12 +311,65 @@ def _row_for(repos: Repos, shipment: Shipment, quote: Quotation,
     else:
         status = ComparisonStatus.comparable
 
+    field_evidence = repos.evidence_for_quotation(str(quote.id))
     evidence_refs = [
         f"{e.field_name}: {e.source_filename}"
         + (f"[{e.page_or_sheet}]" if e.page_or_sheet else "")
         + f" “{e.snippet[:60]}”"
-        for e in repos.evidence_for_quotation(str(quote.id))
+        for e in field_evidence
     ]
+    comparison_fields = {
+        "origin": quote.details.origin_city or quote.origin,
+        "destination": quote.details.destination_city or quote.destination,
+        "transport_type": quote.details.transport_type,
+        "service_type": quote.details.service_type,
+        "cargo_type": quote.details.cargo_type,
+        "fuel_type": quote.details.fuel_type,
+        "equipment_type": quote.details.equipment_type,
+        "container_type": quote.details.container_type,
+        "weight_kg": quote.details.weight_kg,
+        "volume_m3": quote.details.volume_m3,
+        "delivery_time": quote.details.delivery_time,
+        "fuel_surcharge": quote.details.fuel_surcharge,
+        "payment_terms": quote.details.payment_terms,
+        "quotation_validity_period": quote.details.quotation_validity_period,
+        "incoterms": quote.details.incoterms,
+        "insurance_included": quote.insurance_included,
+        "pricing_unit": quote.details.pricing_unit,
+        "base_price": quote.base_price,
+        "currency": quote.currency,
+        "valid_until": quote.valid_until,
+        "transit_days": quote.transit_days_max or quote.transit_days_min,
+    }
+    confidence: dict[str, float | None] = {}
+    field_status: dict[str, str] = {}
+    for field, value in comparison_fields.items():
+        support = [item for item in field_evidence if item.field_name == field]
+        scores = [item.confidence for item in support if item.confidence is not None]
+        score = min(scores) if scores else None
+        confidence[field] = score
+        if value is None:
+            field_status[field] = "missing" if field in {"base_price", "currency", "pricing_unit", "valid_until", "origin", "destination"} else "not_stated"
+        elif any(item.validation_status.value == "needs_review" for item in support) or (score is not None and score < 0.70):
+            field_status[field] = "uncertain"
+        elif score is not None and support:
+            field_status[field] = "high_confidence"
+        else:
+            field_status[field] = "unverified"
+    charge_support = [item for item in field_evidence if item.field_name in {
+        "charge", "fuel_surcharge", "included_charges", "excluded_charges"}]
+    field_status["additional_charges"] = (
+        "high_confidence" if charge_support and all(item.validation_status.value == "accepted" and
+        item.confidence is not None and item.confidence >= .70 for item in charge_support) else
+        "uncertain" if any(item.validation_status.value == "needs_review" for item in charge_support) else
+        "not_stated")
+    charge_scores = [item.confidence for item in charge_support if item.confidence is not None]
+    confidence["additional_charges"] = min(charge_scores) if charge_scores else None
+    additional_charges = []
+    for charge in quote.known_additional_charges:
+        amount = f"{charge.amount} {charge.currency or ''}".strip() if charge.amount is not None else "amount not stated"
+        additional_charges.append(f"{charge.label}: {amount}" +
+                                  (f" / {charge.pricing_unit}" if charge.pricing_unit else ""))
 
     from .workspace import readiness
     missing, conflicts, blocking_gaps = readiness(repos, quote)
@@ -140,6 +403,34 @@ def _row_for(repos: Repos, shipment: Shipment, quote: Quotation,
         unresolved_critical_gaps=[g.description for g in critical],
         unresolved_other_gaps=[g.description for g in other],
         evidence_refs=evidence_refs,
+        origin=quote.details.origin_city or quote.origin,
+        destination=quote.details.destination_city or quote.destination,
+        origin_country=quote.details.origin_country,
+        origin_city=quote.details.origin_city,
+        origin_port=quote.details.origin_port,
+        destination_country=quote.details.destination_country,
+        destination_city=quote.details.destination_city,
+        destination_port=quote.details.destination_port,
+        transport_mode=quote.details.transport_type,
+        service_type=quote.details.service_type,
+        cargo_type=quote.details.cargo_type,
+        fuel_type=quote.details.fuel_type,
+        equipment_type=quote.details.equipment_type,
+        container_type=quote.details.container_type,
+        cargo_weight=str(quote.details.weight_kg) if quote.details.weight_kg is not None else None,
+        cargo_volume=str(quote.details.volume_m3) if quote.details.volume_m3 is not None else None,
+        delivery_time=quote.details.delivery_time,
+        estimated_delivery_date=quote.details.estimated_delivery_date,
+        fuel_surcharge=quote.details.fuel_surcharge,
+        additional_charges=additional_charges,
+        included_charges=quote.details.included_charges,
+        excluded_charges=quote.details.excluded_charges,
+        payment_terms=quote.details.payment_terms,
+        quotation_validity_period=quote.details.quotation_validity_period,
+        incoterms=quote.details.incoterms,
+        insurance_included=bool(quote.insurance_included) if quote.insurance_included is not None else None,
+        field_confidence=confidence,
+        field_status=field_status,
     )
 
 
@@ -203,6 +494,31 @@ def _assemble(shipment: Shipment, rows: list[ComparisonRow]) -> ComparisonReport
             "Ranked by known subtotal (base + confirmed additional charges), not base price alone.",
             f"Only quotes that are comparable, scope-compatible, and convertible to {shipment.target_currency} were ranked.",
         ]
+        fastest = min((row for row in eligible if row.transit_days is not None),
+                      key=lambda row: row.transit_days, default=None)
+        if fastest:
+            report.recommendation_basis.append(
+                f"Fastest documented transit: {fastest.carrier_name or fastest.quote_reference} at up to {fastest.transit_days} days.")
+        payment_scores = []
+        for row in eligible:
+            term = (row.payment_terms or "").casefold()
+            net = re.search(r"\bnet\s*(\d+)\b", term)
+            if net:
+                payment_scores.append((int(net.group(1)), row))
+            elif any(value in term for value in ("prepayment", "prepaid", "cash in advance", "advance payment")):
+                payment_scores.append((0, row))
+        if payment_scores:
+            most_flexible = max(payment_scores, key=lambda item: item[0])[1]
+            report.recommendation_basis.append(
+                f"Most flexible recognized payment term: {most_flexible.carrier_name or most_flexible.quote_reference} ({most_flexible.payment_terms}).")
+        if eligible and all(row.field_status.get("additional_charges") == "high_confidence" for row in eligible):
+            fewest = min(len(row.additional_charges) for row in eligible)
+            winners = [row.carrier_name or row.quote_reference for row in eligible
+                       if len(row.additional_charges) == fewest]
+            report.recommendation_basis.append(
+                "Fewest documented additional charges: " + ", ".join(winners) + f" ({fewest}).")
+        report.recommendation_basis.append(
+            "Best overall match is the lowest known total among quotes that pass the selected shipment, route, scope, currency, and pricing-basis checks; use the service and terms tabs to review trade-offs.")
         if any(r.usd_note for r in rows):
             report.recommendation_basis.append(
                 f"USD figures use the local reference rate table (as of {money.RATES_AS_OF}); "
@@ -246,20 +562,27 @@ def render_report(report: ComparisonReport, fmt: str) -> str:
         return report.model_dump_json(indent=2)
     if fmt not in ("csv", "md", "table"):
         raise ValidationFailureError(f"unknown format {fmt!r}; choose from {', '.join(REPORT_FORMATS)}")
-    headers = ["carrier", "status", "currency", "base_price", "known_extras", "known_subtotal",
-               f"in_{report.target_currency}", "in_USD", "scope", "transit", "valid_until",
+    headers = ["carrier", "status", "origin", "destination", "mode", "cargo", "fuel", "equipment",
+               "currency", "base_price", "pricing_basis", "known_extras", "known_subtotal",
+               f"in_{report.target_currency}", "in_USD", "scope", "delivery_time", "transit",
+               "fuel_surcharge", "payment_terms", "valid_until", "incoterms", "insurance",
                "critical_gaps", "uncertain_charges"]
     body = []
     for r in report.rows:
         body.append([
-            r.carrier_name or "-", str(r.comparison_status), r.currency or "-",
+            r.carrier_name or "-", str(r.comparison_status), r.origin or "-", r.destination or "-",
+            r.transport_mode or "-", r.cargo_type or "-", r.fuel_type or "-",
+            r.equipment_type or r.container_type or "-", r.currency or "-",
             "" if r.base_price is None else str(r.base_price),
+            r.pricing_unit or "-",
             "" if r.known_additional_total is None else str(r.known_additional_total),
             "" if r.known_subtotal is None else str(r.known_subtotal),
             "" if r.converted_subtotal is None else str(r.converted_subtotal),
             "" if r.usd_subtotal is None else str(r.usd_subtotal),
-            r.delivery_scope, r.transit_time,
+            r.delivery_scope, r.delivery_time or "-", r.transit_time,
+            r.fuel_surcharge or "-", r.payment_terms or "-",
             "" if r.valid_until is None else r.valid_until.isoformat(),
+            r.incoterms or "-", "" if r.insurance_included is None else str(r.insurance_included),
             "; ".join(r.unresolved_critical_gaps), "; ".join(r.uncertain_charges),
         ])
     if fmt == "csv":

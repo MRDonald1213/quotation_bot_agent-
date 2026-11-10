@@ -46,6 +46,14 @@ def _uid(value: str) -> UUID:
     return UUID(value)
 
 
+def _audit_uid(value: str) -> UUID | str:
+    """Keep malformed legacy audit identifiers readable without rewriting history."""
+    try:
+        return UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        return value
+
+
 # ------------------------------------------------------------------ shipments
 
 def _route_category(origin_country: str | None, destination_country: str | None) -> str | None:
@@ -605,6 +613,7 @@ class Repos:
                 id=_u(e.id), quotation_id=_u(e.quotation_id), field_name=e.field_name,
                 value_as_extracted=e.value_as_extracted, source_filename=e.source_filename,
                 page_or_sheet=e.page_or_sheet, snippet=e.snippet, confidence=e.confidence,
+                explanation=e.explanation,
                 validation_status=str(e.validation_status), created_at=e.created_at.isoformat(),
             ))
         self._save()
@@ -617,6 +626,7 @@ class Repos:
             id=_uid(r.id), quotation_id=_uid(r.quotation_id), field_name=r.field_name,
             value_as_extracted=r.value_as_extracted, source_filename=r.source_filename,
             page_or_sheet=r.page_or_sheet, snippet=r.snippet, confidence=r.confidence,
+            explanation=r.explanation,
             validation_status=str(r.validation_status),  # type: ignore[arg-type]
             created_at=m.iso_to_dt(r.created_at) or FieldEvidence.model_fields["created_at"].default_factory(),
         ) for r in rows]
@@ -629,6 +639,7 @@ class Repos:
             id=_uid(row.id), quotation_id=_uid(row.quotation_id), field_name=row.field_name,
             value_as_extracted=row.value_as_extracted, source_filename=row.source_filename,
             page_or_sheet=row.page_or_sheet, snippet=row.snippet, confidence=row.confidence,
+            explanation=row.explanation,
             validation_status=str(row.validation_status),  # type: ignore[arg-type]
             created_at=m.iso_to_dt(row.created_at) or FieldEvidence.model_fields["created_at"].default_factory(),
         )
@@ -724,7 +735,7 @@ class Repos:
         rows = self.session.scalars(
             select(m.AuditEventRow).order_by(m.AuditEventRow.created_at.desc(), text("rowid DESC")).limit(limit)
         ).all()
-        return [AuditEvent(id=_uid(r.id), entity_type=r.entity_type, entity_id=_uid(r.entity_id),
+        return [AuditEvent(id=_audit_uid(r.id), entity_type=r.entity_type, entity_id=_audit_uid(r.entity_id),
                            action=r.action, details_json=r.details_json,
                            created_at=m.iso_to_dt(r.created_at) or AuditEvent.model_fields["created_at"].default_factory())
                 for r in rows]
@@ -733,7 +744,7 @@ class Repos:
         rows = self.session.scalars(
             select(m.AuditEventRow).where(m.AuditEventRow.entity_id == _u(entity_id))
         ).all()
-        return [AuditEvent(id=_uid(r.id), entity_type=r.entity_type, entity_id=_uid(r.entity_id),
+        return [AuditEvent(id=_audit_uid(r.id), entity_type=r.entity_type, entity_id=_audit_uid(r.entity_id),
                            action=r.action, details_json=r.details_json,
                            created_at=m.iso_to_dt(r.created_at) or AuditEvent.model_fields["created_at"].default_factory())
                 for r in rows]
